@@ -19,3 +19,6 @@ fuzz-*.log
 .claude/settings.local.json
 .deepsec/
 plans/
+
+# Rust build output
+**/target/

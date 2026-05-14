@@ -47,7 +47,11 @@
     "vendor/cpython-emscripten/",
     "README.md",
     "CHANGELOG.md",
-    "dist/AGENTS.md"
+    "dist/AGENTS.md",
+    "rust-core/Cargo.toml",
+    "rust-core/Cargo.lock",
+    "rust-core/README.md",
+    "rust-core/src/"
   ],
   "bin": {
     "just-bash": "./dist/bin/just-bash.js",
@@ -85,7 +89,9 @@
     "test:fuzz": "vitest run src/security/fuzzing/",
     "test:fuzz:long": "FUZZ_RUNS=10000 vitest run src/security/fuzzing/",
     "shell": "npx tsx src/cli/shell.ts",
-    "dev:exec": "npx tsx src/cli/exec.ts"
+    "dev:exec": "npx tsx src/cli/exec.ts",
+    "rust:build": "cargo build --manifest-path rust-core/Cargo.toml",
+    "rust:test": "cargo test --manifest-path rust-core/Cargo.toml"
   },
   "keywords": [],
   "author": "Malte and Claude",
