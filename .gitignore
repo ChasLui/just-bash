@@ -1,5 +1,4 @@
 node_modules
-package-lock.json
 .DS_Store
 .vscode
 .idea
@@ -13,7 +12,6 @@ profile-*.mjs
 bench-*.mjs
 todo/
 *.parsed.json
-.pnpm-store
 .docs-test-tmp/
 fuzz-*.log
 .claude/settings.local.json

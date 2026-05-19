@@ -5,7 +5,7 @@ contains a native in-memory filesystem, parser, `Bash` execution facade,
 structured execution results, and a small CLI used by the crate tests.
 
 The current Rust milestone intentionally keeps the surface dependency-free while
-preserving the public concepts of the TypeScript package:
+preserving the public runtime concepts of the original project:
 
 - `BashOptions` configures initial files, environment, and working directory.
 - `parse_script` produces a small command/pipeline/redirection model.
@@ -16,7 +16,7 @@ preserving the public concepts of the TypeScript package:
 Supported execution features include command sequencing with `;`/newlines,
 pipelines with `|`, conditional pipeline connectors with `&&` and `||`, input
 redirection with `<`, output redirection with `>` and `>>`, inline `$NAME` and
-`${NAME}` variable expansion with single-quote suppression, and assignment-only
+`${NAME}` variable expansion with single-quote suppression, assignment-only
 environment updates, and syntax errors for missing pipeline/conditional commands.
 
 Supported built-ins in this milestone are `cat`, `cd`, `cp`, `echo`, `env`,
