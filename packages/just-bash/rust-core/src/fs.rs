@@ -47,6 +47,7 @@ impl InMemoryFs {
     pub fn with_files(files: BTreeMap<String, String>) -> Result<Self, BashError> {
         let mut fs = Self::new();
         for (path, contents) in files {
+            fs.create_dir_all(&parent_dir(&path))?;
             fs.write_file(&path, &contents)?;
         }
         Ok(fs)
@@ -67,6 +68,11 @@ impl InMemoryFs {
     pub fn write_file(&mut self, path: &str, contents: &str) -> Result<(), BashError> {
         let normalized = normalize_absolute(path);
         self.ensure_parent_dir(&normalized)?;
+        if matches!(self.entries.get(&normalized), Some(FsEntry::Directory)) {
+            return Err(BashError::FileSystem(format!(
+                "{normalized}: Is a directory"
+            )));
+        }
         self.entries
             .insert(normalized, FsEntry::File(contents.to_string()));
         Ok(())
@@ -85,6 +91,16 @@ impl InMemoryFs {
         };
         next.push_str(contents);
         self.write_file(&normalized, &next)
+    }
+
+    pub fn create_dir(&mut self, path: &str) -> Result<(), BashError> {
+        let normalized = normalize_absolute(path);
+        if self.entries.contains_key(&normalized) {
+            return Err(BashError::FileSystem(format!("{normalized}: File exists")));
+        }
+        self.ensure_parent_dir(&normalized)?;
+        self.entries.insert(normalized, FsEntry::Directory);
+        Ok(())
     }
 
     pub fn create_dir_all(&mut self, path: &str) -> Result<(), BashError> {
@@ -142,6 +158,10 @@ impl InMemoryFs {
         matches!(self.entries.get(path), Some(FsEntry::Directory))
     }
 
+    pub fn is_file(&self, path: &str) -> bool {
+        matches!(self.entries.get(path), Some(FsEntry::File(_)))
+    }
+
     pub fn list_dir(&self, path: &str) -> Result<Vec<String>, BashError> {
         if !self.is_dir(path) {
             return Err(BashError::FileSystem(format!("{path}: Not a directory")));
@@ -166,15 +186,17 @@ impl InMemoryFs {
         Ok(names.into_iter().collect())
     }
 
-    fn ensure_parent_dir(&mut self, path: &str) -> Result<(), BashError> {
+    fn ensure_parent_dir(&self, path: &str) -> Result<(), BashError> {
         let parent = parent_dir(path);
-        if !self.entries.contains_key(&parent) {
-            self.create_dir_all(&parent)?;
+        match self.entries.get(&parent) {
+            Some(FsEntry::Directory) => Ok(()),
+            Some(FsEntry::File(_)) => {
+                Err(BashError::FileSystem(format!("{parent}: Not a directory")))
+            }
+            None => Err(BashError::FileSystem(format!(
+                "{parent}: No such file or directory"
+            ))),
         }
-        if !self.is_dir(&parent) {
-            return Err(BashError::FileSystem(format!("{parent}: Not a directory")));
-        }
-        Ok(())
     }
 
     fn has_children(&self, path: &str) -> bool {

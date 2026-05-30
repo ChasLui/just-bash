@@ -240,7 +240,7 @@ fn lex(source: &str) -> Result<Vec<Token>, BashError> {
 
     while let Some(ch) = chars.next() {
         match (quote, ch) {
-            (None, '#') => {
+            (None, '#') if !current_started => {
                 for next in chars.by_ref() {
                     if next == '\n' {
                         tokens.push(Token::Separator);
@@ -405,6 +405,17 @@ mod tests {
         assert_eq!(words.len(), 3);
         assert_eq!(words[1].text(), "");
         assert_eq!(words[2].text(), "");
+    }
+
+    #[test]
+    fn treats_hash_as_comment_only_at_word_start() {
+        let script = parse_script("echo foo#bar # comment\necho https://example/#frag").unwrap();
+        assert_eq!(script.pipelines.len(), 2);
+        assert_eq!(script.pipelines[0].commands[0].words[1].text(), "foo#bar");
+        assert_eq!(
+            script.pipelines[1].commands[0].words[1].text(),
+            "https://example/#frag"
+        );
     }
 
     #[test]

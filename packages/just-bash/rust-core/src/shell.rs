@@ -72,9 +72,18 @@ impl Bash {
 
             let mut stdin = String::new();
             let command_count = pipeline.commands.len();
+            let is_pipeline = command_count > 1;
             for (index, command) in pipeline.commands.iter().enumerate() {
                 let is_last = index + 1 == command_count;
-                let result = self.run_invocation(command, &stdin);
+                let command_name = command.words.first().map(|word| self.expand_word(word));
+                let result = if is_pipeline {
+                    let mut child = self.clone();
+                    let result = child.run_invocation(command, &stdin);
+                    self.fs = child.fs;
+                    result
+                } else {
+                    self.run_invocation(command, &stdin)
+                };
                 stderr.push_str(&result.stderr);
                 exit_code = result.exit_code;
                 if is_last {
@@ -82,11 +91,7 @@ impl Bash {
                 } else {
                     stdin = result.stdout;
                 }
-                if command
-                    .words
-                    .first()
-                    .is_some_and(|word| self.expand_word(word) == "exit")
-                {
+                if !is_pipeline && command_name.as_deref() == Some("exit") {
                     return BashExecResult {
                         stdout,
                         stderr,
@@ -130,8 +135,25 @@ impl Bash {
                         };
                     }
                 },
-                RedirectMode::Write | RedirectMode::Append => {
-                    stdout_redirect = Some((redirect.mode, target))
+                RedirectMode::Write => {
+                    if let Err(error) = self.fs.write_file(&target, "") {
+                        return CommandOutput {
+                            stdout: String::new(),
+                            stderr: format!("bash: {error}\n"),
+                            exit_code: 1,
+                        };
+                    }
+                    stdout_redirect = Some((redirect.mode, target));
+                }
+                RedirectMode::Append => {
+                    if let Err(error) = self.fs.append_file(&target, "") {
+                        return CommandOutput {
+                            stdout: String::new(),
+                            stderr: format!("bash: {error}\n"),
+                            exit_code: 1,
+                        };
+                    }
+                    stdout_redirect = Some((redirect.mode, target));
                 }
             }
         }
@@ -211,7 +233,7 @@ impl Bash {
             }
             "printf" => {
                 if let Some(format) = args.first() {
-                    stdout.push_str(&format.replace("\\n", "\n"));
+                    stdout.push_str(&format_printf(format, &args[1..]));
                 }
             }
             "pwd" => {
@@ -301,7 +323,7 @@ impl Bash {
                     combined
                 };
                 if exit_code == 0 {
-                    let lines = input.lines().count();
+                    let lines = input.bytes().filter(|byte| *byte == b'\n').count();
                     let words = input.split_whitespace().count();
                     let bytes = input.len();
                     stdout.push_str(&format!("{lines} {words} {bytes}\n"));
@@ -309,16 +331,22 @@ impl Bash {
             }
             "ls" => {
                 let target = args.first().map(String::as_str).unwrap_or(".");
-                match self.fs.list_dir(&self.resolve_path(target)) {
-                    Ok(names) => {
-                        stdout.push_str(&names.join("\n"));
-                        if !names.is_empty() {
-                            stdout.push('\n');
+                let path = self.resolve_path(target);
+                if self.fs.is_file(&path) {
+                    stdout.push_str(target);
+                    stdout.push('\n');
+                } else {
+                    match self.fs.list_dir(&path) {
+                        Ok(names) => {
+                            stdout.push_str(&names.join("\n"));
+                            if !names.is_empty() {
+                                stdout.push('\n');
+                            }
                         }
-                    }
-                    Err(error) => {
-                        stderr.push_str(&format!("ls: {error}\n"));
-                        exit_code = 1;
+                        Err(error) => {
+                            stderr.push_str(&format!("ls: {error}\n"));
+                            exit_code = 1;
+                        }
                     }
                 }
             }
@@ -334,10 +362,8 @@ impl Bash {
                     let path = self.resolve_path(arg);
                     let result = if parents {
                         self.fs.create_dir_all(&path)
-                    } else if self.fs.exists(&path) {
-                        Err(BashError::FileSystem(format!("{path}: File exists")))
                     } else {
-                        self.fs.create_dir_all(&path)
+                        self.fs.create_dir(&path)
                     };
                     if let Err(error) = result {
                         stderr.push_str(&format!("mkdir: {error}\n"));
@@ -381,13 +407,33 @@ impl Bash {
                 }
             }
             "rm" => {
-                let recursive = args
-                    .iter()
-                    .any(|arg| matches!(arg.as_str(), "-r" | "-R" | "-rf" | "-fr"));
-                for arg in args.iter().filter(|arg| !arg.starts_with('-')) {
-                    if let Err(error) = self.fs.remove(&self.resolve_path(arg), recursive) {
-                        stderr.push_str(&format!("rm: {error}\n"));
-                        exit_code = 1;
+                let mut recursive = false;
+                let mut operands = Vec::new();
+                for arg in args {
+                    if arg.starts_with('-') && arg != "-" {
+                        if arg.chars().skip(1).all(|ch| matches!(ch, 'r' | 'R' | 'f')) {
+                            recursive |= arg.chars().any(|ch| matches!(ch, 'r' | 'R'));
+                        } else {
+                            stderr.push_str(&format!("rm: unsupported option: {arg}\n"));
+                            exit_code = 1;
+                        }
+                    } else {
+                        operands.push(arg);
+                    }
+                }
+                if exit_code == 0 && operands.is_empty() {
+                    stderr.push_str(
+                        "rm: missing operand
+",
+                    );
+                    exit_code = 1;
+                }
+                if exit_code == 0 {
+                    for arg in operands {
+                        if let Err(error) = self.fs.remove(&self.resolve_path(arg), recursive) {
+                            stderr.push_str(&format!("rm: {error}\n"));
+                            exit_code = 1;
+                        }
                     }
                 }
             }
@@ -483,6 +529,59 @@ impl Bash {
 
         expanded
     }
+}
+
+fn format_printf(format: &str, args: &[String]) -> String {
+    let mut output = String::new();
+    let mut arg_index = 0;
+    let repeats = if args.is_empty() { 1 } else { args.len() };
+
+    while arg_index < repeats {
+        let consumed = append_printf_once(&mut output, format, &args[arg_index..]);
+        if args.is_empty() {
+            break;
+        }
+        arg_index += consumed.max(1);
+    }
+
+    output
+}
+
+fn append_printf_once(output: &mut String, format: &str, args: &[String]) -> usize {
+    let mut consumed = 0;
+    let mut chars = format.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('n') => output.push('\n'),
+                Some('t') => output.push('\t'),
+                Some('r') => output.push('\r'),
+                Some('\\') => output.push('\\'),
+                Some(other) => output.push(other),
+                None => output.push('\\'),
+            }
+            continue;
+        }
+        if ch != '%' {
+            output.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('%') => output.push('%'),
+            Some('s') | Some('b') | Some('d') | Some('i') => {
+                output.push_str(args.get(consumed).map(String::as_str).unwrap_or(""));
+                consumed += 1;
+            }
+            Some(other) => {
+                output.push('%');
+                output.push(other);
+            }
+            None => output.push('%'),
+        }
+    }
+
+    consumed
 }
 
 fn is_assignment(word: &str) -> bool {
@@ -603,6 +702,100 @@ mod tests {
         let result = bash.exec("echo hello-$NAME-${SUFFIX}");
         assert_eq!(result.stdout, "hello-rust-core\n");
         assert_eq!(result.stderr, "");
+    }
+
+    #[test]
+    fn rejects_writes_to_directories_and_missing_parents() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("echo hi > /tmp; touch /tmp; echo hi > missing/file; ls /tmp");
+        assert_eq!(result.stdout, "");
+        assert_eq!(
+            result.stderr,
+            "bash: /tmp: Is a directory\ntouch: /tmp: Is a directory\nbash: /home/user/missing: No such file or directory\n"
+        );
+        assert_eq!(result.exit_code, 0);
+    }
+
+    #[test]
+    fn mkdir_without_parents_fails_for_missing_parent() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("mkdir nested/child; ls");
+        assert_eq!(result.stdout, "");
+        assert_eq!(
+            result.stderr,
+            "mkdir: /home/user/nested: No such file or directory\n"
+        );
+        assert_eq!(result.exit_code, 0);
+    }
+
+    #[test]
+    fn pipeline_commands_do_not_mutate_parent_shell_state() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("cd /tmp | cat; pwd; exit 7 | true; echo after");
+        assert_eq!(result.stdout, "/home/user\nafter\n");
+        assert_eq!(result.stderr, "");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.cwd, "/home/user");
+    }
+
+    #[test]
+    fn wc_counts_newline_bytes_for_lines() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("echo -n x | wc");
+        assert_eq!(result.stdout, "0 1 1\n");
+        assert_eq!(result.stderr, "");
+    }
+
+    #[test]
+    fn output_redirection_truncates_before_command_runs() {
+        let mut files = BTreeMap::new();
+        files.insert("/home/user/f".to_string(), "old\n".to_string());
+        let mut bash = Bash::new(BashOptions {
+            files,
+            ..BashOptions::default()
+        })
+        .unwrap();
+        let result = bash.exec("cat f > f; wc f");
+        assert_eq!(result.stdout, "0 0 0\n");
+        assert_eq!(result.stderr, "");
+        assert_eq!(bash.fs().read_file("/home/user/f").unwrap(), "");
+    }
+
+    #[test]
+    fn ls_lists_file_operands() {
+        let mut files = BTreeMap::new();
+        files.insert("/home/user/file.txt".to_string(), "data".to_string());
+        let mut bash = Bash::new(BashOptions {
+            files,
+            ..BashOptions::default()
+        })
+        .unwrap();
+        let result = bash.exec("ls file.txt");
+        assert_eq!(result.stdout, "file.txt\n");
+        assert_eq!(result.stderr, "");
+    }
+
+    #[test]
+    fn printf_formats_arguments() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("printf '%s\\n' a b");
+        assert_eq!(result.stdout, "a\nb\n");
+        assert_eq!(result.stderr, "");
+    }
+
+    #[test]
+    fn rm_rejects_unsupported_options_without_deleting() {
+        let mut files = BTreeMap::new();
+        files.insert("/home/user/file.txt".to_string(), "data".to_string());
+        let mut bash = Bash::new(BashOptions {
+            files,
+            ..BashOptions::default()
+        })
+        .unwrap();
+        let result = bash.exec("rm -i file.txt; cat file.txt");
+        assert_eq!(result.stdout, "data");
+        assert_eq!(result.stderr, "rm: unsupported option: -i\n");
+        assert_eq!(result.exit_code, 0);
     }
 
     #[test]
