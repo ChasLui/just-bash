@@ -1,6 +1,6 @@
 # just-bash
 
-`just-bash` is now a Rust workspace centered on a native, deterministic shell
+`just-bash` is a Rust workspace centered on a native, deterministic shell
 runtime. The Rust core lives in [`packages/just-bash/rust-core`](./packages/just-bash/rust-core)
 and provides:
 
@@ -15,7 +15,6 @@ and provides:
 ```text
 Cargo.toml                     Rust workspace manifest
 packages/just-bash/rust-core/  Rust library and CLI crate
-packages/just-bash/legacy-ts/   Archived TypeScript implementation (reference only)
 ```
 
 ## Development
@@ -32,5 +31,4 @@ Run the CLI directly with Cargo:
 cargo run -p just-bash --bin just-bash-rs -- 'echo hello from rust'
 ```
 
-The previous Node package-manager workflow has been removed; use Cargo for all
-build, test, and formatting tasks.
+Cargo is the only build, test, and formatting entry point.

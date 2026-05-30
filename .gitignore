@@ -1,17 +1,8 @@
-node_modules
 .DS_Store
 .idea
 .env
 .env.*
-/coverage
-debug-*.ts
-test-*.ts
-profile-*.mjs
-*.cpuprofile
-bench-*.mjs
 todo/
-*.parsed.json
-.docs-test-tmp/
 fuzz-*.log
 .claude/settings.local.json
 .deepsec/
@@ -20,4 +11,3 @@ plans/
 # Rust build output
 **/target/
 .serena
-**/dist/

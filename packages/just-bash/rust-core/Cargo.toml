@@ -1,9 +1,9 @@
 [package]
 name = "just-bash"
 version = "3.0.0"
-edition = "2024"
+edition.workspace = true
 description = "Rust core for the just-bash virtual shell"
-license = "Apache-2.0"
+license.workspace = true
 
 [lib]
 name = "just_bash"
