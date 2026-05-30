@@ -1,6 +1,5 @@
 node_modules
 .DS_Store
-.vscode
 .idea
 .env
 .env.*
@@ -20,3 +19,5 @@ plans/
 
 # Rust build output
 **/target/
+.serena
+**/dist/

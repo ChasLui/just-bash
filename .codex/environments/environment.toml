@@ -1,0 +1,66 @@
+# Codex App 本地环境配置：当前仓库已经迁到 Rust-only 工作流。
+# 规范：https://developers.openai.com/codex/app/local-environments
+#
+# setup 会在 Codex 创建新 worktree 时运行；actions 会出现在本项目的
+# Codex App 工具栏中。这里故意不再调用 pnpm/npm，因为 Node 工作流已移除。
+version = 1
+name = "just-bash-rust"
+
+[setup]
+script = '''
+set -euo pipefail
+
+for tool in cargo rustc; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    printf '%s\n' "Missing required Rust tool: $tool" >&2
+    exit 1
+  fi
+done
+
+# rustfmt 是 CI 的必需入口；clippy 是本地审查辅助，缺失时尽力补齐。
+if command -v rustup >/dev/null 2>&1; then
+  rustup component add rustfmt >/dev/null 2>&1 || true
+  rustup component add clippy >/dev/null 2>&1 || true
+fi
+
+cargo fetch --locked
+'''
+
+[cleanup]
+script = '''
+set -uo pipefail
+
+# target 可重建，清掉能显著减少 Codex 删除临时 worktree 的成本。
+rm -rf target packages/just-bash/rust-core/target
+find . -type f \( -name '*.profraw' -o -name '*.profdata' \) -delete
+'''
+
+[[actions]]
+name = "Fmt"
+icon = "check"
+command = "cargo fmt --all --check"
+
+[[actions]]
+name = "Check"
+icon = "check"
+command = "cargo check --workspace --all-targets"
+
+[[actions]]
+name = "Test"
+icon = "test"
+command = "cargo test --workspace"
+
+[[actions]]
+name = "Build"
+icon = "build"
+command = "cargo build --workspace"
+
+[[actions]]
+name = "Clippy"
+icon = "lint"
+command = "cargo clippy --workspace --all-targets"
+
+[[actions]]
+name = "Run"
+icon = "run"
+command = "cargo run -p just-bash --bin just-bash-rs -- 'echo hello from rust'"

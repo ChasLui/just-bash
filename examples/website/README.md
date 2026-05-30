@@ -6,7 +6,6 @@ This is an interactive demo of **just-bash** running entirely in your browser, w
 
 > This example is historical TypeScript-facing documentation and is for reference only.
 > Active runtime is Rust-first in `packages/just-bash/rust-core` (`just-bash-rs` CLI).
-
 ```
 +----------------------------------------------------------+
 |                        BROWSER                           |
