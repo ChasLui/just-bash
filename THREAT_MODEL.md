@@ -2,7 +2,8 @@
 
 ## Context
 
-just-bash is a TypeScript implementation of a bash interpreter with an in-memory virtual filesystem, designed for AI agents needing a secure, sandboxed bash environment. This document defines the full threat model: who the adversaries are, what they can target, what defenses exist, what gaps remain, and residual risks.
+This threat model describes the security boundaries for just-bash. The active runtime is now Rust-first and implemented in `packages/just-bash/rust-core` (crate/binary `just-bash-rs`);  
+the historical TypeScript implementation remains archived under `packages/just-bash/legacy-ts`.
 
 ---
 

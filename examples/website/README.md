@@ -4,6 +4,8 @@ This is an interactive demo of **just-bash** running entirely in your browser, w
 
 ## Architecture
 
+> This example reflects the historical browser execution path and is not part of the active Rust-first runtime in `packages/just-bash/rust-core`.
+
 ```
 +----------------------------------------------------------+
 |                        BROWSER                           |
@@ -36,7 +38,7 @@ This is an interactive demo of **just-bash** running entirely in your browser, w
 ## Components
 
 ### 1. just-bash (Browser)
-- Pure TypeScript bash interpreter
+- In-browser execution path (historical TypeScript implementation used by this example)
 - Runs locally in browser for regular commands
 - In-memory virtual filesystem with pre-loaded files
 - No network calls for basic commands like `ls`, `cat`, `grep`

@@ -15,6 +15,7 @@ and provides:
 ```text
 Cargo.toml                     Rust workspace manifest
 packages/just-bash/rust-core/  Rust library and CLI crate
+packages/just-bash/legacy-ts/   Archived TypeScript implementation (reference only)
 ```
 
 ## Development

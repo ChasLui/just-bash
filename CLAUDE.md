@@ -4,7 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-just-bash is a TypeScript implementation of a bash interpreter with an in-memory virtual filesystem. Designed for AI agents needing a secure, sandboxed bash environment. No WASM dependencies allowed.
+just-bash 的活跃实现已迁移为 Rust-first，核心运行时在 `packages/just-bash/rust-core`（`just-bash-rs`）。  
+`packages/just-bash/legacy-ts` 保留历史 TypeScript 实现，仅供归档参考。
 
 ## Commands
 
