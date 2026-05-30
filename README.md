@@ -1,33 +1,35 @@
-# just-bash monorepo
+# just-bash
 
-This repository hosts the [`just-bash`](./packages/just-bash) package and its examples.
+`just-bash` is now a Rust workspace centered on a native, deterministic shell
+runtime. The Rust core lives in [`packages/just-bash/rust-core`](./packages/just-bash/rust-core)
+and provides:
 
-## Packages
+- an in-memory filesystem,
+- a quote-aware shell parser,
+- a small execution engine with built-ins, pipelines, redirections, and
+  environment expansion,
+- a native `just-bash-rs` CLI for running snippets from argv or stdin.
 
-| Package | Path | Description |
-| --- | --- | --- |
-| [`just-bash`](./packages/just-bash) | `packages/just-bash` | A simulated bash environment with virtual filesystem |
+## Workspace layout
 
-See the package's own [README](./packages/just-bash/README.md) for usage documentation.
-
-## Layout
-
+```text
+Cargo.toml                     Rust workspace manifest
+packages/just-bash/rust-core/  Rust library and CLI crate
 ```
-packages/         publishable npm packages
-examples/         example consumers (bash-agent, cjs-consumer, website)
-.github/          CI workflows
-```
 
-## Working in the repo
+## Development
 
 ```bash
-pnpm install              # install all workspace deps
-pnpm build                # build all packages
-pnpm test:run             # run unit + comparison tests
-pnpm test:dist            # smoke-test the bundled output
-pnpm lint                 # biome + per-package banned-pattern checks
-pnpm typecheck            # tsc across all packages
+cargo fmt --all --check
+cargo test --workspace
+cargo build --workspace
 ```
 
-Per-package commands run via `pnpm --filter <name> <script>` — e.g.
-`pnpm --filter just-bash test:wasm`.
+Run the CLI directly with Cargo:
+
+```bash
+cargo run -p just-bash --bin just-bash-rs -- 'echo hello from rust'
+```
+
+The previous Node package-manager workflow has been removed; use Cargo for all
+build, test, and formatting tasks.
