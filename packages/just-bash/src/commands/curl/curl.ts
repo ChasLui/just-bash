@@ -21,6 +21,60 @@ import {
 import type { CurlOptions } from "./types.js";
 
 /**
+ * Resolve the body for `-d`/`--data`/`--data-binary` (and their `@file`
+ * forms). Real curl strips CR and LF from `-d @file` reads (ascii mode);
+ * `--data-binary @file` is sent verbatim. Inline values are returned as-is.
+ */
+async function resolveDataBody(
+  options: CurlOptions,
+  ctx: CommandContext,
+): Promise<string | undefined> {
+  if (options.dataFile) {
+    const filePath = ctx.fs.resolvePath(ctx.cwd, options.dataFile.path);
+    let content = await ctx.fs.readFile(filePath);
+    if (options.dataFile.mode === "ascii") {
+      content = content.replace(/[\r\n]/g, "");
+    }
+    // `--data-urlencode` arguments that appear *after* a `-d @file` keep
+    // accumulating into `options.data`; preserve that concatenation so a
+    // mixed invocation like `-d @file --data-urlencode "x=1"` still emits
+    // both payloads joined with `&`.
+    return options.data ? `${content}&${options.data}` : content;
+  }
+  return options.data;
+}
+
+/**
+ * Append `--data-urlencode @file` and `--data-urlencode name@file` payloads
+ * to the existing inline urlencode payload. File contents are URL-encoded
+ * after read and joined with `&`, matching real curl's behavior.
+ *
+ * Note: file contents are passed through `encodeURIComponent` directly
+ * rather than the inline-form helper. The inline helper (`encodeFormData`)
+ * splits on the first `=` to separate `name=value` arguments, which would
+ * mis-encode any `=` byte inside the file. For `@file` (and `name@file`)
+ * forms the entire file body is the value — `=` bytes must be percent-
+ * encoded like every other reserved character.
+ */
+async function resolveUrlencodeFiles(
+  options: CurlOptions,
+  ctx: CommandContext,
+  base: string | undefined,
+): Promise<string | undefined> {
+  if (options.urlencodeFiles.length === 0) return base;
+  const parts: string[] = base ? [base] : [];
+  for (const entry of options.urlencodeFiles) {
+    const filePath = ctx.fs.resolvePath(ctx.cwd, entry.path);
+    const content = await ctx.fs.readFile(filePath);
+    const encoded = encodeURIComponent(content);
+    parts.push(
+      entry.name ? `${encodeURIComponent(entry.name)}=${encoded}` : encoded,
+    );
+  }
+  return parts.join("&");
+}
+
+/**
  * Prepare request body from options, reading files if needed
  */
 async function prepareRequestBody(
@@ -62,9 +116,14 @@ async function prepareRequestBody(
     };
   }
 
-  // Handle -d/--data variants
-  if (options.data !== undefined) {
-    return { body: options.data };
+  // Handle -d/--data/--data-binary/--data-raw (inline + @file) and
+  // accumulated --data-urlencode files. The two flavors are merged with `&`
+  // because real curl lets you mix `-d foo --data-urlencode @file` and
+  // concatenates the payloads.
+  let body = await resolveDataBody(options, ctx);
+  body = await resolveUrlencodeFiles(options, ctx, body);
+  if (body !== undefined) {
+    return { body };
   }
 
   // @banned-pattern-ignore: returns typed object with known keys (body, contentType), not user data
