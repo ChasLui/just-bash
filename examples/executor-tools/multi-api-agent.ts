@@ -1,6 +1,9 @@
 /**
  * Example 3: Multi-API agent loop
  *
+ * This is a @just-bash/executor companion example (optional when using the
+ * Rust-first runtime in packages/just-bash/rust-core).
+ *
  * Three real public APIs, exposed as inline executor tools and orchestrated
  * across multiple js-exec turns to produce a combined "country snapshot."
  *

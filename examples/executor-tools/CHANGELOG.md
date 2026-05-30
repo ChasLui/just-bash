@@ -1,5 +1,10 @@
 # executor-tools-example
 
+> [!NOTE]
+> `examples/executor-tools` is an **optional companion** collection for
+> `@just-bash/executor` and is not part of the active Rust-first
+> `just-bash-rs` runtime.
+
 ## 1.0.3
 
 ### Patch Changes

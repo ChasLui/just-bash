@@ -1,5 +1,9 @@
 # Executor Tools Examples
 
+> [!NOTE]
+> `examples/executor-tools` showcases **optional companion usage** of `@just-bash/executor` for tool-backing workflows.
+> It is not required for the Rust-first runtime path under `packages/just-bash/rust-core`.
+
 Demonstrates executor tool invocation in just-bash. Sandboxed JavaScript code running in `js-exec` calls tools that fetch from real public APIs — no API keys needed.
 
 ## Run

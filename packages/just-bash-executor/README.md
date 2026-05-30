@@ -1,5 +1,8 @@
 # @just-bash/executor
 
+This package is an optional companion for host-tool wiring and is not required by
+the active Rust runtime path in `packages/just-bash/rust-core`.
+
 Experimental tool-invocation companion for [`just-bash`](../just-bash). Wires
 `@executor-js/sdk` (and its GraphQL / OpenAPI / MCP plugins) into `just-bash`'s
 generic `invokeTool` hook so JavaScript code running in `js-exec` can call

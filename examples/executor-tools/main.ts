@@ -1,6 +1,10 @@
 /**
  * Executor Tools Examples
  *
+ * Optional companion showcase for `@just-bash/executor`.
+ * The Rust-first runtime path (`packages/just-bash/rust-core`) does not require
+ * these examples.
+ *
  * Runs all examples sequentially. You can also run each individually:
  *   npx tsx inline-tools.ts
  *   npx tsx multi-turn-discovery.ts

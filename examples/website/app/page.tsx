@@ -20,7 +20,7 @@ const NOSCRIPT_CONTENT = `
   FEATURES
   --------
 
-  - Pure TypeScript implementation
+  - Historical TypeScript in-browser demo (legacy path)
   - In-memory virtual filesystem
   - Secure sandboxed execution
   - Network access with URL filtering
@@ -29,7 +29,7 @@ const NOSCRIPT_CONTENT = `
   INSTALLATION
   ------------
 
-  npm install just-bash
+  npm install just-bash   # historical demo dependencies only
 
   BASIC USAGE
   -----------
