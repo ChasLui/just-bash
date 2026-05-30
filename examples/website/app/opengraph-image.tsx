@@ -69,9 +69,11 @@ export default async function Image() {
               justifyContent: "center",
             }}
           >
-            A sandboxed bash interpreter for AI agents.
+            Historical TypeScript in-browser demo (legacy path).
             <br />
-            Pure TypeScript with in-memory filesystem.
+            Active runtime is Rust-first in packages/just-bash/rust-core (just-bash-rs).
+            <br />
+            Historical docs in this site are for reference only.
           </div>
           <div
             style={{
@@ -94,7 +96,7 @@ export default async function Image() {
                 fontSize: "31px",
               }}
             >
-              npm install just-bash
+              npm install just-bash  # historical demo dependencies only
             </span>
           </div>
         </div>

@@ -1,6 +1,9 @@
 /**
  * Example 2: Multi-Turn Tool Discovery via createExecutor.setup
  *
+ * This is a @just-bash/executor companion example (optional when using the
+ * Rust-first runtime in packages/just-bash/rust-core).
+ *
  * Demonstrates an AI-agent pattern where tools are registered through the
  * `@executor-js/sdk` discovery pipeline rather than inline. The SDK applies
  * approval/elicitation gates to every call.

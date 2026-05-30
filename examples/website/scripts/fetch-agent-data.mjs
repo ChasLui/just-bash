@@ -82,7 +82,7 @@ This is an interactive demo of **just-bash** running entirely in your browser, w
 - Supports ANSI escape codes for styling
 
 ### 2. just-bash (Browser)
-- Pure TypeScript bash interpreter
+- Historical TypeScript in-browser demo (legacy path)
 - Runs locally in browser for regular commands
 - In-memory virtual filesystem with pre-loaded files
 - No network calls for basic commands like \`ls\`, \`cat\`, \`grep\`

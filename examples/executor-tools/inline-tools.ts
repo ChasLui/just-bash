@@ -1,6 +1,9 @@
 /**
  * Example 1: Inline Tools
  *
+ * This is a @just-bash/executor companion example (optional when using the
+ * Rust-first runtime in packages/just-bash/rust-core).
+ *
  * Demonstrates defining tools and calling them from sandboxed js-exec scripts.
  * No @executor-js/sdk plugins required for inline tools — only the SDK itself
  * is needed via @just-bash/executor's peer deps.

@@ -3,9 +3,9 @@ This file is distributed as dist/AGENTS.md in the npm package.
 It provides instructions for AI agents using just-bash in their projects.
 The build process copies this file to dist/AGENTS.md (removing this comment).
 
-This is a historical TypeScript-facing document. Active runtime is Rust-first
-(`packages/just-bash/rust-core`), with the TypeScript implementation now kept only
-under `legacy-ts/` for historical reference.
+This is a historical TypeScript-facing document and is kept for reference only.
+Active runtime is Rust-first in `packages/just-bash/rust-core`, with the TypeScript
+implementation now kept only under `legacy-ts/` for historical reference.
 
 TypeScript-specific validation notes (for example `src/readme.test.ts`) are archived
 and may not represent the active Rust implementation.
@@ -13,8 +13,10 @@ and may not represent the active Rust implementation.
 
 # AGENTS.md - just-bash
 
-> This document keeps the historical JavaScript/TypeScript usage shape that existed in the legacy implementation.
-> The active runtime is now Rust-first in `packages/just-bash/rust-core` (`just-bash-rs` CLI), and this guide is for **historical reference only**.
+> This document keeps the historical JavaScript/TypeScript usage shape from the legacy implementation.
+> It is for historical reference only; install and command examples here apply to the
+> legacy TypeScript-facing path and not the active Rust runtime.
+> The active runtime is now Rust-first in `packages/just-bash/rust-core` (`just-bash-rs` CLI).
 
 Instructions for AI agents using just-bash in projects.
 

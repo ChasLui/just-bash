@@ -4,7 +4,8 @@ This is an interactive demo of **just-bash** running entirely in your browser, w
 
 ## Architecture
 
-> This example reflects the historical browser execution path and is not part of the active Rust-first runtime in `packages/just-bash/rust-core`.
+> This example is historical TypeScript-facing documentation and is for reference only.
+> Active runtime is Rust-first in `packages/just-bash/rust-core` (`just-bash-rs` CLI).
 
 ```
 +----------------------------------------------------------+
@@ -38,7 +39,7 @@ This is an interactive demo of **just-bash** running entirely in your browser, w
 ## Components
 
 ### 1. just-bash (Browser)
-- In-browser execution path (historical TypeScript implementation used by this example)
+- In-browser execution path (historical TypeScript implementation used by this example; legacy path)
 - Runs locally in browser for regular commands
 - In-memory virtual filesystem with pre-loaded files
 - No network calls for basic commands like `ls`, `cat`, `grep`
@@ -86,6 +87,7 @@ This is an interactive demo of **just-bash** running entirely in your browser, w
 ## Development
 
 ```bash
+# Historical demo dependencies only (this example is not active runtime)
 pnpm install
 pnpm dev
 ```
