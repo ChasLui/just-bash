@@ -1,4 +1,0 @@
-dist
-# Legacy TypeScript archive artifacts (historical only)
-legacy-ts/**/*.js
-legacy-ts/**/*.d.ts

@@ -1,17 +1,23 @@
 # Rust-only migration
 
-This repository now uses Cargo as the only build and test entry point.
+This repository is Rust-only. Cargo is the single build and test entry point,
+and the legacy TypeScript implementation has been removed entirely.
 
-Removed legacy package-manager and JavaScript-tooling metadata includes:
+Removed in the final cleanup:
 
-- root Node package manifests and workspace locks (`package.json`,
-  `pnpm-lock.yaml`, `pnpm-workspace.yaml`),
-- example package manifests, pnpm locks, and TypeScript project configs,
-- package-level Node manifests and TypeScript/Vitest/Knip configs,
-- Biome formatter/linter configuration,
-- Rust crate-local lockfile in favor of the workspace `Cargo.lock`.
+- the archived TypeScript core (`packages/just-bash/legacy-ts`),
+- the TypeScript executor companion (`packages/just-bash-executor`),
+- all TypeScript examples (`examples/`),
+- the vendored CPython/Emscripten WASM assets used only by the TS runtime
+  (`packages/just-bash/vendor`),
+- Node/JavaScript release plumbing (`.changeset/`, npm package manifests,
+  `CHANGELOG.md`, `.npmignore`),
+- the TypeScript-specific threat model document.
 
-Use these commands instead:
+The Rust core in `packages/just-bash/rust-core` is fully self-contained and does
+not depend on any of the removed assets.
+
+Use these commands:
 
 ```bash
 cargo fmt --all --check
