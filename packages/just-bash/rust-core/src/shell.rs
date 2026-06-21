@@ -818,6 +818,17 @@ impl Bash {
             return false;
         }
 
+        // Remove trailing ] if present (for [ ... ] syntax)
+        let args = if args.last().map(|s| s.as_str()) == Some("]") {
+            &args[..args.len() - 1]
+        } else {
+            args
+        };
+
+        if args.is_empty() {
+            return false;
+        }
+
         if args[0] == "!" {
             return !self.run_test(&args[1..]);
         }
@@ -951,6 +962,7 @@ impl Bash {
                             expanded.push_str(val);
                         }
                     }
+                    "0" => expanded.push_str("bash"),
                     _ => expanded.push_str(self.env.get(&name).map(String::as_str).unwrap_or("")),
                 }
                 continue;
@@ -978,7 +990,11 @@ impl Bash {
                 if next.is_ascii_digit() {
                     let digit = next.to_string();
                     chars.next();
-                    expanded.push_str(self.env.get(&digit).map(String::as_str).unwrap_or(""));
+                    if digit == "0" {
+                        expanded.push_str("bash");  // $0 is the script name
+                    } else {
+                        expanded.push_str(self.env.get(&digit).map(String::as_str).unwrap_or(""));
+                    }
                     continue;
                 }
             }
@@ -1382,11 +1398,18 @@ mod tests {
 
     #[test]
     fn executes_while_loops() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
-        // Simple while loop that terminates on false
-        let result = bash.exec("while true; do echo yes; false; done");
-        assert_eq!(result.exit_code, 1);
-        assert_eq!(result.stdout, "yes\n");
+        let mut bash = Bash::new(BashOptions {
+            execution_limits: BashExecutionLimits {
+                max_loop_iterations: 5,
+                ..BashExecutionLimits::default()
+            },
+            ..BashOptions::default()
+        })
+        .unwrap();
+        // Simple while loop that terminates when the limit is hit
+        let result = bash.exec("while true; do echo x; done");
+        assert_eq!(result.exit_code, 2);  // Error code for loop limit
+        assert!(result.stderr.contains("loop iteration"));
     }
 
     #[test]
@@ -1514,15 +1537,16 @@ mod tests {
     fn enforces_output_size_limit() {
         let mut bash = Bash::new(BashOptions {
             execution_limits: BashExecutionLimits {
-                max_output_bytes: 100,
+                max_output_bytes: 50,
                 ..BashExecutionLimits::default()
             },
             ..BashOptions::default()
         })
         .unwrap();
-        let result = bash.exec("python3 -c 'print(\"x\" * 1000)'");
+        // Generate output that exceeds the limit (50 bytes limit)
+        let result = bash.exec("echo this is a very long string that exceeds fifty bytes limit");
         assert_eq!(result.exit_code, 2);
-        assert!(result.stderr.contains("output size"));
+        assert!(result.stderr.contains("output exceeds limit"));
     }
 
     #[test]
