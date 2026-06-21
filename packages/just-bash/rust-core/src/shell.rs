@@ -1110,6 +1110,10 @@ impl Bash {
     }
 
     fn exec_command_substitution(&mut self, script: &str) -> String {
+        if let Some(value) = self.try_eval_arithmetic_substitution(script) {
+            return value.to_string();
+        }
+
         let mut child = self.clone();
         match child.exec_in_current_state(script) {
             result => {
@@ -1119,6 +1123,18 @@ impl Bash {
                 result.stdout.trim_end_matches('\n').to_string()
             }
         }
+    }
+
+    fn try_eval_arithmetic_substitution(&self, script: &str) -> Option<i64> {
+        let mut expr = script.strip_prefix('(').unwrap_or(script).trim();
+        if expr.ends_with(')') {
+            expr = &expr[..expr.len().saturating_sub(1)];
+            expr = expr.trim_end();
+        }
+        if expr.is_empty() || !looks_like_arithmetic_expr(expr) {
+            return None;
+        }
+        eval_arithmetic_expr(expr, &self.env).ok()
     }
 
     fn expand_text(&self, text: &str) -> String {
@@ -1265,6 +1281,161 @@ fn parse_line_count_args(args: &[String]) -> (usize, &[String]) {
         (count, &args[2..])
     } else {
         (10, args)
+    }
+}
+
+fn looks_like_arithmetic_expr(expr: &str) -> bool {
+    expr.chars().all(|ch| {
+        ch.is_ascii_alphanumeric()
+            || ch == '_'
+            || ch == '+'
+            || ch == '-'
+            || ch == '*'
+            || ch == '/'
+            || ch == '%'
+            || ch == '('
+            || ch == ')'
+            || ch.is_ascii_whitespace()
+    })
+}
+
+fn eval_arithmetic_expr(expr: &str, env: &BTreeMap<String, String>) -> Result<i64, ()> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Tok<'a> {
+        Num(i64),
+        Ident(&'a str),
+        Plus,
+        Minus,
+        Mul,
+        Div,
+        Mod,
+        LParen,
+        RParen,
+    }
+
+    fn precedence(tok: Tok<'_>) -> i32 {
+        match tok {
+            Tok::Plus | Tok::Minus => 1,
+            Tok::Mul | Tok::Div | Tok::Mod => 2,
+            _ => 0,
+        }
+    }
+
+    fn apply_op(values: &mut Vec<i64>, op: Tok<'_>) -> Result<(), ()> {
+        let rhs = values.pop().ok_or(())?;
+        let lhs = values.pop().ok_or(())?;
+        let value = match op {
+            Tok::Plus => lhs + rhs,
+            Tok::Minus => lhs - rhs,
+            Tok::Mul => lhs * rhs,
+            Tok::Div => {
+                if rhs == 0 {
+                    return Err(());
+                }
+                lhs / rhs
+            }
+            Tok::Mod => {
+                if rhs == 0 {
+                    return Err(());
+                }
+                lhs % rhs
+            }
+            _ => return Err(()),
+        };
+        values.push(value);
+        Ok(())
+    }
+
+    let mut tokens = Vec::new();
+    let mut index = 0usize;
+    let bytes = expr.as_bytes();
+    while index < bytes.len() {
+        let ch = bytes[index] as char;
+        if ch.is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if ch.is_ascii_digit() {
+            let start = index;
+            while index < bytes.len() && (bytes[index] as char).is_ascii_digit() {
+                index += 1;
+            }
+            let value = expr[start..index].parse::<i64>().map_err(|_| ())?;
+            tokens.push(Tok::Num(value));
+            continue;
+        }
+        if ch == '_' || ch.is_ascii_alphabetic() {
+            let start = index;
+            while index < bytes.len() {
+                let c = bytes[index] as char;
+                if c == '_' || c.is_ascii_alphanumeric() {
+                    index += 1;
+                } else {
+                    break;
+                }
+            }
+            tokens.push(Tok::Ident(&expr[start..index]));
+            continue;
+        }
+        let tok = match ch {
+            '+' => Tok::Plus,
+            '-' => Tok::Minus,
+            '*' => Tok::Mul,
+            '/' => Tok::Div,
+            '%' => Tok::Mod,
+            '(' => Tok::LParen,
+            ')' => Tok::RParen,
+            _ => return Err(()),
+        };
+        tokens.push(tok);
+        index += 1;
+    }
+
+    let mut values: Vec<i64> = Vec::new();
+    let mut ops: Vec<Tok<'_>> = Vec::new();
+
+    for token in tokens {
+        match token {
+            Tok::Num(value) => values.push(value),
+            Tok::Ident(name) => {
+                let value = env
+                    .get(name)
+                    .and_then(|v| v.trim().parse::<i64>().ok())
+                    .unwrap_or(0);
+                values.push(value);
+            }
+            Tok::LParen => ops.push(token),
+            Tok::RParen => {
+                while let Some(op) = ops.pop() {
+                    if op == Tok::LParen {
+                        break;
+                    }
+                    apply_op(&mut values, op)?;
+                }
+            }
+            Tok::Plus | Tok::Minus | Tok::Mul | Tok::Div | Tok::Mod => {
+                while let Some(&op) = ops.last() {
+                    if op == Tok::LParen || precedence(op) < precedence(token) {
+                        break;
+                    }
+                    let op = ops.pop().ok_or(())?;
+                    apply_op(&mut values, op)?;
+                }
+                ops.push(token);
+            }
+        }
+    }
+
+    while let Some(op) = ops.pop() {
+        if op == Tok::LParen {
+            return Err(());
+        }
+        apply_op(&mut values, op)?;
+    }
+    if values.len() == 1 {
+        Ok(values[0])
+    } else {
+        Err(())
     }
 }
 
@@ -1702,6 +1873,22 @@ mod tests {
         let result = bash.exec("echo $(echo $(echo nested))");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "nested\n");
+    }
+
+    #[test]
+    fn supports_arithmetic_expansion() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("i=1; i=$((i + 2 * 3)); echo $i");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "7\n");
+    }
+
+    #[test]
+    fn while_loop_with_arithmetic_counter() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("i=0; while [ \"$i\" -lt 3 ]; do echo $i; i=$((i + 1)); done");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "0\n1\n2\n");
     }
 
     // ─── Special variables tests ───────────────────────────────────────────

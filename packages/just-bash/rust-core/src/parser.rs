@@ -592,10 +592,14 @@ fn lex(source: &str, limits: ParseLimits) -> Result<Vec<Token>, BashError> {
             // command substitution $(...): execute and substitute
             (quote_state, '$') if quote_state != Some(Quote::Single) => {
                 if chars.next_if_eq(&'(').is_some() {
-                    let inner = consume_command_substitution(
-                        &mut chars,
-                        limits.max_command_substitution_depth,
-                    )?;
+                    let inner = if chars.next_if_eq(&'(').is_some() {
+                        consume_arithmetic_substitution(&mut chars)?
+                    } else {
+                        consume_command_substitution(
+                            &mut chars,
+                            limits.max_command_substitution_depth,
+                        )?
+                    };
                     // Each $(...) is its own CommandSub part (never merged)
                     current_started = true;
                     current.parts.push(WordPart {
@@ -659,6 +663,7 @@ fn consume_command_substitution(
                 output.push(ch);
                 quote = None;
             }
+
             Some(Quote::Double) if ch == '"' => {
                 output.push(ch);
                 quote = None;
@@ -714,6 +719,64 @@ fn consume_command_substitution(
 
     Err(BashError::Parse(
         "unexpected EOF while looking for matching `)`".to_string(),
+    ))
+}
+
+/// Consume an arithmetic expansion body after `$((` and stop at the matching `))`.
+fn consume_arithmetic_substitution(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<String, BashError> {
+    let mut output = String::new();
+    let mut depth = 0usize;
+    let mut quote = None;
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(Quote::Single) if ch == '\'' => {
+                output.push(ch);
+                quote = None;
+            }
+            Some(Quote::Double) if ch == '"' => {
+                output.push(ch);
+                quote = None;
+            }
+            Some(Quote::Single) | Some(Quote::Double) => output.push(ch),
+            None => match ch {
+                '\'' => {
+                    output.push(ch);
+                    quote = Some(Quote::Single);
+                }
+                '"' => {
+                    output.push(ch);
+                    quote = Some(Quote::Double);
+                }
+                '\\' => {
+                    output.push(ch);
+                    if let Some(next) = chars.next() {
+                        output.push(next);
+                    }
+                }
+                '(' => {
+                    depth += 1;
+                    output.push(ch);
+                }
+                ')' => {
+                    if depth > 0 {
+                        depth -= 1;
+                        output.push(ch);
+                    } else if chars.next_if_eq(&')').is_some() {
+                        return Ok(output);
+                    } else {
+                        output.push(ch);
+                    }
+                }
+                _ => output.push(ch),
+            },
+        }
+    }
+
+    Err(BashError::Parse(
+        "unexpected EOF while looking for matching '))'".to_string(),
     ))
 }
 
@@ -858,6 +921,16 @@ mod tests {
         assert_eq!(sub_word.parts.len(), 1);
         assert_eq!(sub_word.parts[0].kind, WordPartKind::CommandSub);
         assert_eq!(sub_word.parts[0].text, "printf 'a|b;c'");
+    }
+
+    #[test]
+    fn keeps_arithmetic_substitution_body_without_trailing_paren() {
+        let script = parse_script("echo $((i + 2 * 3))").unwrap();
+        let cmds = pipeline_cmds(&script, 0);
+        let sub_word = &cmds[0].words[1];
+        assert_eq!(sub_word.parts.len(), 1);
+        assert_eq!(sub_word.parts[0].kind, WordPartKind::CommandSub);
+        assert_eq!(sub_word.parts[0].text, "i + 2 * 3");
     }
 
     #[test]
