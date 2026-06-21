@@ -425,7 +425,7 @@ fn parse_for(tokens: &[Token], pos: &mut usize) -> Result<ForStatement, BashErro
         _ => {
             return Err(BashError::Parse(
                 "syntax error: expected variable name after 'for'".to_string(),
-            ))
+            ));
         }
     };
 
@@ -437,7 +437,7 @@ fn parse_for(tokens: &[Token], pos: &mut usize) -> Result<ForStatement, BashErro
         _ => {
             return Err(BashError::Parse(
                 "syntax error: expected 'in' after for variable".to_string(),
-            ))
+            ));
         }
     }
 
@@ -465,7 +465,7 @@ fn parse_for(tokens: &[Token], pos: &mut usize) -> Result<ForStatement, BashErro
         _ => {
             return Err(BashError::Parse(
                 "syntax error: expected 'do' in for loop".to_string(),
-            ))
+            ));
         }
     }
 
@@ -825,14 +825,14 @@ mod tests {
             error.to_string().contains("&&"),
             "expected token '&&' in error: {error}"
         );
-        
+
         // "echo || || echo" should error (empty right side of first ||)
         let error = parse_script("echo || || echo").unwrap_err();
         assert!(
             error.to_string().contains("||"),
             "expected token '||' in error: {error}"
         );
-        
+
         // Note: "| echo" is now accepted as just "echo" (leading pipe ignored)
         // This is a design choice in the recursive-descent parser
         let script = parse_script("| echo").unwrap();
@@ -884,10 +884,9 @@ mod tests {
 
     #[test]
     fn parses_if_elif_else_fi() {
-        let script = parse_script(
-            "if true; then echo yes; elif false; then echo mid; else echo no; fi",
-        )
-        .unwrap();
+        let script =
+            parse_script("if true; then echo yes; elif false; then echo mid; else echo no; fi")
+                .unwrap();
         assert_eq!(script.statements.len(), 1);
         let StatementKind::If(if_stmt) = &script.statements[0].kind else {
             panic!("expected If");
