@@ -295,6 +295,24 @@ fn lex(source: &str) -> Result<Vec<Token>, BashError> {
                 }
             }
             (Some(Quote::Single), c) => push_part(&mut current, c, false, &mut current_started),
+            (quote_state, '$') if quote_state != Some(Quote::Single) => {
+                if chars.next_if_eq(&'(').is_some() {
+                    let command_substitution = consume_command_substitution(&mut chars)?;
+                    push_text(
+                        &mut current,
+                        &command_substitution,
+                        false,
+                        &mut current_started,
+                    );
+                } else {
+                    push_part(
+                        &mut current,
+                        '$',
+                        quote_state != Some(Quote::Single),
+                        &mut current_started,
+                    );
+                }
+            }
             (_, '\\') => {
                 if let Some(next) = chars.next() {
                     push_part(
@@ -323,6 +341,56 @@ fn lex(source: &str) -> Result<Vec<Token>, BashError> {
     Ok(tokens)
 }
 
+fn consume_command_substitution(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<String, BashError> {
+    let mut output = String::from("$(");
+    let mut depth = 1usize;
+    let mut quote = None;
+
+    while let Some(ch) = chars.next() {
+        output.push(ch);
+        match quote {
+            Some(Quote::Single) if ch == '\'' => quote = None,
+            Some(Quote::Double) if ch == '"' => quote = None,
+            Some(Quote::Single) => {}
+            Some(Quote::Double) => {
+                if ch == '\\' {
+                    if let Some(next) = chars.next() {
+                        output.push(next);
+                    }
+                }
+            }
+            None => match ch {
+                '\'' => quote = Some(Quote::Single),
+                '"' => quote = Some(Quote::Double),
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        output.push(next);
+                    }
+                }
+                '$' => {
+                    if chars.next_if_eq(&'(').is_some() {
+                        output.push('(');
+                        depth += 1;
+                    }
+                }
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(output);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+
+    Err(BashError::Parse(
+        "unexpected EOF while looking for matching `)`".to_string(),
+    ))
+}
+
 fn push_part(word: &mut Word, ch: char, expand: bool, current_started: &mut bool) {
     *current_started = true;
     if let Some(part) = word.parts.last_mut().filter(|part| part.expand == expand) {
@@ -330,6 +398,18 @@ fn push_part(word: &mut Word, ch: char, expand: bool, current_started: &mut bool
     } else {
         word.parts.push(WordPart {
             text: ch.to_string(),
+            expand,
+        });
+    }
+}
+
+fn push_text(word: &mut Word, text: &str, expand: bool, current_started: &mut bool) {
+    *current_started = true;
+    if let Some(part) = word.parts.last_mut().filter(|part| part.expand == expand) {
+        part.text.push_str(text);
+    } else {
+        word.parts.push(WordPart {
+            text: text.to_string(),
             expand,
         });
     }
@@ -440,6 +520,26 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "syntax error near unexpected token `newline'"
+        );
+    }
+
+    #[test]
+    fn keeps_command_substitutions_intact_while_lexing_operators() {
+        let script = parse_script("echo $(printf 'a|b;c') | cat && echo done").unwrap();
+        assert_eq!(script.pipelines.len(), 2);
+        assert_eq!(script.pipelines[0].commands.len(), 2);
+        assert_eq!(
+            script.pipelines[0].commands[0].words[1].text(),
+            "$(printf 'a|b;c')"
+        );
+    }
+
+    #[test]
+    fn errors_on_unclosed_command_substitution() {
+        let error = parse_script("echo $(printf hi").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unexpected EOF while looking for matching `)`"
         );
     }
 }
