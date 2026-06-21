@@ -319,49 +319,61 @@ impl Bash {
     }
 
     fn exec_if(&mut self, if_stmt: &IfStatement) -> (String, String, i32) {
-        let cond_exit = self.exec_statement_list(&if_stmt.condition);
+        let (_, _, cond_exit) = self.exec_statement_list(&if_stmt.condition);
         if cond_exit == 0 {
-            let result = self.exec_statement_list(&if_stmt.body);
-            return (String::new(), String::new(), result);
+            return self.exec_statement_list(&if_stmt.body);
         }
 
         for (elif_cond, elif_body) in &if_stmt.elif_clauses {
-            let elif_exit = self.exec_statement_list(elif_cond);
+            let (_, _, elif_exit) = self.exec_statement_list(elif_cond);
             if elif_exit == 0 {
-                let result = self.exec_statement_list(elif_body);
-                return (String::new(), String::new(), result);
+                return self.exec_statement_list(elif_body);
             }
         }
 
-        let result = if let Some(else_body) = &if_stmt.else_body {
+        if let Some(else_body) = &if_stmt.else_body {
             self.exec_statement_list(else_body)
         } else {
-            0
-        };
-        (String::new(), String::new(), result)
+            (String::new(), String::new(), 0)
+        }
     }
 
     fn exec_while(&mut self, while_stmt: &WhileStatement) -> (String, String, i32) {
+        let mut stdout = String::new();
         let mut stderr = String::new();
         let mut exit_code = 0;
 
-        while self.exec_statement_list(&while_stmt.condition) == 0 {
+        loop {
+            let (_, _, cond_exit) = self.exec_statement_list(&while_stmt.condition);
+            if cond_exit != 0 {
+                break;
+            }
+
             self.loop_iteration_count += 1;
             if self.loop_iteration_count > self.execution_limits.max_loop_iterations {
                 stderr.push_str(&format!(
                     "bash: loop iteration limit exceeded ({})\n",
                     self.execution_limits.max_loop_iterations
                 ));
-                return (String::new(), stderr, 2);
+                return (stdout, stderr, 2);
             }
 
-            exit_code = self.exec_statement_list(&while_stmt.body);
+            let (body_stdout, body_stderr, body_exit) = self.exec_statement_list(&while_stmt.body);
+            stdout.push_str(&body_stdout);
+            stderr.push_str(&body_stderr);
+            exit_code = body_exit;
+
+            self.output_bytes_used += body_stdout.len() + body_stderr.len();
+            if let Err(_) = self.check_output_limit(&mut stderr) {
+                return (stdout, stderr, 2);
+            }
         }
 
-        (String::new(), stderr, exit_code)
+        (stdout, stderr, exit_code)
     }
 
     fn exec_for(&mut self, for_stmt: &ForStatement) -> (String, String, i32) {
+        let mut stdout = String::new();
         let mut stderr = String::new();
         let mut exit_code = 0;
 
@@ -381,17 +393,28 @@ impl Bash {
                     "bash: loop iteration limit exceeded ({})\n",
                     self.execution_limits.max_loop_iterations
                 ));
-                return (String::new(), stderr, 2);
+                return (stdout, stderr, 2);
             }
 
             self.env.insert(for_stmt.var.clone(), item);
-            exit_code = self.exec_statement_list(&for_stmt.body);
+
+            let (body_stdout, body_stderr, body_exit) = self.exec_statement_list(&for_stmt.body);
+            stdout.push_str(&body_stdout);
+            stderr.push_str(&body_stderr);
+            exit_code = body_exit;
+
+            self.output_bytes_used += body_stdout.len() + body_stderr.len();
+            if let Err(_) = self.check_output_limit(&mut stderr) {
+                return (stdout, stderr, 2);
+            }
         }
 
-        (String::new(), stderr, exit_code)
+        (stdout, stderr, exit_code)
     }
 
-    fn exec_statement_list(&mut self, statements: &[Statement]) -> i32 {
+    fn exec_statement_list(&mut self, statements: &[Statement]) -> (String, String, i32) {
+        let mut stdout = String::new();
+        let mut stderr = String::new();
         let mut exit_code = 0;
 
         for statement in statements {
@@ -404,11 +427,18 @@ impl Bash {
                 continue;
             }
 
-            let (_, _, code) = self.exec_statement(statement);
+            let (stmt_stdout, stmt_stderr, code) = self.exec_statement(statement);
+            stdout.push_str(&stmt_stdout);
+            stderr.push_str(&stmt_stderr);
             exit_code = code;
+
+            self.output_bytes_used += stmt_stdout.len() + stmt_stderr.len();
+            if let Err(_) = self.check_output_limit(&mut stderr) {
+                return (stdout, stderr, 2);
+            }
         }
 
-        exit_code
+        (stdout, stderr, exit_code)
     }
 
     fn check_output_limit(&mut self, stderr: &mut String) -> Result<(), ()> {
@@ -913,10 +943,47 @@ impl Bash {
                     }
                     name.push(next);
                 }
-                expanded.push_str(self.expand_special_var(&name));
+                match name.as_str() {
+                    "?" => expanded.push_str(&self.last_exit_code.to_string()),
+                    "#" => expanded.push('0'),  // No args yet
+                    "@" | "*" => {
+                        if let Some(val) = self.env.get("@") {
+                            expanded.push_str(val);
+                        }
+                    }
+                    _ => expanded.push_str(self.env.get(&name).map(String::as_str).unwrap_or("")),
+                }
                 continue;
             }
 
+            // Check for special single-character variables first ($?, $#, etc)
+            if let Some(&next) = chars.peek() {
+                if next == '?' {
+                    chars.next();
+                    expanded.push_str(&self.last_exit_code.to_string());
+                    continue;
+                }
+                if next == '#' {
+                    chars.next();
+                    expanded.push('0');  // No positional args yet
+                    continue;
+                }
+                if next == '@' || next == '*' {
+                    chars.next();
+                    if let Some(val) = self.env.get("@") {
+                        expanded.push_str(val);
+                    }
+                    continue;
+                }
+                if next.is_ascii_digit() {
+                    let digit = next.to_string();
+                    chars.next();
+                    expanded.push_str(self.env.get(&digit).map(String::as_str).unwrap_or(""));
+                    continue;
+                }
+            }
+
+            // Otherwise, extract alphanumeric variable name
             let mut name = String::new();
             while let Some(&next) = chars.peek() {
                 if next == '_' || next.is_ascii_alphanumeric() {
@@ -929,36 +996,12 @@ impl Bash {
 
             if name.is_empty() {
                 expanded.push('$');
-            } else if name == "?" {
-                expanded.push_str(&self.last_exit_code.to_string());
-            } else if name == "#" {
-                if let Ok(argv) = std::env::var("ARGV") {
-                    expanded.push_str(&argv.split_whitespace().count().to_string());
-                } else {
-                    expanded.push('0');
-                }
-            } else if name == "@" || name == "*" {
-                if let Some(val) = self.env.get("@") {
-                    expanded.push_str(val);
-                }
             } else {
                 expanded.push_str(self.env.get(&name).map(String::as_str).unwrap_or(""));
             }
         }
 
         expanded
-    }
-
-    fn expand_special_var(&self, name: &str) -> &str {
-        if name == "?" {
-            if self.last_exit_code == 0 {
-                "0"
-            } else {
-                "1"
-            }
-        } else {
-            self.env.get(name).map(String::as_str).unwrap_or("")
-        }
     }
 }
 
@@ -1310,4 +1353,213 @@ mod tests {
         assert_eq!(result.exit_code, 2);
         assert_eq!(result.stderr, "bash: command count exceeds limit (2)\n");
     }
+
+    // ─── Control-flow tests ───────────────────────────────────────────────
+
+    #[test]
+    fn executes_if_statements() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("if true; then echo yes; fi");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "yes\n");
+    }
+
+    #[test]
+    fn executes_if_else_statements() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("if false; then echo yes; else echo no; fi");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "no\n");
+    }
+
+    #[test]
+    fn executes_if_elif_statements() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("if false; then echo a; elif true; then echo b; else echo c; fi");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "b\n");
+    }
+
+    #[test]
+    fn executes_while_loops() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        // Simple while loop that terminates on false
+        let result = bash.exec("while true; do echo yes; false; done");
+        assert_eq!(result.exit_code, 1);
+        assert_eq!(result.stdout, "yes\n");
+    }
+
+    #[test]
+    fn executes_for_loops() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("for i in a b c; do echo $i; done");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "a\nb\nc\n");
+    }
+
+    // ─── Command substitution tests ────────────────────────────────────────
+
+    #[test]
+    fn executes_command_substitution() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("echo $(echo hello)");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "hello\n");
+    }
+
+    #[test]
+    fn command_substitution_strips_trailing_newlines() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("echo $(echo -e \"a\\nb\\nc\")");
+        assert_eq!(result.exit_code, 0);
+        // Trailing newlines are stripped but internal ones are preserved
+        assert!(result.stdout.contains("a") && result.stdout.contains("b") && result.stdout.contains("c"));
+    }
+
+    #[test]
+    fn nested_command_substitutions() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("echo $(echo $(echo nested))");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "nested\n");
+    }
+
+    // ─── Special variables tests ───────────────────────────────────────────
+
+    #[test]
+    fn special_variable_exit_code() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("true; echo $?");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "0\n");
+    }
+
+    #[test]
+    fn special_variable_exit_code_after_failure() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("false; echo $?");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "1\n");
+    }
+
+    #[test]
+    fn special_variable_script_name() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("echo $0");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "bash\n");
+    }
+
+    // ─── Test builtin tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_builtin_string_empty() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("test -z \"\"; echo $?");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "0\n");
+    }
+
+    #[test]
+    fn test_builtin_string_not_empty() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("test -z \"hello\"; echo $?");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "1\n");
+    }
+
+    #[test]
+    fn test_builtin_string_not_null() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("test -n \"hello\"; echo $?");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "0\n");
+    }
+
+    #[test]
+    fn test_builtin_string_equal() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("test \"a\" = \"a\"; echo $?");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "0\n");
+    }
+
+    #[test]
+    fn test_builtin_numeric_equal() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("test 5 -eq 5; echo $?");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "0\n");
+    }
+
+    #[test]
+    fn test_builtin_numeric_less_than() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("test 3 -lt 5; echo $?");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "0\n");
+    }
+
+    #[test]
+    fn bracket_test_builtin() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("[ \"a\" = \"a\" ]; echo $?");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "0\n");
+    }
+
+    // ─── Execution limits tests ────────────────────────────────────────────
+
+    #[test]
+    fn enforces_output_size_limit() {
+        let mut bash = Bash::new(BashOptions {
+            execution_limits: BashExecutionLimits {
+                max_output_bytes: 100,
+                ..BashExecutionLimits::default()
+            },
+            ..BashOptions::default()
+        })
+        .unwrap();
+        let result = bash.exec("python3 -c 'print(\"x\" * 1000)'");
+        assert_eq!(result.exit_code, 2);
+        assert!(result.stderr.contains("output size"));
+    }
+
+    #[test]
+    fn enforces_loop_iteration_limit() {
+        let mut bash = Bash::new(BashOptions {
+            execution_limits: BashExecutionLimits {
+                max_loop_iterations: 10,
+                ..BashExecutionLimits::default()
+            },
+            ..BashOptions::default()
+        })
+        .unwrap();
+        let result = bash.exec("i=0; while [ 1 ]; do i=$((i + 1)); done");
+        assert_eq!(result.exit_code, 2);
+        assert!(result.stderr.contains("loop iteration"));
+    }
+
+    // ─── Complex scenarios ────────────────────────────────────────────────
+
+    #[test]
+    fn complex_script_with_conditionals_and_substitution() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec(
+            "result=$(echo \"test\"); if [ \"$result\" = \"test\" ]; then echo pass; fi"
+        );
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "pass\n");
+    }
+
+    #[test]
+    fn for_loop_with_command_substitution() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("for i in $(echo -e \"1\\n2\\n3\"); do echo $i; done");
+        assert_eq!(result.exit_code, 0);
+        assert!(result.stdout.contains("1"));
+        assert!(result.stdout.contains("2"));
+        assert!(result.stdout.contains("3"));
+    }
 }
+
