@@ -4,7 +4,8 @@ pub mod shell;
 
 pub use fs::{BashError, InMemoryFs};
 pub use parser::{
-    CommandInvocation, ParseLimits, Pipeline, PipelineConnector, Redirect, RedirectMode, Script,
-    Word, WordPart, parse_script, parse_script_with_limits,
+    CommandInvocation, ForStatement, IfStatement, ParseLimits, PipelineConnector, Redirect,
+    RedirectMode, Script, Statement, StatementKind, WhileStatement, Word, WordPart, WordPartKind,
+    parse_script, parse_script_with_limits,
 };
 pub use shell::{Bash, BashExecResult, BashExecutionLimits, BashOptions};
