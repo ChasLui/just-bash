@@ -8,7 +8,12 @@ and provides:
 - a quote-aware shell parser,
 - a small execution engine with built-ins, pipelines, redirections, and
   environment expansion,
+- default per-`exec` shell-state isolation (filesystem remains shared),
+- configurable execution limits for script size, command count, and command
+  substitution depth,
 - a native `just-bash-rs` CLI for running snippets from argv or stdin.
+
+Security model details: [`THREAT_MODEL.md`](./THREAT_MODEL.md).
 
 ## Workspace layout
 
