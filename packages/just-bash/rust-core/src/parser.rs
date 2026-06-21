@@ -1,5 +1,18 @@
 use crate::fs::BashError;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseLimits {
+    pub max_command_substitution_depth: usize,
+}
+
+impl Default for ParseLimits {
+    fn default() -> Self {
+        Self {
+            max_command_substitution_depth: 50,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Script {
     pub pipelines: Vec<Pipeline>,
@@ -106,7 +119,11 @@ enum Quote {
 }
 
 pub fn parse_script(source: &str) -> Result<Script, BashError> {
-    let tokens = lex(source)?;
+    parse_script_with_limits(source, ParseLimits::default())
+}
+
+pub fn parse_script_with_limits(source: &str, limits: ParseLimits) -> Result<Script, BashError> {
+    let tokens = lex(source, limits)?;
     let mut pipelines = Vec::new();
     let mut commands = Vec::new();
     let mut words = Vec::new();
@@ -231,7 +248,7 @@ fn push_command(
     Ok(true)
 }
 
-fn lex(source: &str) -> Result<Vec<Token>, BashError> {
+fn lex(source: &str, limits: ParseLimits) -> Result<Vec<Token>, BashError> {
     let mut tokens = Vec::new();
     let mut current = Word { parts: Vec::new() };
     let mut current_started = false;
@@ -297,7 +314,10 @@ fn lex(source: &str) -> Result<Vec<Token>, BashError> {
             (Some(Quote::Single), c) => push_part(&mut current, c, false, &mut current_started),
             (quote_state, '$') if quote_state != Some(Quote::Single) => {
                 if chars.next_if_eq(&'(').is_some() {
-                    let command_substitution = consume_command_substitution(&mut chars)?;
+                    let command_substitution = consume_command_substitution(
+                        &mut chars,
+                        limits.max_command_substitution_depth,
+                    )?;
                     push_text(
                         &mut current,
                         &command_substitution,
@@ -343,6 +363,7 @@ fn lex(source: &str) -> Result<Vec<Token>, BashError> {
 
 fn consume_command_substitution(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    max_depth: usize,
 ) -> Result<String, BashError> {
     let mut output = String::from("$(");
     let mut depth = 1usize;
@@ -373,6 +394,11 @@ fn consume_command_substitution(
                     if chars.next_if_eq(&'(').is_some() {
                         output.push('(');
                         depth += 1;
+                        if depth > max_depth {
+                            return Err(BashError::Parse(format!(
+                                "command substitution nesting exceeds limit ({max_depth})"
+                            )));
+                        }
                     }
                 }
                 ')' => {
@@ -540,6 +566,19 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "unexpected EOF while looking for matching `)`"
+        );
+    }
+
+    #[test]
+    fn rejects_excessive_command_substitution_nesting() {
+        let limits = ParseLimits {
+            max_command_substitution_depth: 2,
+        };
+        let error =
+            parse_script_with_limits("echo $(printf $(printf $(printf hi)))", limits).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "command substitution nesting exceeds limit (2)"
         );
     }
 }

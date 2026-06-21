@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 
 use crate::fs::{BashError, InMemoryFs, normalize_absolute, parent_dir};
-use crate::parser::{CommandInvocation, PipelineConnector, RedirectMode, Word, parse_script};
+use crate::parser::{
+    CommandInvocation, ParseLimits, PipelineConnector, RedirectMode, Word, parse_script_with_limits,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BashExecResult {
@@ -11,11 +13,42 @@ pub struct BashExecResult {
     pub cwd: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BashExecutionLimits {
+    pub max_script_size_bytes: usize,
+    pub max_command_count: usize,
+    pub max_command_substitution_depth: usize,
+}
+
+impl Default for BashExecutionLimits {
+    fn default() -> Self {
+        Self {
+            max_script_size_bytes: 1_048_576,
+            max_command_count: 10_000,
+            max_command_substitution_depth: 50,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BashOptions {
     pub files: BTreeMap<String, String>,
     pub env: BTreeMap<String, String>,
     pub cwd: Option<String>,
+    pub isolate_exec: bool,
+    pub execution_limits: BashExecutionLimits,
+}
+
+impl Default for BashOptions {
+    fn default() -> Self {
+        Self {
+            files: BTreeMap::new(),
+            env: BTreeMap::new(),
+            cwd: None,
+            isolate_exec: true,
+            execution_limits: BashExecutionLimits::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +56,10 @@ pub struct Bash {
     fs: InMemoryFs,
     env: BTreeMap<String, String>,
     cwd: String,
+    initial_env: BTreeMap<String, String>,
+    initial_cwd: String,
+    isolate_exec: bool,
+    execution_limits: BashExecutionLimits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,11 +78,58 @@ impl Bash {
         env.entry("HOME".to_string())
             .or_insert_with(|| "/home/user".to_string());
         env.entry("PWD".to_string()).or_insert_with(|| cwd.clone());
-        Ok(Self { fs, env, cwd })
+        Ok(Self {
+            fs,
+            env: env.clone(),
+            cwd: cwd.clone(),
+            initial_env: env,
+            initial_cwd: cwd,
+            isolate_exec: options.isolate_exec,
+            execution_limits: options.execution_limits,
+        })
     }
 
     pub fn exec(&mut self, script: &str) -> BashExecResult {
-        let parsed = match parse_script(script) {
+        if script.len() > self.execution_limits.max_script_size_bytes {
+            return BashExecResult {
+                stdout: String::new(),
+                stderr: format!(
+                    "bash: script exceeds limit ({} bytes)\n",
+                    self.execution_limits.max_script_size_bytes
+                ),
+                exit_code: 2,
+                cwd: if self.isolate_exec {
+                    self.initial_cwd.clone()
+                } else {
+                    self.cwd.clone()
+                },
+            };
+        }
+
+        if self.isolate_exec {
+            let saved_env = self.env.clone();
+            let saved_cwd = self.cwd.clone();
+            self.env = self.initial_env.clone();
+            self.cwd = self.initial_cwd.clone();
+            self.env.insert("PWD".to_string(), self.cwd.clone());
+            let result = self.exec_in_current_state(script);
+            self.env = saved_env;
+            self.cwd = saved_cwd;
+            result
+        } else {
+            self.exec_in_current_state(script)
+        }
+    }
+
+    fn exec_in_current_state(&mut self, script: &str) -> BashExecResult {
+        let parsed = match parse_script_with_limits(
+            script,
+            ParseLimits {
+                max_command_substitution_depth: self
+                    .execution_limits
+                    .max_command_substitution_depth,
+            },
+        ) {
             Ok(parsed) => parsed,
             Err(error) => {
                 return BashExecResult {
@@ -56,6 +140,22 @@ impl Bash {
                 };
             }
         };
+        let command_count: usize = parsed
+            .pipelines
+            .iter()
+            .map(|pipeline| pipeline.commands.len())
+            .sum();
+        if command_count > self.execution_limits.max_command_count {
+            return BashExecResult {
+                stdout: String::new(),
+                stderr: format!(
+                    "bash: command count exceeds limit ({})\n",
+                    self.execution_limits.max_command_count
+                ),
+                exit_code: 2,
+                cwd: self.cwd.clone(),
+            };
+        }
         let mut stdout = String::new();
         let mut stderr = String::new();
         let mut exit_code = 0;
@@ -818,5 +918,65 @@ mod tests {
         let result = bash.exec("NAME=rust; echo $NAME");
         assert_eq!(result.stdout, "rust\n");
         assert_eq!(result.stderr, "");
+    }
+
+    #[test]
+    fn isolates_environment_and_cwd_between_exec_calls_by_default() {
+        let mut files = BTreeMap::new();
+        files.insert("/home/user/seed.txt".to_string(), "ok\n".to_string());
+        let mut bash = Bash::new(BashOptions {
+            files,
+            ..BashOptions::default()
+        })
+        .unwrap();
+        let first = bash
+            .exec("NAME=rust; cd /tmp; cp /home/user/seed.txt /home/user/out.txt; echo $NAME; pwd");
+        assert_eq!(first.stdout, "rust\n/tmp\n");
+        let second = bash.exec("echo $NAME; pwd; cat out.txt");
+        assert_eq!(second.stdout, "\n/home/user\nok\n");
+        assert_eq!(second.stderr, "");
+    }
+
+    #[test]
+    fn can_opt_out_of_exec_isolation() {
+        let mut bash = Bash::new(BashOptions {
+            isolate_exec: false,
+            ..BashOptions::default()
+        })
+        .unwrap();
+        let first = bash.exec("NAME=rust; cd /tmp");
+        assert_eq!(first.exit_code, 0);
+        let second = bash.exec("echo $NAME; pwd");
+        assert_eq!(second.stdout, "rust\n/tmp\n");
+    }
+
+    #[test]
+    fn rejects_scripts_larger_than_limit() {
+        let mut bash = Bash::new(BashOptions {
+            execution_limits: BashExecutionLimits {
+                max_script_size_bytes: 8,
+                ..BashExecutionLimits::default()
+            },
+            ..BashOptions::default()
+        })
+        .unwrap();
+        let result = bash.exec("echo hello");
+        assert_eq!(result.exit_code, 2);
+        assert_eq!(result.stderr, "bash: script exceeds limit (8 bytes)\n");
+    }
+
+    #[test]
+    fn rejects_too_many_commands() {
+        let mut bash = Bash::new(BashOptions {
+            execution_limits: BashExecutionLimits {
+                max_command_count: 2,
+                ..BashExecutionLimits::default()
+            },
+            ..BashOptions::default()
+        })
+        .unwrap();
+        let result = bash.exec("echo a; echo b; echo c");
+        assert_eq!(result.exit_code, 2);
+        assert_eq!(result.stderr, "bash: command count exceeds limit (2)\n");
     }
 }
