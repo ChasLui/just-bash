@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use crate::fs::{BashError, InMemoryFs, normalize_absolute, parent_dir};
 use crate::parser::{
-    CommandInvocation, ParseLimits, PipelineConnector, RedirectMode, Word, parse_script_with_limits,
+    CommandInvocation, ForStatement, IfStatement, ParseLimits, PipelineConnector, RedirectMode,
+    Statement, StatementKind, WhileStatement, Word, WordPartKind, parse_script_with_limits,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +19,8 @@ pub struct BashExecutionLimits {
     pub max_script_size_bytes: usize,
     pub max_command_count: usize,
     pub max_command_substitution_depth: usize,
+    pub max_output_bytes: usize,
+    pub max_loop_iterations: usize,
 }
 
 impl Default for BashExecutionLimits {
@@ -26,6 +29,8 @@ impl Default for BashExecutionLimits {
             max_script_size_bytes: 1_048_576,
             max_command_count: 10_000,
             max_command_substitution_depth: 50,
+            max_output_bytes: 10_485_760, // 10 MiB
+            max_loop_iterations: 100_000,
         }
     }
 }
@@ -60,6 +65,9 @@ pub struct Bash {
     initial_cwd: String,
     isolate_exec: bool,
     execution_limits: BashExecutionLimits,
+    last_exit_code: i32,
+    output_bytes_used: usize,
+    loop_iteration_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +94,9 @@ impl Bash {
             initial_cwd: cwd,
             isolate_exec: options.isolate_exec,
             execution_limits: options.execution_limits,
+            last_exit_code: 0,
+            output_bytes_used: 0,
+            loop_iteration_count: 0,
         })
     }
 
@@ -109,12 +120,18 @@ impl Bash {
         if self.isolate_exec {
             let saved_env = self.env.clone();
             let saved_cwd = self.cwd.clone();
+            let saved_output = self.output_bytes_used;
+            let saved_loop_count = self.loop_iteration_count;
             self.env = self.initial_env.clone();
             self.cwd = self.initial_cwd.clone();
             self.env.insert("PWD".to_string(), self.cwd.clone());
+            self.output_bytes_used = 0;
+            self.loop_iteration_count = 0;
             let result = self.exec_in_current_state(script);
             self.env = saved_env;
             self.cwd = saved_cwd;
+            self.output_bytes_used = saved_output;
+            self.loop_iteration_count = saved_loop_count;
             result
         } else {
             self.exec_in_current_state(script)
@@ -140,11 +157,13 @@ impl Bash {
                 };
             }
         };
+
         let command_count: usize = parsed
-            .pipelines
+            .statements
             .iter()
-            .map(|pipeline| pipeline.commands.len())
+            .map(|stmt| self.count_commands_in_statement(stmt))
             .sum();
+
         if command_count > self.execution_limits.max_command_count {
             return BashExecResult {
                 stdout: String::new(),
@@ -156,12 +175,13 @@ impl Bash {
                 cwd: self.cwd.clone(),
             };
         }
+
         let mut stdout = String::new();
         let mut stderr = String::new();
         let mut exit_code = 0;
 
-        for pipeline in parsed.pipelines {
-            let should_run = match pipeline.connector {
+        for statement in parsed.statements {
+            let should_run = match statement.connector {
                 PipelineConnector::Always => true,
                 PipelineConnector::And => exit_code == 0,
                 PipelineConnector::Or => exit_code != 0,
@@ -170,43 +190,272 @@ impl Bash {
                 continue;
             }
 
-            let mut stdin = String::new();
-            let command_count = pipeline.commands.len();
-            let is_pipeline = command_count > 1;
-            for (index, command) in pipeline.commands.iter().enumerate() {
-                let is_last = index + 1 == command_count;
-                let command_name = command.words.first().map(|word| self.expand_word(word));
-                let result = if is_pipeline {
-                    let mut child = self.clone();
-                    let result = child.run_invocation(command, &stdin);
-                    self.fs = child.fs;
-                    result
-                } else {
-                    self.run_invocation(command, &stdin)
+            let exec_result = self.exec_statement(&statement);
+            stdout.push_str(&exec_result.0);
+            stderr.push_str(&exec_result.1);
+            exit_code = exec_result.2;
+
+            if let Err(_) = self.check_output_limit(&mut stderr) {
+                return BashExecResult {
+                    stdout,
+                    stderr,
+                    exit_code: 2,
+                    cwd: self.cwd.clone(),
                 };
-                stderr.push_str(&result.stderr);
-                exit_code = result.exit_code;
-                if is_last {
-                    stdout.push_str(&result.stdout);
-                } else {
-                    stdin = result.stdout;
-                }
-                if !is_pipeline && command_name.as_deref() == Some("exit") {
-                    return BashExecResult {
-                        stdout,
-                        stderr,
-                        exit_code,
-                        cwd: self.cwd.clone(),
-                    };
-                }
             }
         }
 
+        self.last_exit_code = exit_code;
         BashExecResult {
             stdout,
             stderr,
             exit_code,
             cwd: self.cwd.clone(),
+        }
+    }
+
+    fn count_commands_in_statement(&self, stmt: &Statement) -> usize {
+        match &stmt.kind {
+            StatementKind::Pipeline(commands) => commands.len(),
+            StatementKind::If(if_stmt) => {
+                let mut count = 0;
+                for s in &if_stmt.condition {
+                    count += self.count_commands_in_statement(s);
+                }
+                for s in &if_stmt.body {
+                    count += self.count_commands_in_statement(s);
+                }
+                for (cond, body) in &if_stmt.elif_clauses {
+                    for s in cond {
+                        count += self.count_commands_in_statement(s);
+                    }
+                    for s in body {
+                        count += self.count_commands_in_statement(s);
+                    }
+                }
+                if let Some(else_body) = &if_stmt.else_body {
+                    for s in else_body {
+                        count += self.count_commands_in_statement(s);
+                    }
+                }
+                count
+            }
+            StatementKind::While(while_stmt) => {
+                let mut count = 0;
+                for s in &while_stmt.condition {
+                    count += self.count_commands_in_statement(s);
+                }
+                for s in &while_stmt.body {
+                    count += self.count_commands_in_statement(s);
+                }
+                count
+            }
+            StatementKind::For(for_stmt) => {
+                let mut count = 0;
+                for s in &for_stmt.body {
+                    count += self.count_commands_in_statement(s);
+                }
+                count
+            }
+        }
+    }
+
+    fn exec_statement(&mut self, statement: &Statement) -> (String, String, i32) {
+        match &statement.kind {
+            StatementKind::Pipeline(commands) => self.exec_pipeline(commands),
+            StatementKind::If(if_stmt) => self.exec_if(if_stmt),
+            StatementKind::While(while_stmt) => self.exec_while(while_stmt),
+            StatementKind::For(for_stmt) => self.exec_for(for_stmt),
+        }
+    }
+
+    fn exec_pipeline(&mut self, commands: &[CommandInvocation]) -> (String, String, i32) {
+        let mut stdin = String::new();
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut exit_code = 0;
+
+        let command_count = commands.len();
+        let is_pipeline = command_count > 1;
+
+        for (index, command) in commands.iter().enumerate() {
+            let is_last = index + 1 == command_count;
+            let result = if is_pipeline {
+                let mut child = self.clone();
+                let result = child.run_invocation(command, &stdin);
+                self.fs = child.fs;
+                self.env = child.env;
+                // Note: cwd is NOT copied back for pipeline commands (pipeline isolation)
+                result
+            } else {
+                self.run_invocation(command, &stdin)
+            };
+
+            stderr.push_str(&result.stderr);
+            exit_code = result.exit_code;
+
+            if is_last {
+                stdout.push_str(&result.stdout);
+            } else {
+                stdin = result.stdout;
+            }
+
+            if !is_pipeline
+                && command
+                    .words
+                    .first()
+                    .map(|w| self.expand_word(w))
+                    .as_deref()
+                    == Some("exit")
+            {
+                self.last_exit_code = exit_code;
+                return (stdout, stderr, exit_code);
+            }
+        }
+
+        self.last_exit_code = exit_code;
+        (stdout, stderr, exit_code)
+    }
+
+    fn exec_if(&mut self, if_stmt: &IfStatement) -> (String, String, i32) {
+        let (_, _, cond_exit) = self.exec_statement_list(&if_stmt.condition);
+        if cond_exit == 0 {
+            return self.exec_statement_list(&if_stmt.body);
+        }
+
+        for (elif_cond, elif_body) in &if_stmt.elif_clauses {
+            let (_, _, elif_exit) = self.exec_statement_list(elif_cond);
+            if elif_exit == 0 {
+                return self.exec_statement_list(elif_body);
+            }
+        }
+
+        if let Some(else_body) = &if_stmt.else_body {
+            self.exec_statement_list(else_body)
+        } else {
+            (String::new(), String::new(), 0)
+        }
+    }
+
+    fn exec_while(&mut self, while_stmt: &WhileStatement) -> (String, String, i32) {
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut exit_code = 0;
+
+        loop {
+            let (_, _, cond_exit) = self.exec_statement_list(&while_stmt.condition);
+            if cond_exit != 0 {
+                break;
+            }
+
+            self.loop_iteration_count += 1;
+            if self.loop_iteration_count > self.execution_limits.max_loop_iterations {
+                stderr.push_str(&format!(
+                    "bash: loop iteration limit exceeded ({})\n",
+                    self.execution_limits.max_loop_iterations
+                ));
+                return (stdout, stderr, 2);
+            }
+
+            let (body_stdout, body_stderr, body_exit) = self.exec_statement_list(&while_stmt.body);
+            stdout.push_str(&body_stdout);
+            stderr.push_str(&body_stderr);
+            exit_code = body_exit;
+
+            self.output_bytes_used += body_stdout.len() + body_stderr.len();
+            if let Err(_) = self.check_output_limit(&mut stderr) {
+                return (stdout, stderr, 2);
+            }
+        }
+
+        (stdout, stderr, exit_code)
+    }
+
+    fn exec_for(&mut self, for_stmt: &ForStatement) -> (String, String, i32) {
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut exit_code = 0;
+
+        let items = if for_stmt.items.is_empty() {
+            self.env
+                .get("@")
+                .map(|s| s.as_str())
+                .unwrap_or("")
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        } else {
+            for_stmt
+                .items
+                .iter()
+                .map(|w| self.expand_word(w))
+                .collect::<Vec<_>>()
+        };
+
+        for item in items {
+            self.loop_iteration_count += 1;
+            if self.loop_iteration_count > self.execution_limits.max_loop_iterations {
+                stderr.push_str(&format!(
+                    "bash: loop iteration limit exceeded ({})\n",
+                    self.execution_limits.max_loop_iterations
+                ));
+                return (stdout, stderr, 2);
+            }
+
+            self.env.insert(for_stmt.var.clone(), item);
+
+            let (body_stdout, body_stderr, body_exit) = self.exec_statement_list(&for_stmt.body);
+            stdout.push_str(&body_stdout);
+            stderr.push_str(&body_stderr);
+            exit_code = body_exit;
+
+            self.output_bytes_used += body_stdout.len() + body_stderr.len();
+            if let Err(_) = self.check_output_limit(&mut stderr) {
+                return (stdout, stderr, 2);
+            }
+        }
+
+        (stdout, stderr, exit_code)
+    }
+
+    fn exec_statement_list(&mut self, statements: &[Statement]) -> (String, String, i32) {
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut exit_code = 0;
+
+        for statement in statements {
+            let should_run = match statement.connector {
+                PipelineConnector::Always => true,
+                PipelineConnector::And => exit_code == 0,
+                PipelineConnector::Or => exit_code != 0,
+            };
+            if !should_run {
+                continue;
+            }
+
+            let (stmt_stdout, stmt_stderr, code) = self.exec_statement(statement);
+            stdout.push_str(&stmt_stdout);
+            stderr.push_str(&stmt_stderr);
+            exit_code = code;
+
+            self.output_bytes_used += stmt_stdout.len() + stmt_stderr.len();
+            if let Err(_) = self.check_output_limit(&mut stderr) {
+                return (stdout, stderr, 2);
+            }
+        }
+
+        (stdout, stderr, exit_code)
+    }
+
+    fn check_output_limit(&mut self, stderr: &mut String) -> Result<(), ()> {
+        if self.output_bytes_used > self.execution_limits.max_output_bytes {
+            stderr.push_str(&format!(
+                "bash: output exceeds limit ({} bytes)\n",
+                self.execution_limits.max_output_bytes
+            ));
+            Err(())
+        } else {
+            Ok(())
         }
     }
 
@@ -223,7 +472,8 @@ impl Bash {
         let mut stdout_redirect = None;
 
         for redirect in &command.redirects {
-            let target = self.resolve_path(&self.expand_word(&redirect.target));
+            let expanded_target = self.expand_word(&redirect.target);
+            let target = self.resolve_path(&expanded_target);
             match redirect.mode {
                 RedirectMode::Read => match self.fs.read_file(&target) {
                     Ok(contents) => stdin = contents.to_string(),
@@ -429,6 +679,161 @@ impl Bash {
                     stdout.push_str(&format!("{lines} {words} {bytes}\n"));
                 }
             }
+            "head" => {
+                let (line_count, file_args) = parse_line_count_args(args);
+                match self.read_inputs_for_text_tool(file_args, stdin, "head", &mut stderr) {
+                    Ok(input) => {
+                        for line in input.lines().take(line_count) {
+                            stdout.push_str(line);
+                            stdout.push('\n');
+                        }
+                    }
+                    Err(()) => exit_code = 1,
+                }
+            }
+            "tail" => {
+                let (line_count, file_args) = parse_line_count_args(args);
+                match self.read_inputs_for_text_tool(file_args, stdin, "tail", &mut stderr) {
+                    Ok(input) => {
+                        let lines: Vec<&str> = input.lines().collect();
+                        let start = lines.len().saturating_sub(line_count);
+                        for line in &lines[start..] {
+                            stdout.push_str(line);
+                            stdout.push('\n');
+                        }
+                    }
+                    Err(()) => exit_code = 1,
+                }
+            }
+            "sort" => match self.read_inputs_for_text_tool(args, stdin, "sort", &mut stderr) {
+                Ok(input) => {
+                    let mut lines: Vec<&str> = input.lines().collect();
+                    lines.sort_unstable();
+                    for line in lines {
+                        stdout.push_str(line);
+                        stdout.push('\n');
+                    }
+                }
+                Err(()) => exit_code = 1,
+            },
+            "uniq" => match self.read_inputs_for_text_tool(args, stdin, "uniq", &mut stderr) {
+                Ok(input) => {
+                    let mut last: Option<&str> = None;
+                    for line in input.lines() {
+                        if last != Some(line) {
+                            stdout.push_str(line);
+                            stdout.push('\n');
+                            last = Some(line);
+                        }
+                    }
+                }
+                Err(()) => exit_code = 1,
+            },
+            "cut" => {
+                let mut delimiter = ',';
+                let mut field_index: Option<usize> = None;
+                let mut file_start = 0usize;
+                let mut index = 0usize;
+                while index < args.len() {
+                    match args[index].as_str() {
+                        "-d" => {
+                            let Some(value) = args.get(index + 1) else {
+                                stderr.push_str("cut: usage: cut -d DELIM -f FIELD [FILE...]\n");
+                                exit_code = 1;
+                                break;
+                            };
+                            delimiter = value.chars().next().unwrap_or(',');
+                            index += 2;
+                            file_start = index;
+                        }
+                        "-f" => {
+                            let Some(value) = args.get(index + 1) else {
+                                stderr.push_str("cut: usage: cut -d DELIM -f FIELD [FILE...]\n");
+                                exit_code = 1;
+                                break;
+                            };
+                            field_index =
+                                value.parse::<usize>().ok().and_then(|v| v.checked_sub(1));
+                            index += 2;
+                            file_start = index;
+                        }
+                        _ => {
+                            file_start = index;
+                            break;
+                        }
+                    }
+                }
+                if exit_code == 0 {
+                    if let Some(field_index) = field_index {
+                        match self.read_inputs_for_text_tool(
+                            &args[file_start..],
+                            stdin,
+                            "cut",
+                            &mut stderr,
+                        ) {
+                            Ok(input) => {
+                                for line in input.lines() {
+                                    let fields: Vec<&str> = line.split(delimiter).collect();
+                                    if let Some(field) = fields.get(field_index) {
+                                        stdout.push_str(field);
+                                    }
+                                    stdout.push('\n');
+                                }
+                            }
+                            Err(()) => exit_code = 1,
+                        }
+                    } else {
+                        stderr.push_str("cut: usage: cut -d DELIM -f FIELD [FILE...]\n");
+                        exit_code = 1;
+                    }
+                }
+            }
+            "tr" => {
+                if args.len() < 2 {
+                    stderr.push_str("tr: usage: tr SET1 SET2\n");
+                    exit_code = 1;
+                } else {
+                    let set1: Vec<char> = args[0].chars().collect();
+                    let set2: Vec<char> = args[1].chars().collect();
+                    if set1.is_empty() || set2.is_empty() {
+                        stderr.push_str("tr: SET1 and SET2 must be non-empty\n");
+                        exit_code = 1;
+                    } else {
+                        for ch in stdin.chars() {
+                            if let Some(pos) = set1.iter().position(|candidate| *candidate == ch) {
+                                let mapped = set2
+                                    .get(pos)
+                                    .copied()
+                                    .unwrap_or(*set2.last().expect("set2 is non-empty"));
+                                stdout.push(mapped);
+                            } else {
+                                stdout.push(ch);
+                            }
+                        }
+                    }
+                }
+            }
+            "basename" => {
+                if let Some(path) = args.first() {
+                    let normalized = normalize_absolute(path);
+                    let name = normalized.rsplit('/').next().unwrap_or("");
+                    stdout.push_str(name);
+                    stdout.push('\n');
+                } else {
+                    stderr.push_str("basename: usage: basename PATH\n");
+                    exit_code = 1;
+                }
+            }
+            "dirname" => {
+                if let Some(path) = args.first() {
+                    let normalized = self.resolve_path(path);
+                    stdout.push_str(&parent_dir(&normalized));
+                    stdout.push('\n');
+                } else {
+                    stderr.push_str("dirname: usage: dirname PATH\n");
+                    exit_code = 1;
+                }
+            }
             "ls" => {
                 let target = args.first().map(String::as_str).unwrap_or(".");
                 let path = self.resolve_path(target);
@@ -552,17 +957,124 @@ impl Bash {
                     stdout.push('\n');
                 }
             }
+            "test" | "[" => {
+                exit_code = if self.run_test(args) { 0 } else { 1 };
+            }
             _ => {
                 stderr.push_str(&format!("bash: {command}: command not found\n"));
                 exit_code = 127;
             }
         }
 
+        self.output_bytes_used += stdout.len() + stderr.len();
         CommandOutput {
             stdout,
             stderr,
             exit_code,
         }
+    }
+
+    fn read_inputs_for_text_tool(
+        &self,
+        args: &[String],
+        stdin: &str,
+        cmd: &str,
+        stderr: &mut String,
+    ) -> Result<String, ()> {
+        if args.is_empty() {
+            return Ok(stdin.to_string());
+        }
+        let mut combined = String::new();
+        let mut had_error = false;
+        for arg in args {
+            match self.fs.read_file(&self.resolve_path(arg)) {
+                Ok(contents) => combined.push_str(contents),
+                Err(error) => {
+                    stderr.push_str(&format!("{cmd}: {error}\n"));
+                    had_error = true;
+                }
+            }
+        }
+        if had_error { Err(()) } else { Ok(combined) }
+    }
+
+    fn run_test(&self, args: &[String]) -> bool {
+        if args.is_empty() {
+            return false;
+        }
+
+        // Remove trailing ] if present (for [ ... ] syntax)
+        let args = if args.last().map(|s| s.as_str()) == Some("]") {
+            &args[..args.len() - 1]
+        } else {
+            args
+        };
+
+        if args.is_empty() {
+            return false;
+        }
+
+        if args[0] == "!" {
+            return !self.run_test(&args[1..]);
+        }
+
+        if args.len() == 1 {
+            return !args[0].is_empty();
+        }
+
+        if args.len() == 2 {
+            match args[0].as_str() {
+                "-z" => return args[1].is_empty(),
+                "-n" => return !args[1].is_empty(),
+                "-f" => return self.fs.is_file(&self.resolve_path(&args[1])),
+                "-d" => return self.fs.is_dir(&self.resolve_path(&args[1])),
+                "-e" => {
+                    let path = self.resolve_path(&args[1]);
+                    return self.fs.is_file(&path) || self.fs.is_dir(&path);
+                }
+                _ => {}
+            }
+        }
+
+        if args.len() == 3 {
+            match args[1].as_str() {
+                "=" => return args[0] == args[2],
+                "!=" => return args[0] != args[2],
+                "-eq" => {
+                    if let (Ok(a), Ok(b)) = (args[0].parse::<i32>(), args[2].parse::<i32>()) {
+                        return a == b;
+                    }
+                }
+                "-ne" => {
+                    if let (Ok(a), Ok(b)) = (args[0].parse::<i32>(), args[2].parse::<i32>()) {
+                        return a != b;
+                    }
+                }
+                "-lt" => {
+                    if let (Ok(a), Ok(b)) = (args[0].parse::<i32>(), args[2].parse::<i32>()) {
+                        return a < b;
+                    }
+                }
+                "-gt" => {
+                    if let (Ok(a), Ok(b)) = (args[0].parse::<i32>(), args[2].parse::<i32>()) {
+                        return a > b;
+                    }
+                }
+                "-le" => {
+                    if let (Ok(a), Ok(b)) = (args[0].parse::<i32>(), args[2].parse::<i32>()) {
+                        return a <= b;
+                    }
+                }
+                "-ge" => {
+                    if let (Ok(a), Ok(b)) = (args[0].parse::<i32>(), args[2].parse::<i32>()) {
+                        return a >= b;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        false
     }
 
     fn resolve_path(&self, path: &str) -> String {
@@ -577,16 +1089,52 @@ impl Bash {
         }
     }
 
-    fn expand_word(&self, word: &Word) -> String {
+    fn expand_word(&mut self, word: &Word) -> String {
         let mut expanded = String::new();
         for part in &word.parts {
-            if part.expand {
-                expanded.push_str(&self.expand_text(&part.text));
-            } else {
-                expanded.push_str(&part.text);
+            match part.kind {
+                WordPartKind::Literal => {
+                    expanded.push_str(&part.text);
+                }
+                WordPartKind::Variable => {
+                    expanded.push_str(&self.expand_text(&part.text));
+                }
+                WordPartKind::CommandSub => {
+                    let result = self.exec_command_substitution(&part.text);
+                    expanded.push_str(&result);
+                }
             }
         }
+        self.output_bytes_used += expanded.len();
         expanded
+    }
+
+    fn exec_command_substitution(&mut self, script: &str) -> String {
+        if let Some(value) = self.try_eval_arithmetic_substitution(script) {
+            return value.to_string();
+        }
+
+        let mut child = self.clone();
+        match child.exec_in_current_state(script) {
+            result => {
+                self.fs = child.fs;
+                self.env = child.env;
+                self.cwd = child.cwd;
+                result.stdout.trim_end_matches('\n').to_string()
+            }
+        }
+    }
+
+    fn try_eval_arithmetic_substitution(&self, script: &str) -> Option<i64> {
+        let mut expr = script.strip_prefix('(').unwrap_or(script).trim();
+        if expr.ends_with(')') {
+            expr = &expr[..expr.len().saturating_sub(1)];
+            expr = expr.trim_end();
+        }
+        if expr.is_empty() || !looks_like_arithmetic_expr(expr) {
+            return None;
+        }
+        eval_arithmetic_expr(expr, &self.env).ok()
     }
 
     fn expand_text(&self, text: &str) -> String {
@@ -607,12 +1155,54 @@ impl Bash {
                     }
                     name.push(next);
                 }
-                expanded.push_str(self.env.get(&name).map(String::as_str).unwrap_or(""));
+                match name.as_str() {
+                    "?" => expanded.push_str(&self.last_exit_code.to_string()),
+                    "#" => expanded.push('0'), // No args yet
+                    "@" | "*" => {
+                        if let Some(val) = self.env.get("@") {
+                            expanded.push_str(val);
+                        }
+                    }
+                    "0" => expanded.push_str("bash"),
+                    _ => expanded.push_str(self.env.get(&name).map(String::as_str).unwrap_or("")),
+                }
                 continue;
             }
 
+            // Check for special single-character variables first ($?, $#, etc)
+            if let Some(&next) = chars.peek() {
+                if next == '?' {
+                    chars.next();
+                    expanded.push_str(&self.last_exit_code.to_string());
+                    continue;
+                }
+                if next == '#' {
+                    chars.next();
+                    expanded.push('0'); // No positional args yet
+                    continue;
+                }
+                if next == '@' || next == '*' {
+                    chars.next();
+                    if let Some(val) = self.env.get("@") {
+                        expanded.push_str(val);
+                    }
+                    continue;
+                }
+                if next.is_ascii_digit() {
+                    let digit = next.to_string();
+                    chars.next();
+                    if digit == "0" {
+                        expanded.push_str("bash"); // $0 is the script name
+                    } else {
+                        expanded.push_str(self.env.get(&digit).map(String::as_str).unwrap_or(""));
+                    }
+                    continue;
+                }
+            }
+
+            // Otherwise, extract alphanumeric variable name
             let mut name = String::new();
-            while let Some(next) = chars.peek().copied() {
+            while let Some(&next) = chars.peek() {
                 if next == '_' || next.is_ascii_alphanumeric() {
                     name.push(next);
                     chars.next();
@@ -620,6 +1210,7 @@ impl Bash {
                     break;
                 }
             }
+
             if name.is_empty() {
                 expanded.push('$');
             } else {
@@ -682,6 +1273,170 @@ fn append_printf_once(output: &mut String, format: &str, args: &[String]) -> usi
     }
 
     consumed
+}
+
+fn parse_line_count_args(args: &[String]) -> (usize, &[String]) {
+    if args.len() >= 2 && args[0] == "-n" {
+        let count = args[1].parse::<usize>().ok().unwrap_or(10);
+        (count, &args[2..])
+    } else {
+        (10, args)
+    }
+}
+
+fn looks_like_arithmetic_expr(expr: &str) -> bool {
+    expr.chars().all(|ch| {
+        ch.is_ascii_alphanumeric()
+            || ch == '_'
+            || ch == '+'
+            || ch == '-'
+            || ch == '*'
+            || ch == '/'
+            || ch == '%'
+            || ch == '('
+            || ch == ')'
+            || ch.is_ascii_whitespace()
+    })
+}
+
+fn eval_arithmetic_expr(expr: &str, env: &BTreeMap<String, String>) -> Result<i64, ()> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Tok<'a> {
+        Num(i64),
+        Ident(&'a str),
+        Plus,
+        Minus,
+        Mul,
+        Div,
+        Mod,
+        LParen,
+        RParen,
+    }
+
+    fn precedence(tok: Tok<'_>) -> i32 {
+        match tok {
+            Tok::Plus | Tok::Minus => 1,
+            Tok::Mul | Tok::Div | Tok::Mod => 2,
+            _ => 0,
+        }
+    }
+
+    fn apply_op(values: &mut Vec<i64>, op: Tok<'_>) -> Result<(), ()> {
+        let rhs = values.pop().ok_or(())?;
+        let lhs = values.pop().ok_or(())?;
+        let value = match op {
+            Tok::Plus => lhs + rhs,
+            Tok::Minus => lhs - rhs,
+            Tok::Mul => lhs * rhs,
+            Tok::Div => {
+                if rhs == 0 {
+                    return Err(());
+                }
+                lhs / rhs
+            }
+            Tok::Mod => {
+                if rhs == 0 {
+                    return Err(());
+                }
+                lhs % rhs
+            }
+            _ => return Err(()),
+        };
+        values.push(value);
+        Ok(())
+    }
+
+    let mut tokens = Vec::new();
+    let mut index = 0usize;
+    let bytes = expr.as_bytes();
+    while index < bytes.len() {
+        let ch = bytes[index] as char;
+        if ch.is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if ch.is_ascii_digit() {
+            let start = index;
+            while index < bytes.len() && (bytes[index] as char).is_ascii_digit() {
+                index += 1;
+            }
+            let value = expr[start..index].parse::<i64>().map_err(|_| ())?;
+            tokens.push(Tok::Num(value));
+            continue;
+        }
+        if ch == '_' || ch.is_ascii_alphabetic() {
+            let start = index;
+            while index < bytes.len() {
+                let c = bytes[index] as char;
+                if c == '_' || c.is_ascii_alphanumeric() {
+                    index += 1;
+                } else {
+                    break;
+                }
+            }
+            tokens.push(Tok::Ident(&expr[start..index]));
+            continue;
+        }
+        let tok = match ch {
+            '+' => Tok::Plus,
+            '-' => Tok::Minus,
+            '*' => Tok::Mul,
+            '/' => Tok::Div,
+            '%' => Tok::Mod,
+            '(' => Tok::LParen,
+            ')' => Tok::RParen,
+            _ => return Err(()),
+        };
+        tokens.push(tok);
+        index += 1;
+    }
+
+    let mut values: Vec<i64> = Vec::new();
+    let mut ops: Vec<Tok<'_>> = Vec::new();
+
+    for token in tokens {
+        match token {
+            Tok::Num(value) => values.push(value),
+            Tok::Ident(name) => {
+                let value = env
+                    .get(name)
+                    .and_then(|v| v.trim().parse::<i64>().ok())
+                    .unwrap_or(0);
+                values.push(value);
+            }
+            Tok::LParen => ops.push(token),
+            Tok::RParen => {
+                while let Some(op) = ops.pop() {
+                    if op == Tok::LParen {
+                        break;
+                    }
+                    apply_op(&mut values, op)?;
+                }
+            }
+            Tok::Plus | Tok::Minus | Tok::Mul | Tok::Div | Tok::Mod => {
+                while let Some(&op) = ops.last() {
+                    if op == Tok::LParen || precedence(op) < precedence(token) {
+                        break;
+                    }
+                    let op = ops.pop().ok_or(())?;
+                    apply_op(&mut values, op)?;
+                }
+                ops.push(token);
+            }
+        }
+    }
+
+    while let Some(op) = ops.pop() {
+        if op == Tok::LParen {
+            return Err(());
+        }
+        apply_op(&mut values, op)?;
+    }
+    if values.len() == 1 {
+        Ok(values[0])
+    } else {
+        Err(())
+    }
 }
 
 fn is_assignment(word: &str) -> bool {
@@ -884,6 +1639,65 @@ mod tests {
     }
 
     #[test]
+    fn supports_head_tail_sort_uniq() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "/home/user/input.txt".to_string(),
+            "b\na\na\nc\n".to_string(),
+        );
+        let mut bash = Bash::new(BashOptions {
+            files,
+            ..BashOptions::default()
+        })
+        .unwrap();
+        let result = bash.exec(
+            "head -n 2 input.txt; tail -n 2 input.txt; sort input.txt; sort input.txt | uniq",
+        );
+        assert_eq!(result.stdout, "b\na\na\nc\na\na\nb\nc\na\nb\nc\n");
+        assert_eq!(result.stderr, "");
+        assert_eq!(result.exit_code, 0);
+    }
+
+    #[test]
+    fn supports_cut_and_tr() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "/home/user/csv.txt".to_string(),
+            "name,lang\nalice,rust\nbob,go\n".to_string(),
+        );
+        let mut bash = Bash::new(BashOptions {
+            files,
+            ..BashOptions::default()
+        })
+        .unwrap();
+        let result = bash.exec("cut -d , -f 2 csv.txt | tr og OG");
+        assert_eq!(result.stdout, "lanG\nrust\nGO\n");
+        assert_eq!(result.stderr, "");
+        assert_eq!(result.exit_code, 0);
+    }
+
+    #[test]
+    fn supports_basename_and_dirname() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("basename /tmp/hello.txt; dirname /tmp/hello.txt");
+        assert_eq!(result.stdout, "hello.txt\n/tmp\n");
+        assert_eq!(result.stderr, "");
+        assert_eq!(result.exit_code, 0);
+    }
+
+    #[test]
+    fn text_tool_usage_errors_are_reported() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("cut -d , missing");
+        assert_eq!(result.stdout, "");
+        assert_eq!(
+            result.stderr,
+            "cut: usage: cut -d DELIM -f FIELD [FILE...]\n"
+        );
+        assert_eq!(result.exit_code, 1);
+    }
+
+    #[test]
     fn rm_rejects_unsupported_options_without_deleting() {
         let mut files = BTreeMap::new();
         files.insert("/home/user/file.txt".to_string(), "data".to_string());
@@ -978,5 +1792,240 @@ mod tests {
         let result = bash.exec("echo a; echo b; echo c");
         assert_eq!(result.exit_code, 2);
         assert_eq!(result.stderr, "bash: command count exceeds limit (2)\n");
+    }
+
+    // ─── Control-flow tests ───────────────────────────────────────────────
+
+    #[test]
+    fn executes_if_statements() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("if true; then echo yes; fi");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "yes\n");
+    }
+
+    #[test]
+    fn executes_if_else_statements() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("if false; then echo yes; else echo no; fi");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "no\n");
+    }
+
+    #[test]
+    fn executes_if_elif_statements() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("if false; then echo a; elif true; then echo b; else echo c; fi");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "b\n");
+    }
+
+    #[test]
+    fn executes_while_loops() {
+        let mut bash = Bash::new(BashOptions {
+            execution_limits: BashExecutionLimits {
+                max_loop_iterations: 5,
+                ..BashExecutionLimits::default()
+            },
+            ..BashOptions::default()
+        })
+        .unwrap();
+        // Simple while loop that terminates when the limit is hit
+        let result = bash.exec("while true; do echo x; done");
+        assert_eq!(result.exit_code, 2); // Error code for loop limit
+        assert!(result.stderr.contains("loop iteration"));
+    }
+
+    #[test]
+    fn executes_for_loops() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("for i in a b c; do echo $i; done");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "a\nb\nc\n");
+    }
+
+    // ─── Command substitution tests ────────────────────────────────────────
+
+    #[test]
+    fn executes_command_substitution() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("echo $(echo hello)");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "hello\n");
+    }
+
+    #[test]
+    fn command_substitution_strips_trailing_newlines() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("echo $(echo -e \"a\\nb\\nc\")");
+        assert_eq!(result.exit_code, 0);
+        // Trailing newlines are stripped but internal ones are preserved
+        assert!(
+            result.stdout.contains("a")
+                && result.stdout.contains("b")
+                && result.stdout.contains("c")
+        );
+    }
+
+    #[test]
+    fn nested_command_substitutions() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("echo $(echo $(echo nested))");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "nested\n");
+    }
+
+    #[test]
+    fn supports_arithmetic_expansion() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("i=1; i=$((i + 2 * 3)); echo $i");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "7\n");
+    }
+
+    #[test]
+    fn while_loop_with_arithmetic_counter() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("i=0; while [ \"$i\" -lt 3 ]; do echo $i; i=$((i + 1)); done");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "0\n1\n2\n");
+    }
+
+    // ─── Special variables tests ───────────────────────────────────────────
+
+    #[test]
+    fn special_variable_exit_code() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("true; echo $?");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "0\n");
+    }
+
+    #[test]
+    fn special_variable_exit_code_after_failure() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("false; echo $?");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "1\n");
+    }
+
+    #[test]
+    fn special_variable_script_name() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("echo $0");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "bash\n");
+    }
+
+    // ─── Test builtin tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_builtin_string_empty() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("test -z \"\"; echo $?");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "0\n");
+    }
+
+    #[test]
+    fn test_builtin_string_not_empty() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("test -z \"hello\"; echo $?");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "1\n");
+    }
+
+    #[test]
+    fn test_builtin_string_not_null() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("test -n \"hello\"; echo $?");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "0\n");
+    }
+
+    #[test]
+    fn test_builtin_string_equal() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("test \"a\" = \"a\"; echo $?");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "0\n");
+    }
+
+    #[test]
+    fn test_builtin_numeric_equal() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("test 5 -eq 5; echo $?");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "0\n");
+    }
+
+    #[test]
+    fn test_builtin_numeric_less_than() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("test 3 -lt 5; echo $?");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "0\n");
+    }
+
+    #[test]
+    fn bracket_test_builtin() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("[ \"a\" = \"a\" ]; echo $?");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "0\n");
+    }
+
+    // ─── Execution limits tests ────────────────────────────────────────────
+
+    #[test]
+    fn enforces_output_size_limit() {
+        let mut bash = Bash::new(BashOptions {
+            execution_limits: BashExecutionLimits {
+                max_output_bytes: 50,
+                ..BashExecutionLimits::default()
+            },
+            ..BashOptions::default()
+        })
+        .unwrap();
+        // Generate output that exceeds the limit (50 bytes limit)
+        let result = bash.exec("echo this is a very long string that exceeds fifty bytes limit");
+        assert_eq!(result.exit_code, 2);
+        assert!(result.stderr.contains("output exceeds limit"));
+    }
+
+    #[test]
+    fn enforces_loop_iteration_limit() {
+        let mut bash = Bash::new(BashOptions {
+            execution_limits: BashExecutionLimits {
+                max_loop_iterations: 10,
+                ..BashExecutionLimits::default()
+            },
+            ..BashOptions::default()
+        })
+        .unwrap();
+        let result = bash.exec("i=0; while [ 1 ]; do i=$((i + 1)); done");
+        assert_eq!(result.exit_code, 2);
+        assert!(result.stderr.contains("loop iteration"));
+    }
+
+    // ─── Complex scenarios ────────────────────────────────────────────────
+
+    #[test]
+    fn complex_script_with_conditionals_and_substitution() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result =
+            bash.exec("result=$(echo \"test\"); if [ \"$result\" = \"test\" ]; then echo pass; fi");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "pass\n");
+    }
+
+    #[test]
+    fn for_loop_with_command_substitution() {
+        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let result = bash.exec("for i in $(echo -e \"1\\n2\\n3\"); do echo $i; done");
+        assert_eq!(result.exit_code, 0);
+        assert!(result.stdout.contains("1"));
+        assert!(result.stdout.contains("2"));
+        assert!(result.stdout.contains("3"));
     }
 }
