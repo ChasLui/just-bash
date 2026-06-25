@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 
-use crate::fs::{BashError, InMemoryFs, normalize_absolute, parent_dir};
+use crate::fs::{Error, InMemoryFs, normalize_absolute, parent_dir};
 use crate::parser::{
     CommandInvocation, ForStatement, IfStatement, ParseLimits, PipelineConnector, RedirectMode,
     Statement, StatementKind, WhileStatement, Word, WordPartKind, parse_script_with_limits,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BashExecResult {
+pub struct ExecResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
@@ -15,7 +15,7 @@ pub struct BashExecResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BashExecutionLimits {
+pub struct ExecutionLimits {
     pub max_script_size_bytes: usize,
     pub max_command_count: usize,
     pub max_command_substitution_depth: usize,
@@ -23,7 +23,7 @@ pub struct BashExecutionLimits {
     pub max_loop_iterations: usize,
 }
 
-impl Default for BashExecutionLimits {
+impl Default for ExecutionLimits {
     fn default() -> Self {
         Self {
             max_script_size_bytes: 1_048_576,
@@ -36,22 +36,22 @@ impl Default for BashExecutionLimits {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BashOptions {
+pub struct Options {
     pub files: BTreeMap<String, String>,
     pub env: BTreeMap<String, String>,
     pub cwd: Option<String>,
     pub isolate_exec: bool,
-    pub execution_limits: BashExecutionLimits,
+    pub execution_limits: ExecutionLimits,
 }
 
-impl Default for BashOptions {
+impl Default for Options {
     fn default() -> Self {
         Self {
             files: BTreeMap::new(),
             env: BTreeMap::new(),
             cwd: None,
             isolate_exec: true,
-            execution_limits: BashExecutionLimits::default(),
+            execution_limits: ExecutionLimits::default(),
         }
     }
 }
@@ -64,10 +64,18 @@ pub struct Bash {
     initial_env: BTreeMap<String, String>,
     initial_cwd: String,
     isolate_exec: bool,
-    execution_limits: BashExecutionLimits,
+    execution_limits: ExecutionLimits,
     last_exit_code: i32,
     output_bytes_used: usize,
     loop_iteration_count: usize,
+    /// set -e: exit immediately if a command returns non-zero
+    opt_errexit: bool,
+    /// set -u: treat unset variables as an error
+    opt_nounset: bool,
+    /// set -o pipefail: pipeline exit code is last non-zero status
+    opt_pipefail: bool,
+    /// Pending error from set -u: variable name that was unset
+    nounset_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +86,7 @@ struct CommandOutput {
 }
 
 impl Bash {
-    pub fn new(options: BashOptions) -> Result<Self, BashError> {
+    pub fn new(options: Options) -> Result<Self, Error> {
         let cwd = normalize_absolute(options.cwd.as_deref().unwrap_or("/home/user"));
         let mut fs = InMemoryFs::with_files(options.files)?;
         fs.create_dir_all(&cwd)?;
@@ -97,12 +105,16 @@ impl Bash {
             last_exit_code: 0,
             output_bytes_used: 0,
             loop_iteration_count: 0,
+            opt_errexit: false,
+            opt_nounset: false,
+            opt_pipefail: false,
+            nounset_error: None,
         })
     }
 
-    pub fn exec(&mut self, script: &str) -> BashExecResult {
+    pub fn exec(&mut self, script: &str) -> ExecResult {
         if script.len() > self.execution_limits.max_script_size_bytes {
-            return BashExecResult {
+            return ExecResult {
                 stdout: String::new(),
                 stderr: format!(
                     "bash: script exceeds limit ({} bytes)\n",
@@ -122,23 +134,34 @@ impl Bash {
             let saved_cwd = self.cwd.clone();
             let saved_output = self.output_bytes_used;
             let saved_loop_count = self.loop_iteration_count;
+            let saved_errexit = self.opt_errexit;
+            let saved_nounset = self.opt_nounset;
+            let saved_pipefail = self.opt_pipefail;
             self.env = self.initial_env.clone();
             self.cwd = self.initial_cwd.clone();
             self.env.insert("PWD".to_string(), self.cwd.clone());
             self.output_bytes_used = 0;
             self.loop_iteration_count = 0;
+            self.opt_errexit = false;
+            self.opt_nounset = false;
+            self.opt_pipefail = false;
+            self.nounset_error = None;
             let result = self.exec_in_current_state(script);
             self.env = saved_env;
             self.cwd = saved_cwd;
             self.output_bytes_used = saved_output;
             self.loop_iteration_count = saved_loop_count;
+            self.opt_errexit = saved_errexit;
+            self.opt_nounset = saved_nounset;
+            self.opt_pipefail = saved_pipefail;
+            self.nounset_error = None;
             result
         } else {
             self.exec_in_current_state(script)
         }
     }
 
-    fn exec_in_current_state(&mut self, script: &str) -> BashExecResult {
+    fn exec_in_current_state(&mut self, script: &str) -> ExecResult {
         let parsed = match parse_script_with_limits(
             script,
             ParseLimits {
@@ -149,7 +172,7 @@ impl Bash {
         ) {
             Ok(parsed) => parsed,
             Err(error) => {
-                return BashExecResult {
+                return ExecResult {
                     stdout: String::new(),
                     stderr: format!("bash: {error}\n"),
                     exit_code: 2,
@@ -165,7 +188,7 @@ impl Bash {
             .sum();
 
         if command_count > self.execution_limits.max_command_count {
-            return BashExecResult {
+            return ExecResult {
                 stdout: String::new(),
                 stderr: format!(
                     "bash: command count exceeds limit ({})\n",
@@ -196,17 +219,31 @@ impl Bash {
             exit_code = exec_result.2;
 
             if let Err(_) = self.check_output_limit(&mut stderr) {
-                return BashExecResult {
+                return ExecResult {
                     stdout,
                     stderr,
                     exit_code: 2,
                     cwd: self.cwd.clone(),
                 };
             }
+
+            // set -e: abort on non-zero exit (but not when connector is || or &&)
+            if self.opt_errexit
+                && exit_code != 0
+                && statement.connector == PipelineConnector::Always
+            {
+                self.last_exit_code = exit_code;
+                return ExecResult {
+                    stdout,
+                    stderr,
+                    exit_code,
+                    cwd: self.cwd.clone(),
+                };
+            }
         }
 
         self.last_exit_code = exit_code;
-        BashExecResult {
+        ExecResult {
             stdout,
             stderr,
             exit_code,
@@ -274,6 +311,8 @@ impl Bash {
         let mut stdout = String::new();
         let mut stderr = String::new();
         let mut exit_code = 0;
+        // For pipefail: track all non-zero exit codes in the pipeline
+        let mut pipeline_last_failure: i32 = 0;
 
         let command_count = commands.len();
         let is_pipeline = command_count > 1;
@@ -293,6 +332,9 @@ impl Bash {
 
             stderr.push_str(&result.stderr);
             exit_code = result.exit_code;
+            if is_pipeline && result.exit_code != 0 {
+                pipeline_last_failure = result.exit_code;
+            }
 
             if is_last {
                 stdout.push_str(&result.stdout);
@@ -311,6 +353,11 @@ impl Bash {
                 self.last_exit_code = exit_code;
                 return (stdout, stderr, exit_code);
             }
+        }
+
+        // set -o pipefail: use last non-zero exit code from the pipeline
+        if self.opt_pipefail && is_pipeline && pipeline_last_failure != 0 {
+            exit_code = pipeline_last_failure;
         }
 
         self.last_exit_code = exit_code;
@@ -513,6 +560,16 @@ impl Bash {
             .iter()
             .map(|word| self.expand_word(word))
             .collect::<Vec<_>>();
+
+        // set -u: abort if any variable expansion flagged an unset variable
+        if let Some(ref varname) = self.nounset_error.take() {
+            return CommandOutput {
+                stdout: String::new(),
+                stderr: format!("bash: {varname}: unbound variable\n"),
+                exit_code: 1,
+            };
+        }
+
         let mut result = self.run_command(&words, &stdin);
 
         if let Some((mode, target)) = stdout_redirect {
@@ -657,11 +714,37 @@ impl Bash {
                 }
             }
             "wc" => {
-                let input = if args.is_empty() {
+                let mut flag_l = false;
+                let mut flag_w = false;
+                let mut flag_c = false;
+                let mut file_start = 0usize;
+                for (i, arg) in args.iter().enumerate() {
+                    if arg.starts_with('-') && !arg.starts_with("--") {
+                        for ch in arg.chars().skip(1) {
+                            match ch {
+                                'l' => flag_l = true,
+                                'w' => flag_w = true,
+                                'c' => flag_c = true,
+                                _ => {}
+                            }
+                        }
+                        file_start = i + 1;
+                    } else {
+                        file_start = i;
+                        break;
+                    }
+                }
+                // No flags means print all three columns
+                if !flag_l && !flag_w && !flag_c {
+                    flag_l = true;
+                    flag_w = true;
+                    flag_c = true;
+                }
+                let input = if file_start >= args.len() {
                     stdin.to_string()
                 } else {
                     let mut combined = String::new();
-                    for arg in args {
+                    for arg in &args[file_start..] {
                         match self.fs.read_file(&self.resolve_path(arg)) {
                             Ok(contents) => combined.push_str(contents),
                             Err(error) => {
@@ -673,10 +756,18 @@ impl Bash {
                     combined
                 };
                 if exit_code == 0 {
-                    let lines = input.bytes().filter(|byte| *byte == b'\n').count();
-                    let words = input.split_whitespace().count();
-                    let bytes = input.len();
-                    stdout.push_str(&format!("{lines} {words} {bytes}\n"));
+                    let mut parts = Vec::new();
+                    if flag_l {
+                        parts.push(input.bytes().filter(|byte| *byte == b'\n').count().to_string());
+                    }
+                    if flag_w {
+                        parts.push(input.split_whitespace().count().to_string());
+                    }
+                    if flag_c {
+                        parts.push(input.len().to_string());
+                    }
+                    stdout.push_str(&parts.join(" "));
+                    stdout.push('\n');
                 }
             }
             "head" => {
@@ -960,6 +1051,184 @@ impl Bash {
             "test" | "[" => {
                 exit_code = if self.run_test(args) { 0 } else { 1 };
             }
+            "mv" => {
+                if args.len() != 2 {
+                    stderr.push_str("mv: usage: mv SOURCE DEST\n");
+                    exit_code = 1;
+                } else {
+                    let source = self.resolve_path(&args[0]);
+                    let dest = self.resolve_path(&args[1]);
+                    if self.fs.is_file(&source) {
+                        match self.fs.read_file(&source).map(str::to_string) {
+                            Ok(contents) => {
+                                if let Err(error) = self.fs.write_file(&dest, &contents) {
+                                    stderr.push_str(&format!("mv: {error}\n"));
+                                    exit_code = 1;
+                                } else if let Err(error) = self.fs.remove(&source, false) {
+                                    stderr.push_str(&format!("mv: {error}\n"));
+                                    exit_code = 1;
+                                }
+                            }
+                            Err(error) => {
+                                stderr.push_str(&format!("mv: {error}\n"));
+                                exit_code = 1;
+                            }
+                        }
+                    } else if self.fs.is_dir(&source) {
+                        // Move directory: copy all entries under dest
+                        match self.fs.entries_under(&source) {
+                            Ok(entries) => {
+                                let source_prefix = if source.ends_with('/') {
+                                    source.clone()
+                                } else {
+                                    format!("{source}/")
+                                };
+                                let dest_norm = dest.clone();
+                                for (path, contents) in entries {
+                                    let rel = path.strip_prefix(&source_prefix).unwrap_or(&path);
+                                    let new_path = if rel.is_empty() {
+                                        dest_norm.clone()
+                                    } else {
+                                        format!("{dest_norm}/{rel}")
+                                    };
+                                    match contents {
+                                        None => {
+                                            if let Err(error) = self.fs.create_dir_all(&new_path) {
+                                                stderr.push_str(&format!("mv: {error}\n"));
+                                                exit_code = 1;
+                                            }
+                                        }
+                                        Some(c) => {
+                                            if let Err(error) = self.fs.write_file(&new_path, &c) {
+                                                stderr.push_str(&format!("mv: {error}\n"));
+                                                exit_code = 1;
+                                            }
+                                        }
+                                    }
+                                }
+                                if exit_code == 0 {
+                                    if let Err(error) = self.fs.remove(&source, true) {
+                                        stderr.push_str(&format!("mv: {error}\n"));
+                                        exit_code = 1;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                stderr.push_str(&format!("mv: {error}\n"));
+                                exit_code = 1;
+                            }
+                        }
+                    } else {
+                        stderr.push_str(&format!(
+                            "mv: {}: No such file or directory\n",
+                            args[0]
+                        ));
+                        exit_code = 1;
+                    }
+                }
+            }
+            "read" => {
+                // read [-r] VAR [VAR2 ...]
+                let mut raw_mode = false;
+                let mut var_args = args;
+                if var_args.first().map(String::as_str) == Some("-r") {
+                    raw_mode = true;
+                    var_args = &var_args[1..];
+                }
+                let line = stdin.lines().next().unwrap_or("").to_string();
+                let unescaped = if raw_mode {
+                    line.clone()
+                } else {
+                    // interpret backslash-newline continuation (simple form)
+                    line.replace("\\\n", "")
+                };
+                if var_args.is_empty() {
+                    // No variable name: store in REPLY
+                    self.env.insert("REPLY".to_string(), unescaped);
+                } else if var_args.len() == 1 {
+                    self.env.insert(var_args[0].clone(), unescaped);
+                } else {
+                    // Split on IFS (default: space/tab/newline)
+                    let ifs = self
+                        .env
+                        .get("IFS")
+                        .map(String::as_str)
+                        .unwrap_or(" \t\n");
+                    let mut parts: Vec<&str> =
+                        unescaped.splitn(var_args.len(), |c| ifs.contains(c)).collect();
+                    // Pad with empty strings if fewer parts than variables
+                    while parts.len() < var_args.len() {
+                        parts.push("");
+                    }
+                    for (var, val) in var_args.iter().zip(parts.iter()) {
+                        self.env.insert(var.clone(), val.to_string());
+                    }
+                }
+            }
+            "set" => {
+                let mut i = 0;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "-e" => self.opt_errexit = true,
+                        "+e" => self.opt_errexit = false,
+                        "-u" => self.opt_nounset = true,
+                        "+u" => self.opt_nounset = false,
+                        "-o" => {
+                            i += 1;
+                            match args.get(i).map(String::as_str) {
+                                Some("errexit") => self.opt_errexit = true,
+                                Some("nounset") => self.opt_nounset = true,
+                                Some("pipefail") => self.opt_pipefail = true,
+                                Some(other) => {
+                                    stderr.push_str(&format!("set: unknown option: {other}\n"));
+                                    exit_code = 1;
+                                }
+                                None => {
+                                    stderr.push_str("set: -o requires an option name\n");
+                                    exit_code = 1;
+                                }
+                            }
+                        }
+                        "+o" => {
+                            i += 1;
+                            match args.get(i).map(String::as_str) {
+                                Some("errexit") => self.opt_errexit = false,
+                                Some("nounset") => self.opt_nounset = false,
+                                Some("pipefail") => self.opt_pipefail = false,
+                                Some(other) => {
+                                    stderr.push_str(&format!("set: unknown option: {other}\n"));
+                                    exit_code = 1;
+                                }
+                                None => {
+                                    stderr.push_str("set: +o requires an option name\n");
+                                    exit_code = 1;
+                                }
+                            }
+                        }
+                        // Bundled flags like -euo, -eu, etc.
+                        flag if flag.starts_with('-') && flag.len() > 1 => {
+                            for ch in flag.chars().skip(1) {
+                                match ch {
+                                    'e' => self.opt_errexit = true,
+                                    'u' => self.opt_nounset = true,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        flag if flag.starts_with('+') && flag.len() > 1 => {
+                            for ch in flag.chars().skip(1) {
+                                match ch {
+                                    'e' => self.opt_errexit = false,
+                                    'u' => self.opt_nounset = false,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
             _ => {
                 stderr.push_str(&format!("bash: {command}: command not found\n"));
                 exit_code = 127;
@@ -1137,7 +1406,7 @@ impl Bash {
         eval_arithmetic_expr(expr, &self.env).ok()
     }
 
-    fn expand_text(&self, text: &str) -> String {
+    fn expand_text(&mut self, text: &str) -> String {
         let mut expanded = String::new();
         let mut chars = text.chars().peekable();
 
@@ -1164,7 +1433,13 @@ impl Bash {
                         }
                     }
                     "0" => expanded.push_str("bash"),
-                    _ => expanded.push_str(self.env.get(&name).map(String::as_str).unwrap_or("")),
+                    _ => {
+                        if let Some(val) = self.env.get(&name) {
+                            expanded.push_str(val);
+                        } else if self.opt_nounset {
+                            self.nounset_error = Some(name.clone());
+                        }
+                    }
                 }
                 continue;
             }
@@ -1213,8 +1488,10 @@ impl Bash {
 
             if name.is_empty() {
                 expanded.push('$');
-            } else {
-                expanded.push_str(self.env.get(&name).map(String::as_str).unwrap_or(""));
+            } else if let Some(val) = self.env.get(&name) {
+                expanded.push_str(val);
+            } else if self.opt_nounset {
+                self.nounset_error = Some(name.clone());
             }
         }
 
@@ -1457,7 +1734,7 @@ mod tests {
 
     #[test]
     fn executes_basic_commands_and_preserves_cwd() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("pwd; mkdir -p work; cd work; pwd; echo hello rust");
         assert_eq!(result.stdout, "/home/user\n/home/user/work\nhello rust\n");
         assert_eq!(result.stderr, "");
@@ -1469,9 +1746,9 @@ mod tests {
     fn reads_and_writes_virtual_files() {
         let mut files = BTreeMap::new();
         files.insert("/home/user/input.txt".to_string(), "hello\n".to_string());
-        let mut bash = Bash::new(BashOptions {
+        let mut bash = Bash::new(Options {
             files,
-            ..BashOptions::default()
+            ..Options::default()
         })
         .unwrap();
         let result = bash.exec("cat input.txt; cp input.txt copy.txt; ls");
@@ -1485,7 +1762,7 @@ mod tests {
 
     #[test]
     fn reports_unknown_commands() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("wat");
         assert_eq!(result.stdout, "");
         assert_eq!(result.stderr, "bash: wat: command not found\n");
@@ -1496,9 +1773,9 @@ mod tests {
     fn expands_environment_variables() {
         let mut env = BTreeMap::new();
         env.insert("NAME".to_string(), "rust".to_string());
-        let mut bash = Bash::new(BashOptions {
+        let mut bash = Bash::new(Options {
             env,
-            ..BashOptions::default()
+            ..Options::default()
         })
         .unwrap();
         let result = bash.exec("echo $NAME");
@@ -1507,7 +1784,7 @@ mod tests {
 
     #[test]
     fn pipes_stdout_into_next_command() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("echo alpha; echo beta | grep beta | wc");
         assert_eq!(result.stdout, "alpha\n1 1 5\n");
         assert_eq!(result.stderr, "");
@@ -1518,9 +1795,9 @@ mod tests {
     fn supports_input_output_and_append_redirection() {
         let mut files = BTreeMap::new();
         files.insert("/home/user/input.txt".to_string(), "one\ntwo\n".to_string());
-        let mut bash = Bash::new(BashOptions {
+        let mut bash = Bash::new(Options {
             files,
-            ..BashOptions::default()
+            ..Options::default()
         })
         .unwrap();
         let result = bash.exec("grep two < input.txt > out.txt; echo done >> out.txt; cat out.txt");
@@ -1535,7 +1812,7 @@ mod tests {
 
     #[test]
     fn honors_and_or_connectors() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec(
             "false && echo nope; false || echo fallback; true && echo done; true || echo skip",
         );
@@ -1549,9 +1826,9 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("NAME".to_string(), "rust".to_string());
         env.insert("SUFFIX".to_string(), "core".to_string());
-        let mut bash = Bash::new(BashOptions {
+        let mut bash = Bash::new(Options {
             env,
-            ..BashOptions::default()
+            ..Options::default()
         })
         .unwrap();
         let result = bash.exec("echo hello-$NAME-${SUFFIX}");
@@ -1561,7 +1838,7 @@ mod tests {
 
     #[test]
     fn rejects_writes_to_directories_and_missing_parents() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("echo hi > /tmp; touch /tmp; echo hi > missing/file; ls /tmp");
         assert_eq!(result.stdout, "");
         assert_eq!(
@@ -1573,7 +1850,7 @@ mod tests {
 
     #[test]
     fn mkdir_without_parents_fails_for_missing_parent() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("mkdir nested/child; ls");
         assert_eq!(result.stdout, "");
         assert_eq!(
@@ -1585,7 +1862,7 @@ mod tests {
 
     #[test]
     fn pipeline_commands_do_not_mutate_parent_shell_state() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("cd /tmp | cat; pwd; exit 7 | true; echo after");
         assert_eq!(result.stdout, "/home/user\nafter\n");
         assert_eq!(result.stderr, "");
@@ -1595,7 +1872,7 @@ mod tests {
 
     #[test]
     fn wc_counts_newline_bytes_for_lines() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("echo -n x | wc");
         assert_eq!(result.stdout, "0 1 1\n");
         assert_eq!(result.stderr, "");
@@ -1605,9 +1882,9 @@ mod tests {
     fn output_redirection_truncates_before_command_runs() {
         let mut files = BTreeMap::new();
         files.insert("/home/user/f".to_string(), "old\n".to_string());
-        let mut bash = Bash::new(BashOptions {
+        let mut bash = Bash::new(Options {
             files,
-            ..BashOptions::default()
+            ..Options::default()
         })
         .unwrap();
         let result = bash.exec("cat f > f; wc f");
@@ -1620,9 +1897,9 @@ mod tests {
     fn ls_lists_file_operands() {
         let mut files = BTreeMap::new();
         files.insert("/home/user/file.txt".to_string(), "data".to_string());
-        let mut bash = Bash::new(BashOptions {
+        let mut bash = Bash::new(Options {
             files,
-            ..BashOptions::default()
+            ..Options::default()
         })
         .unwrap();
         let result = bash.exec("ls file.txt");
@@ -1632,7 +1909,7 @@ mod tests {
 
     #[test]
     fn printf_formats_arguments() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("printf '%s\\n' a b");
         assert_eq!(result.stdout, "a\nb\n");
         assert_eq!(result.stderr, "");
@@ -1645,9 +1922,9 @@ mod tests {
             "/home/user/input.txt".to_string(),
             "b\na\na\nc\n".to_string(),
         );
-        let mut bash = Bash::new(BashOptions {
+        let mut bash = Bash::new(Options {
             files,
-            ..BashOptions::default()
+            ..Options::default()
         })
         .unwrap();
         let result = bash.exec(
@@ -1665,9 +1942,9 @@ mod tests {
             "/home/user/csv.txt".to_string(),
             "name,lang\nalice,rust\nbob,go\n".to_string(),
         );
-        let mut bash = Bash::new(BashOptions {
+        let mut bash = Bash::new(Options {
             files,
-            ..BashOptions::default()
+            ..Options::default()
         })
         .unwrap();
         let result = bash.exec("cut -d , -f 2 csv.txt | tr og OG");
@@ -1678,7 +1955,7 @@ mod tests {
 
     #[test]
     fn supports_basename_and_dirname() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("basename /tmp/hello.txt; dirname /tmp/hello.txt");
         assert_eq!(result.stdout, "hello.txt\n/tmp\n");
         assert_eq!(result.stderr, "");
@@ -1687,7 +1964,7 @@ mod tests {
 
     #[test]
     fn text_tool_usage_errors_are_reported() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("cut -d , missing");
         assert_eq!(result.stdout, "");
         assert_eq!(
@@ -1701,9 +1978,9 @@ mod tests {
     fn rm_rejects_unsupported_options_without_deleting() {
         let mut files = BTreeMap::new();
         files.insert("/home/user/file.txt".to_string(), "data".to_string());
-        let mut bash = Bash::new(BashOptions {
+        let mut bash = Bash::new(Options {
             files,
-            ..BashOptions::default()
+            ..Options::default()
         })
         .unwrap();
         let result = bash.exec("rm -i file.txt; cat file.txt");
@@ -1716,9 +1993,9 @@ mod tests {
     fn single_quotes_suppress_variable_expansion() {
         let mut env = BTreeMap::new();
         env.insert("NAME".to_string(), "rust".to_string());
-        let mut bash = Bash::new(BashOptions {
+        let mut bash = Bash::new(Options {
             env,
-            ..BashOptions::default()
+            ..Options::default()
         })
         .unwrap();
         let result = bash.exec(r#"echo '$NAME' "$NAME" pre'$NAME'-$NAME"#);
@@ -1728,7 +2005,7 @@ mod tests {
 
     #[test]
     fn assignment_words_update_environment() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("NAME=rust; echo $NAME");
         assert_eq!(result.stdout, "rust\n");
         assert_eq!(result.stderr, "");
@@ -1738,9 +2015,9 @@ mod tests {
     fn isolates_environment_and_cwd_between_exec_calls_by_default() {
         let mut files = BTreeMap::new();
         files.insert("/home/user/seed.txt".to_string(), "ok\n".to_string());
-        let mut bash = Bash::new(BashOptions {
+        let mut bash = Bash::new(Options {
             files,
-            ..BashOptions::default()
+            ..Options::default()
         })
         .unwrap();
         let first = bash
@@ -1753,9 +2030,9 @@ mod tests {
 
     #[test]
     fn can_opt_out_of_exec_isolation() {
-        let mut bash = Bash::new(BashOptions {
+        let mut bash = Bash::new(Options {
             isolate_exec: false,
-            ..BashOptions::default()
+            ..Options::default()
         })
         .unwrap();
         let first = bash.exec("NAME=rust; cd /tmp");
@@ -1766,12 +2043,12 @@ mod tests {
 
     #[test]
     fn rejects_scripts_larger_than_limit() {
-        let mut bash = Bash::new(BashOptions {
-            execution_limits: BashExecutionLimits {
+        let mut bash = Bash::new(Options {
+            execution_limits: ExecutionLimits {
                 max_script_size_bytes: 8,
-                ..BashExecutionLimits::default()
+                ..ExecutionLimits::default()
             },
-            ..BashOptions::default()
+            ..Options::default()
         })
         .unwrap();
         let result = bash.exec("echo hello");
@@ -1781,12 +2058,12 @@ mod tests {
 
     #[test]
     fn rejects_too_many_commands() {
-        let mut bash = Bash::new(BashOptions {
-            execution_limits: BashExecutionLimits {
+        let mut bash = Bash::new(Options {
+            execution_limits: ExecutionLimits {
                 max_command_count: 2,
-                ..BashExecutionLimits::default()
+                ..ExecutionLimits::default()
             },
-            ..BashOptions::default()
+            ..Options::default()
         })
         .unwrap();
         let result = bash.exec("echo a; echo b; echo c");
@@ -1798,7 +2075,7 @@ mod tests {
 
     #[test]
     fn executes_if_statements() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("if true; then echo yes; fi");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "yes\n");
@@ -1806,7 +2083,7 @@ mod tests {
 
     #[test]
     fn executes_if_else_statements() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("if false; then echo yes; else echo no; fi");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "no\n");
@@ -1814,7 +2091,7 @@ mod tests {
 
     #[test]
     fn executes_if_elif_statements() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("if false; then echo a; elif true; then echo b; else echo c; fi");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "b\n");
@@ -1822,12 +2099,12 @@ mod tests {
 
     #[test]
     fn executes_while_loops() {
-        let mut bash = Bash::new(BashOptions {
-            execution_limits: BashExecutionLimits {
+        let mut bash = Bash::new(Options {
+            execution_limits: ExecutionLimits {
                 max_loop_iterations: 5,
-                ..BashExecutionLimits::default()
+                ..ExecutionLimits::default()
             },
-            ..BashOptions::default()
+            ..Options::default()
         })
         .unwrap();
         // Simple while loop that terminates when the limit is hit
@@ -1838,7 +2115,7 @@ mod tests {
 
     #[test]
     fn executes_for_loops() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("for i in a b c; do echo $i; done");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "a\nb\nc\n");
@@ -1848,7 +2125,7 @@ mod tests {
 
     #[test]
     fn executes_command_substitution() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("echo $(echo hello)");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "hello\n");
@@ -1856,7 +2133,7 @@ mod tests {
 
     #[test]
     fn command_substitution_strips_trailing_newlines() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("echo $(echo -e \"a\\nb\\nc\")");
         assert_eq!(result.exit_code, 0);
         // Trailing newlines are stripped but internal ones are preserved
@@ -1869,7 +2146,7 @@ mod tests {
 
     #[test]
     fn nested_command_substitutions() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("echo $(echo $(echo nested))");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "nested\n");
@@ -1877,7 +2154,7 @@ mod tests {
 
     #[test]
     fn supports_arithmetic_expansion() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("i=1; i=$((i + 2 * 3)); echo $i");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "7\n");
@@ -1885,7 +2162,7 @@ mod tests {
 
     #[test]
     fn while_loop_with_arithmetic_counter() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("i=0; while [ \"$i\" -lt 3 ]; do echo $i; i=$((i + 1)); done");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "0\n1\n2\n");
@@ -1895,7 +2172,7 @@ mod tests {
 
     #[test]
     fn special_variable_exit_code() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("true; echo $?");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "0\n");
@@ -1903,7 +2180,7 @@ mod tests {
 
     #[test]
     fn special_variable_exit_code_after_failure() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("false; echo $?");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "1\n");
@@ -1911,7 +2188,7 @@ mod tests {
 
     #[test]
     fn special_variable_script_name() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("echo $0");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "bash\n");
@@ -1921,7 +2198,7 @@ mod tests {
 
     #[test]
     fn test_builtin_string_empty() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("test -z \"\"; echo $?");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "0\n");
@@ -1929,7 +2206,7 @@ mod tests {
 
     #[test]
     fn test_builtin_string_not_empty() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("test -z \"hello\"; echo $?");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "1\n");
@@ -1937,7 +2214,7 @@ mod tests {
 
     #[test]
     fn test_builtin_string_not_null() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("test -n \"hello\"; echo $?");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "0\n");
@@ -1945,7 +2222,7 @@ mod tests {
 
     #[test]
     fn test_builtin_string_equal() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("test \"a\" = \"a\"; echo $?");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "0\n");
@@ -1953,7 +2230,7 @@ mod tests {
 
     #[test]
     fn test_builtin_numeric_equal() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("test 5 -eq 5; echo $?");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "0\n");
@@ -1961,7 +2238,7 @@ mod tests {
 
     #[test]
     fn test_builtin_numeric_less_than() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("test 3 -lt 5; echo $?");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "0\n");
@@ -1969,7 +2246,7 @@ mod tests {
 
     #[test]
     fn bracket_test_builtin() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("[ \"a\" = \"a\" ]; echo $?");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "0\n");
@@ -1979,12 +2256,12 @@ mod tests {
 
     #[test]
     fn enforces_output_size_limit() {
-        let mut bash = Bash::new(BashOptions {
-            execution_limits: BashExecutionLimits {
+        let mut bash = Bash::new(Options {
+            execution_limits: ExecutionLimits {
                 max_output_bytes: 50,
-                ..BashExecutionLimits::default()
+                ..ExecutionLimits::default()
             },
-            ..BashOptions::default()
+            ..Options::default()
         })
         .unwrap();
         // Generate output that exceeds the limit (50 bytes limit)
@@ -1995,12 +2272,12 @@ mod tests {
 
     #[test]
     fn enforces_loop_iteration_limit() {
-        let mut bash = Bash::new(BashOptions {
-            execution_limits: BashExecutionLimits {
+        let mut bash = Bash::new(Options {
+            execution_limits: ExecutionLimits {
                 max_loop_iterations: 10,
-                ..BashExecutionLimits::default()
+                ..ExecutionLimits::default()
             },
-            ..BashOptions::default()
+            ..Options::default()
         })
         .unwrap();
         let result = bash.exec("i=0; while [ 1 ]; do i=$((i + 1)); done");
@@ -2012,7 +2289,7 @@ mod tests {
 
     #[test]
     fn complex_script_with_conditionals_and_substitution() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result =
             bash.exec("result=$(echo \"test\"); if [ \"$result\" = \"test\" ]; then echo pass; fi");
         assert_eq!(result.exit_code, 0);
@@ -2021,11 +2298,123 @@ mod tests {
 
     #[test]
     fn for_loop_with_command_substitution() {
-        let mut bash = Bash::new(BashOptions::default()).unwrap();
+        let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("for i in $(echo -e \"1\\n2\\n3\"); do echo $i; done");
         assert_eq!(result.exit_code, 0);
         assert!(result.stdout.contains("1"));
         assert!(result.stdout.contains("2"));
         assert!(result.stdout.contains("3"));
+    }
+
+    // ─── mv ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn mv_renames_a_file() {
+        let mut files = BTreeMap::new();
+        files.insert("/home/user/old.txt".to_string(), "content\n".to_string());
+        let mut bash = Bash::new(Options { files, ..Options::default() }).unwrap();
+        let result = bash.exec("mv old.txt new.txt; cat new.txt");
+        assert_eq!(result.stdout, "content\n");
+        assert_eq!(result.stderr, "");
+        assert!(bash.fs().read_file("/home/user/old.txt").is_err());
+        assert_eq!(bash.fs().read_file("/home/user/new.txt").unwrap(), "content\n");
+    }
+
+    #[test]
+    fn mv_fails_for_missing_source() {
+        let mut bash = Bash::new(Options::default()).unwrap();
+        let result = bash.exec("mv missing.txt dest.txt");
+        assert_eq!(result.exit_code, 1);
+        assert!(result.stderr.contains("No such file or directory"));
+    }
+
+    // ─── wc flags ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn wc_flag_l_counts_lines_only() {
+        let mut bash = Bash::new(Options::default()).unwrap();
+        let result = bash.exec("printf 'a\\nb\\nc\\n' | wc -l");
+        assert_eq!(result.stdout, "3\n");
+    }
+
+    #[test]
+    fn wc_flag_w_counts_words_only() {
+        let mut bash = Bash::new(Options::default()).unwrap();
+        let result = bash.exec("echo 'hello world' | wc -w");
+        assert_eq!(result.stdout, "2\n");
+    }
+
+    #[test]
+    fn wc_combined_flags() {
+        let mut bash = Bash::new(Options::default()).unwrap();
+        let result = bash.exec("echo 'hello world' | wc -lw");
+        assert_eq!(result.stdout, "1 2\n");
+    }
+
+    // ─── read builtin ─────────────────────────────────────────────────────
+
+    #[test]
+    fn read_assigns_line_to_variable() {
+        let mut bash = Bash::new(Options {
+            isolate_exec: false,
+            ..Options::default()
+        }).unwrap();
+        bash.exec("echo hello | read LINE; echo $LINE");
+        // In a pipeline the child env doesn't propagate; test via here-string style
+        let result = bash.exec("read NAME <<< 'world'; echo $NAME");
+        // <<< is not yet supported, so use a simpler approach: write to file then read
+        let _ = result;
+        let mut bash2 = Bash::new(Options {
+            isolate_exec: false,
+            ..Options::default()
+        }).unwrap();
+        bash2.exec("echo 'alice' > /home/user/name.txt");
+        let r = bash2.exec("read NAME < /home/user/name.txt; echo $NAME");
+        assert_eq!(r.stdout, "alice\n");
+        assert_eq!(r.stderr, "");
+    }
+
+    // ─── set options ─────────────────────────────────────────────────────
+
+    #[test]
+    fn set_e_aborts_on_nonzero() {
+        let mut bash = Bash::new(Options {
+            isolate_exec: false,
+            ..Options::default()
+        }).unwrap();
+        let result = bash.exec("set -e; false; echo should_not_run");
+        assert_eq!(result.stdout, "");
+        assert_ne!(result.exit_code, 0);
+    }
+
+    #[test]
+    fn set_u_errors_on_unset_variable() {
+        let mut bash = Bash::new(Options {
+            isolate_exec: false,
+            ..Options::default()
+        }).unwrap();
+        let result = bash.exec("set -u; echo $UNSET_VAR");
+        assert_eq!(result.exit_code, 1);
+        assert!(result.stderr.contains("unbound variable"));
+    }
+
+    #[test]
+    fn set_o_pipefail_propagates_pipeline_failure() {
+        let mut bash = Bash::new(Options {
+            isolate_exec: false,
+            ..Options::default()
+        }).unwrap();
+        let result = bash.exec("set -o pipefail; false | echo ok");
+        assert_ne!(result.exit_code, 0);
+    }
+
+    #[test]
+    fn set_bundled_flags() {
+        let mut bash = Bash::new(Options {
+            isolate_exec: false,
+            ..Options::default()
+        }).unwrap();
+        let result = bash.exec("set -eu; false");
+        assert_ne!(result.exit_code, 0);
     }
 }

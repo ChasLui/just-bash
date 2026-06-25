@@ -2,12 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BashError {
+pub enum Error {
     Parse(String),
     FileSystem(String),
 }
 
-impl fmt::Display for BashError {
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Parse(message) | Self::FileSystem(message) => write!(f, "{message}"),
@@ -15,7 +15,7 @@ impl fmt::Display for BashError {
     }
 }
 
-impl std::error::Error for BashError {}
+impl std::error::Error for Error {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FsEntry {
@@ -44,7 +44,7 @@ impl InMemoryFs {
         Self::default()
     }
 
-    pub fn with_files(files: BTreeMap<String, String>) -> Result<Self, BashError> {
+    pub fn with_files(files: BTreeMap<String, String>) -> Result<Self, Error> {
         let mut fs = Self::new();
         for (path, contents) in files {
             fs.create_dir_all(&parent_dir(&path))?;
@@ -53,23 +53,23 @@ impl InMemoryFs {
         Ok(fs)
     }
 
-    pub fn read_file(&self, path: &str) -> Result<&str, BashError> {
+    pub fn read_file(&self, path: &str) -> Result<&str, Error> {
         match self.entries.get(path) {
             Some(FsEntry::File(contents)) => Ok(contents),
             Some(FsEntry::Directory) => {
-                Err(BashError::FileSystem(format!("{path}: Is a directory")))
+                Err(Error::FileSystem(format!("{path}: Is a directory")))
             }
-            None => Err(BashError::FileSystem(format!(
+            None => Err(Error::FileSystem(format!(
                 "{path}: No such file or directory"
             ))),
         }
     }
 
-    pub fn write_file(&mut self, path: &str, contents: &str) -> Result<(), BashError> {
+    pub fn write_file(&mut self, path: &str, contents: &str) -> Result<(), Error> {
         let normalized = normalize_absolute(path);
         self.ensure_parent_dir(&normalized)?;
         if matches!(self.entries.get(&normalized), Some(FsEntry::Directory)) {
-            return Err(BashError::FileSystem(format!(
+            return Err(Error::FileSystem(format!(
                 "{normalized}: Is a directory"
             )));
         }
@@ -78,12 +78,12 @@ impl InMemoryFs {
         Ok(())
     }
 
-    pub fn append_file(&mut self, path: &str, contents: &str) -> Result<(), BashError> {
+    pub fn append_file(&mut self, path: &str, contents: &str) -> Result<(), Error> {
         let normalized = normalize_absolute(path);
         let mut next = match self.entries.get(&normalized) {
             Some(FsEntry::File(existing)) => existing.clone(),
             Some(FsEntry::Directory) => {
-                return Err(BashError::FileSystem(format!(
+                return Err(Error::FileSystem(format!(
                     "{normalized}: Is a directory"
                 )));
             }
@@ -93,17 +93,17 @@ impl InMemoryFs {
         self.write_file(&normalized, &next)
     }
 
-    pub fn create_dir(&mut self, path: &str) -> Result<(), BashError> {
+    pub fn create_dir(&mut self, path: &str) -> Result<(), Error> {
         let normalized = normalize_absolute(path);
         if self.entries.contains_key(&normalized) {
-            return Err(BashError::FileSystem(format!("{normalized}: File exists")));
+            return Err(Error::FileSystem(format!("{normalized}: File exists")));
         }
         self.ensure_parent_dir(&normalized)?;
         self.entries.insert(normalized, FsEntry::Directory);
         Ok(())
     }
 
-    pub fn create_dir_all(&mut self, path: &str) -> Result<(), BashError> {
+    pub fn create_dir_all(&mut self, path: &str) -> Result<(), Error> {
         let normalized = normalize_absolute(path);
         let mut current = String::from("/");
         for part in normalized.split('/').filter(|part| !part.is_empty()) {
@@ -112,26 +112,26 @@ impl InMemoryFs {
             }
             current.push_str(part);
             if matches!(self.entries.get(&current), Some(FsEntry::File(_))) {
-                return Err(BashError::FileSystem(format!("{current}: Not a directory")));
+                return Err(Error::FileSystem(format!("{current}: Not a directory")));
             }
             self.entries.insert(current.clone(), FsEntry::Directory);
         }
         Ok(())
     }
 
-    pub fn remove(&mut self, path: &str, recursive: bool) -> Result<(), BashError> {
+    pub fn remove(&mut self, path: &str, recursive: bool) -> Result<(), Error> {
         let normalized = normalize_absolute(path);
         if normalized == "/" {
-            return Err(BashError::FileSystem("cannot remove '/'".to_string()));
+            return Err(Error::FileSystem("cannot remove '/'".to_string()));
         }
         match self.entries.get(&normalized) {
             None => {
-                return Err(BashError::FileSystem(format!(
+                return Err(Error::FileSystem(format!(
                     "{normalized}: No such file or directory"
                 )));
             }
             Some(FsEntry::Directory) if !recursive && self.has_children(&normalized) => {
-                return Err(BashError::FileSystem(format!(
+                return Err(Error::FileSystem(format!(
                     "{normalized}: Directory not empty"
                 )));
             }
@@ -162,9 +162,9 @@ impl InMemoryFs {
         matches!(self.entries.get(path), Some(FsEntry::File(_)))
     }
 
-    pub fn list_dir(&self, path: &str) -> Result<Vec<String>, BashError> {
+    pub fn list_dir(&self, path: &str) -> Result<Vec<String>, Error> {
         if !self.is_dir(path) {
-            return Err(BashError::FileSystem(format!("{path}: Not a directory")));
+            return Err(Error::FileSystem(format!("{path}: Not a directory")));
         }
         let prefix = if path == "/" {
             "/".to_string()
@@ -186,14 +186,35 @@ impl InMemoryFs {
         Ok(names.into_iter().collect())
     }
 
-    fn ensure_parent_dir(&self, path: &str) -> Result<(), BashError> {
+    /// Returns all entries under `path` (inclusive of the dir itself) as
+    /// `(absolute_path, Option<contents>)` where `None` means a directory.
+    pub fn entries_under(&self, path: &str) -> Result<Vec<(String, Option<String>)>, Error> {
+        let normalized = normalize_absolute(path);
+        if !self.is_dir(&normalized) {
+            return Err(Error::FileSystem(format!("{normalized}: Not a directory")));
+        }
+        let prefix = format!("{normalized}/");
+        let mut result = vec![(normalized.clone(), None)];
+        for (entry_path, entry) in &self.entries {
+            if entry_path.starts_with(&prefix) {
+                let contents = match entry {
+                    FsEntry::File(c) => Some(c.clone()),
+                    FsEntry::Directory => None,
+                };
+                result.push((entry_path.clone(), contents));
+            }
+        }
+        Ok(result)
+    }
+
+    fn ensure_parent_dir(&self, path: &str) -> Result<(), Error> {
         let parent = parent_dir(path);
         match self.entries.get(&parent) {
             Some(FsEntry::Directory) => Ok(()),
             Some(FsEntry::File(_)) => {
-                Err(BashError::FileSystem(format!("{parent}: Not a directory")))
+                Err(Error::FileSystem(format!("{parent}: Not a directory")))
             }
-            None => Err(BashError::FileSystem(format!(
+            None => Err(Error::FileSystem(format!(
                 "{parent}: No such file or directory"
             ))),
         }
