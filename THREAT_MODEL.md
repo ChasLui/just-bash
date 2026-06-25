@@ -19,7 +19,7 @@ goal is deterministic behavior with conservative resource limits.
 
 1. In-memory filesystem only (`InMemoryFs`), no host filesystem writes/reads.
 2. Explicit parser + executor errors for malformed syntax and invalid file ops.
-3. Execution limits (configurable via `BashExecutionLimits`):
+3. Execution limits (configurable via `ExecutionLimits`):
    - script size ceiling,
    - total command count ceiling,
    - command substitution nesting ceiling.
