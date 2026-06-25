@@ -19,7 +19,9 @@ Supported execution features include command sequencing with `;`/newlines,
 pipelines with `|`, conditional pipeline connectors with `&&` and `||`, input
 redirection with `<`, output redirection with `>` and `>>`, inline `$NAME` and
 `${NAME}` variable expansion with single-quote suppression, assignment-only
-environment updates, and syntax errors for missing pipeline/conditional commands.
+environment updates, `if`/`elif`/`else`, `while` and `for` loops, arithmetic
+expansion `$((expr))`, command substitution `$(...)`, and `set -e`, `set -u`,
+`set -o pipefail` shell options.
 
 Default runtime behavior is intentionally close to upstream: each `exec()` call
 starts from the initial `env` + `cwd` (isolated shell state), while filesystem
@@ -32,6 +34,7 @@ Default execution limits:
 - `max_command_count`: `10_000`
 - `max_command_substitution_depth`: `50`
 
-Supported built-ins in this milestone are `cat`, `cd`, `cp`, `echo`, `env`,
-`exit`, `export`, `false`, `grep`, `ls`, `mkdir`, `printf`, `pwd`, `rm`,
-`touch`, `true`, and `wc`.
+Supported built-ins in this milestone are `basename`, `cat`, `cd`, `cp`,
+`cut`, `dirname`, `echo`, `env`, `exit`, `export`, `false`, `grep`, `head`,
+`ls`, `mkdir`, `mv`, `printf`, `pwd`, `read`, `rm`, `set`, `sort`, `tail`,
+`test`/`[`, `touch`, `tr`, `true`, `uniq`, and `wc`.

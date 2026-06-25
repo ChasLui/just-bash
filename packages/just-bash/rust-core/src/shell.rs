@@ -68,6 +68,14 @@ pub struct Bash {
     last_exit_code: i32,
     output_bytes_used: usize,
     loop_iteration_count: usize,
+    /// set -e: exit immediately if a command returns non-zero
+    opt_errexit: bool,
+    /// set -u: treat unset variables as an error
+    opt_nounset: bool,
+    /// set -o pipefail: pipeline exit code is last non-zero status
+    opt_pipefail: bool,
+    /// Pending error from set -u: variable name that was unset
+    nounset_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +105,10 @@ impl Bash {
             last_exit_code: 0,
             output_bytes_used: 0,
             loop_iteration_count: 0,
+            opt_errexit: false,
+            opt_nounset: false,
+            opt_pipefail: false,
+            nounset_error: None,
         })
     }
 
@@ -122,16 +134,27 @@ impl Bash {
             let saved_cwd = self.cwd.clone();
             let saved_output = self.output_bytes_used;
             let saved_loop_count = self.loop_iteration_count;
+            let saved_errexit = self.opt_errexit;
+            let saved_nounset = self.opt_nounset;
+            let saved_pipefail = self.opt_pipefail;
             self.env = self.initial_env.clone();
             self.cwd = self.initial_cwd.clone();
             self.env.insert("PWD".to_string(), self.cwd.clone());
             self.output_bytes_used = 0;
             self.loop_iteration_count = 0;
+            self.opt_errexit = false;
+            self.opt_nounset = false;
+            self.opt_pipefail = false;
+            self.nounset_error = None;
             let result = self.exec_in_current_state(script);
             self.env = saved_env;
             self.cwd = saved_cwd;
             self.output_bytes_used = saved_output;
             self.loop_iteration_count = saved_loop_count;
+            self.opt_errexit = saved_errexit;
+            self.opt_nounset = saved_nounset;
+            self.opt_pipefail = saved_pipefail;
+            self.nounset_error = None;
             result
         } else {
             self.exec_in_current_state(script)
@@ -200,6 +223,20 @@ impl Bash {
                     stdout,
                     stderr,
                     exit_code: 2,
+                    cwd: self.cwd.clone(),
+                };
+            }
+
+            // set -e: abort on non-zero exit (but not when connector is || or &&)
+            if self.opt_errexit
+                && exit_code != 0
+                && statement.connector == PipelineConnector::Always
+            {
+                self.last_exit_code = exit_code;
+                return ExecResult {
+                    stdout,
+                    stderr,
+                    exit_code,
                     cwd: self.cwd.clone(),
                 };
             }
@@ -274,6 +311,8 @@ impl Bash {
         let mut stdout = String::new();
         let mut stderr = String::new();
         let mut exit_code = 0;
+        // For pipefail: track all non-zero exit codes in the pipeline
+        let mut pipeline_last_failure: i32 = 0;
 
         let command_count = commands.len();
         let is_pipeline = command_count > 1;
@@ -293,6 +332,9 @@ impl Bash {
 
             stderr.push_str(&result.stderr);
             exit_code = result.exit_code;
+            if is_pipeline && result.exit_code != 0 {
+                pipeline_last_failure = result.exit_code;
+            }
 
             if is_last {
                 stdout.push_str(&result.stdout);
@@ -311,6 +353,11 @@ impl Bash {
                 self.last_exit_code = exit_code;
                 return (stdout, stderr, exit_code);
             }
+        }
+
+        // set -o pipefail: use last non-zero exit code from the pipeline
+        if self.opt_pipefail && is_pipeline && pipeline_last_failure != 0 {
+            exit_code = pipeline_last_failure;
         }
 
         self.last_exit_code = exit_code;
@@ -513,6 +560,16 @@ impl Bash {
             .iter()
             .map(|word| self.expand_word(word))
             .collect::<Vec<_>>();
+
+        // set -u: abort if any variable expansion flagged an unset variable
+        if let Some(ref varname) = self.nounset_error.take() {
+            return CommandOutput {
+                stdout: String::new(),
+                stderr: format!("bash: {varname}: unbound variable\n"),
+                exit_code: 1,
+            };
+        }
+
         let mut result = self.run_command(&words, &stdin);
 
         if let Some((mode, target)) = stdout_redirect {
@@ -657,11 +714,37 @@ impl Bash {
                 }
             }
             "wc" => {
-                let input = if args.is_empty() {
+                let mut flag_l = false;
+                let mut flag_w = false;
+                let mut flag_c = false;
+                let mut file_start = 0usize;
+                for (i, arg) in args.iter().enumerate() {
+                    if arg.starts_with('-') && !arg.starts_with("--") {
+                        for ch in arg.chars().skip(1) {
+                            match ch {
+                                'l' => flag_l = true,
+                                'w' => flag_w = true,
+                                'c' => flag_c = true,
+                                _ => {}
+                            }
+                        }
+                        file_start = i + 1;
+                    } else {
+                        file_start = i;
+                        break;
+                    }
+                }
+                // No flags means print all three columns
+                if !flag_l && !flag_w && !flag_c {
+                    flag_l = true;
+                    flag_w = true;
+                    flag_c = true;
+                }
+                let input = if file_start >= args.len() {
                     stdin.to_string()
                 } else {
                     let mut combined = String::new();
-                    for arg in args {
+                    for arg in &args[file_start..] {
                         match self.fs.read_file(&self.resolve_path(arg)) {
                             Ok(contents) => combined.push_str(contents),
                             Err(error) => {
@@ -673,10 +756,18 @@ impl Bash {
                     combined
                 };
                 if exit_code == 0 {
-                    let lines = input.bytes().filter(|byte| *byte == b'\n').count();
-                    let words = input.split_whitespace().count();
-                    let bytes = input.len();
-                    stdout.push_str(&format!("{lines} {words} {bytes}\n"));
+                    let mut parts = Vec::new();
+                    if flag_l {
+                        parts.push(input.bytes().filter(|byte| *byte == b'\n').count().to_string());
+                    }
+                    if flag_w {
+                        parts.push(input.split_whitespace().count().to_string());
+                    }
+                    if flag_c {
+                        parts.push(input.len().to_string());
+                    }
+                    stdout.push_str(&parts.join(" "));
+                    stdout.push('\n');
                 }
             }
             "head" => {
@@ -960,6 +1051,184 @@ impl Bash {
             "test" | "[" => {
                 exit_code = if self.run_test(args) { 0 } else { 1 };
             }
+            "mv" => {
+                if args.len() != 2 {
+                    stderr.push_str("mv: usage: mv SOURCE DEST\n");
+                    exit_code = 1;
+                } else {
+                    let source = self.resolve_path(&args[0]);
+                    let dest = self.resolve_path(&args[1]);
+                    if self.fs.is_file(&source) {
+                        match self.fs.read_file(&source).map(str::to_string) {
+                            Ok(contents) => {
+                                if let Err(error) = self.fs.write_file(&dest, &contents) {
+                                    stderr.push_str(&format!("mv: {error}\n"));
+                                    exit_code = 1;
+                                } else if let Err(error) = self.fs.remove(&source, false) {
+                                    stderr.push_str(&format!("mv: {error}\n"));
+                                    exit_code = 1;
+                                }
+                            }
+                            Err(error) => {
+                                stderr.push_str(&format!("mv: {error}\n"));
+                                exit_code = 1;
+                            }
+                        }
+                    } else if self.fs.is_dir(&source) {
+                        // Move directory: copy all entries under dest
+                        match self.fs.entries_under(&source) {
+                            Ok(entries) => {
+                                let source_prefix = if source.ends_with('/') {
+                                    source.clone()
+                                } else {
+                                    format!("{source}/")
+                                };
+                                let dest_norm = dest.clone();
+                                for (path, contents) in entries {
+                                    let rel = path.strip_prefix(&source_prefix).unwrap_or(&path);
+                                    let new_path = if rel.is_empty() {
+                                        dest_norm.clone()
+                                    } else {
+                                        format!("{dest_norm}/{rel}")
+                                    };
+                                    match contents {
+                                        None => {
+                                            if let Err(error) = self.fs.create_dir_all(&new_path) {
+                                                stderr.push_str(&format!("mv: {error}\n"));
+                                                exit_code = 1;
+                                            }
+                                        }
+                                        Some(c) => {
+                                            if let Err(error) = self.fs.write_file(&new_path, &c) {
+                                                stderr.push_str(&format!("mv: {error}\n"));
+                                                exit_code = 1;
+                                            }
+                                        }
+                                    }
+                                }
+                                if exit_code == 0 {
+                                    if let Err(error) = self.fs.remove(&source, true) {
+                                        stderr.push_str(&format!("mv: {error}\n"));
+                                        exit_code = 1;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                stderr.push_str(&format!("mv: {error}\n"));
+                                exit_code = 1;
+                            }
+                        }
+                    } else {
+                        stderr.push_str(&format!(
+                            "mv: {}: No such file or directory\n",
+                            args[0]
+                        ));
+                        exit_code = 1;
+                    }
+                }
+            }
+            "read" => {
+                // read [-r] VAR [VAR2 ...]
+                let mut raw_mode = false;
+                let mut var_args = args;
+                if var_args.first().map(String::as_str) == Some("-r") {
+                    raw_mode = true;
+                    var_args = &var_args[1..];
+                }
+                let line = stdin.lines().next().unwrap_or("").to_string();
+                let unescaped = if raw_mode {
+                    line.clone()
+                } else {
+                    // interpret backslash-newline continuation (simple form)
+                    line.replace("\\\n", "")
+                };
+                if var_args.is_empty() {
+                    // No variable name: store in REPLY
+                    self.env.insert("REPLY".to_string(), unescaped);
+                } else if var_args.len() == 1 {
+                    self.env.insert(var_args[0].clone(), unescaped);
+                } else {
+                    // Split on IFS (default: space/tab/newline)
+                    let ifs = self
+                        .env
+                        .get("IFS")
+                        .map(String::as_str)
+                        .unwrap_or(" \t\n");
+                    let mut parts: Vec<&str> =
+                        unescaped.splitn(var_args.len(), |c| ifs.contains(c)).collect();
+                    // Pad with empty strings if fewer parts than variables
+                    while parts.len() < var_args.len() {
+                        parts.push("");
+                    }
+                    for (var, val) in var_args.iter().zip(parts.iter()) {
+                        self.env.insert(var.clone(), val.to_string());
+                    }
+                }
+            }
+            "set" => {
+                let mut i = 0;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "-e" => self.opt_errexit = true,
+                        "+e" => self.opt_errexit = false,
+                        "-u" => self.opt_nounset = true,
+                        "+u" => self.opt_nounset = false,
+                        "-o" => {
+                            i += 1;
+                            match args.get(i).map(String::as_str) {
+                                Some("errexit") => self.opt_errexit = true,
+                                Some("nounset") => self.opt_nounset = true,
+                                Some("pipefail") => self.opt_pipefail = true,
+                                Some(other) => {
+                                    stderr.push_str(&format!("set: unknown option: {other}\n"));
+                                    exit_code = 1;
+                                }
+                                None => {
+                                    stderr.push_str("set: -o requires an option name\n");
+                                    exit_code = 1;
+                                }
+                            }
+                        }
+                        "+o" => {
+                            i += 1;
+                            match args.get(i).map(String::as_str) {
+                                Some("errexit") => self.opt_errexit = false,
+                                Some("nounset") => self.opt_nounset = false,
+                                Some("pipefail") => self.opt_pipefail = false,
+                                Some(other) => {
+                                    stderr.push_str(&format!("set: unknown option: {other}\n"));
+                                    exit_code = 1;
+                                }
+                                None => {
+                                    stderr.push_str("set: +o requires an option name\n");
+                                    exit_code = 1;
+                                }
+                            }
+                        }
+                        // Bundled flags like -euo, -eu, etc.
+                        flag if flag.starts_with('-') && flag.len() > 1 => {
+                            for ch in flag.chars().skip(1) {
+                                match ch {
+                                    'e' => self.opt_errexit = true,
+                                    'u' => self.opt_nounset = true,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        flag if flag.starts_with('+') && flag.len() > 1 => {
+                            for ch in flag.chars().skip(1) {
+                                match ch {
+                                    'e' => self.opt_errexit = false,
+                                    'u' => self.opt_nounset = false,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
             _ => {
                 stderr.push_str(&format!("bash: {command}: command not found\n"));
                 exit_code = 127;
@@ -1137,7 +1406,7 @@ impl Bash {
         eval_arithmetic_expr(expr, &self.env).ok()
     }
 
-    fn expand_text(&self, text: &str) -> String {
+    fn expand_text(&mut self, text: &str) -> String {
         let mut expanded = String::new();
         let mut chars = text.chars().peekable();
 
@@ -1164,7 +1433,13 @@ impl Bash {
                         }
                     }
                     "0" => expanded.push_str("bash"),
-                    _ => expanded.push_str(self.env.get(&name).map(String::as_str).unwrap_or("")),
+                    _ => {
+                        if let Some(val) = self.env.get(&name) {
+                            expanded.push_str(val);
+                        } else if self.opt_nounset {
+                            self.nounset_error = Some(name.clone());
+                        }
+                    }
                 }
                 continue;
             }
@@ -1213,8 +1488,10 @@ impl Bash {
 
             if name.is_empty() {
                 expanded.push('$');
-            } else {
-                expanded.push_str(self.env.get(&name).map(String::as_str).unwrap_or(""));
+            } else if let Some(val) = self.env.get(&name) {
+                expanded.push_str(val);
+            } else if self.opt_nounset {
+                self.nounset_error = Some(name.clone());
             }
         }
 
@@ -2027,5 +2304,117 @@ mod tests {
         assert!(result.stdout.contains("1"));
         assert!(result.stdout.contains("2"));
         assert!(result.stdout.contains("3"));
+    }
+
+    // ─── mv ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn mv_renames_a_file() {
+        let mut files = BTreeMap::new();
+        files.insert("/home/user/old.txt".to_string(), "content\n".to_string());
+        let mut bash = Bash::new(Options { files, ..Options::default() }).unwrap();
+        let result = bash.exec("mv old.txt new.txt; cat new.txt");
+        assert_eq!(result.stdout, "content\n");
+        assert_eq!(result.stderr, "");
+        assert!(bash.fs().read_file("/home/user/old.txt").is_err());
+        assert_eq!(bash.fs().read_file("/home/user/new.txt").unwrap(), "content\n");
+    }
+
+    #[test]
+    fn mv_fails_for_missing_source() {
+        let mut bash = Bash::new(Options::default()).unwrap();
+        let result = bash.exec("mv missing.txt dest.txt");
+        assert_eq!(result.exit_code, 1);
+        assert!(result.stderr.contains("No such file or directory"));
+    }
+
+    // ─── wc flags ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn wc_flag_l_counts_lines_only() {
+        let mut bash = Bash::new(Options::default()).unwrap();
+        let result = bash.exec("printf 'a\\nb\\nc\\n' | wc -l");
+        assert_eq!(result.stdout, "3\n");
+    }
+
+    #[test]
+    fn wc_flag_w_counts_words_only() {
+        let mut bash = Bash::new(Options::default()).unwrap();
+        let result = bash.exec("echo 'hello world' | wc -w");
+        assert_eq!(result.stdout, "2\n");
+    }
+
+    #[test]
+    fn wc_combined_flags() {
+        let mut bash = Bash::new(Options::default()).unwrap();
+        let result = bash.exec("echo 'hello world' | wc -lw");
+        assert_eq!(result.stdout, "1 2\n");
+    }
+
+    // ─── read builtin ─────────────────────────────────────────────────────
+
+    #[test]
+    fn read_assigns_line_to_variable() {
+        let mut bash = Bash::new(Options {
+            isolate_exec: false,
+            ..Options::default()
+        }).unwrap();
+        bash.exec("echo hello | read LINE; echo $LINE");
+        // In a pipeline the child env doesn't propagate; test via here-string style
+        let result = bash.exec("read NAME <<< 'world'; echo $NAME");
+        // <<< is not yet supported, so use a simpler approach: write to file then read
+        let _ = result;
+        let mut bash2 = Bash::new(Options {
+            isolate_exec: false,
+            ..Options::default()
+        }).unwrap();
+        bash2.exec("echo 'alice' > /home/user/name.txt");
+        let r = bash2.exec("read NAME < /home/user/name.txt; echo $NAME");
+        assert_eq!(r.stdout, "alice\n");
+        assert_eq!(r.stderr, "");
+    }
+
+    // ─── set options ─────────────────────────────────────────────────────
+
+    #[test]
+    fn set_e_aborts_on_nonzero() {
+        let mut bash = Bash::new(Options {
+            isolate_exec: false,
+            ..Options::default()
+        }).unwrap();
+        let result = bash.exec("set -e; false; echo should_not_run");
+        assert_eq!(result.stdout, "");
+        assert_ne!(result.exit_code, 0);
+    }
+
+    #[test]
+    fn set_u_errors_on_unset_variable() {
+        let mut bash = Bash::new(Options {
+            isolate_exec: false,
+            ..Options::default()
+        }).unwrap();
+        let result = bash.exec("set -u; echo $UNSET_VAR");
+        assert_eq!(result.exit_code, 1);
+        assert!(result.stderr.contains("unbound variable"));
+    }
+
+    #[test]
+    fn set_o_pipefail_propagates_pipeline_failure() {
+        let mut bash = Bash::new(Options {
+            isolate_exec: false,
+            ..Options::default()
+        }).unwrap();
+        let result = bash.exec("set -o pipefail; false | echo ok");
+        assert_ne!(result.exit_code, 0);
+    }
+
+    #[test]
+    fn set_bundled_flags() {
+        let mut bash = Bash::new(Options {
+            isolate_exec: false,
+            ..Options::default()
+        }).unwrap();
+        let result = bash.exec("set -eu; false");
+        assert_ne!(result.exit_code, 0);
     }
 }

@@ -186,6 +186,27 @@ impl InMemoryFs {
         Ok(names.into_iter().collect())
     }
 
+    /// Returns all entries under `path` (inclusive of the dir itself) as
+    /// `(absolute_path, Option<contents>)` where `None` means a directory.
+    pub fn entries_under(&self, path: &str) -> Result<Vec<(String, Option<String>)>, Error> {
+        let normalized = normalize_absolute(path);
+        if !self.is_dir(&normalized) {
+            return Err(Error::FileSystem(format!("{normalized}: Not a directory")));
+        }
+        let prefix = format!("{normalized}/");
+        let mut result = vec![(normalized.clone(), None)];
+        for (entry_path, entry) in &self.entries {
+            if entry_path.starts_with(&prefix) {
+                let contents = match entry {
+                    FsEntry::File(c) => Some(c.clone()),
+                    FsEntry::Directory => None,
+                };
+                result.push((entry_path.clone(), contents));
+            }
+        }
+        Ok(result)
+    }
+
     fn ensure_parent_dir(&self, path: &str) -> Result<(), Error> {
         let parent = parent_dir(path);
         match self.entries.get(&parent) {
