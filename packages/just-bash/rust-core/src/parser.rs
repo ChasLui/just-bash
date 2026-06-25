@@ -1,4 +1,4 @@
-use crate::fs::BashError;
+use crate::fs::Error;
 
 // ─── Public limits ────────────────────────────────────────────────────────────
 
@@ -132,22 +132,22 @@ pub struct Script {
 
 // ─── Entry points ─────────────────────────────────────────────────────────────
 
-pub fn parse_script(source: &str) -> Result<Script, BashError> {
+pub fn parse_script(source: &str) -> Result<Script, Error> {
     parse_script_with_limits(source, ParseLimits::default())
 }
 
-pub fn parse_script_with_limits(source: &str, limits: ParseLimits) -> Result<Script, BashError> {
+pub fn parse_script_with_limits(source: &str, limits: ParseLimits) -> Result<Script, Error> {
     let tokens = lex(source, limits)?;
     let mut pos = 0;
     let statements = parse_statements(&tokens, &mut pos, &[])?;
     if pos < tokens.len() {
         if let Token::Word(w) = &tokens[pos] {
-            return Err(BashError::Parse(format!(
+            return Err(Error::Parse(format!(
                 "syntax error near unexpected token `{}'",
                 w.text()
             )));
         }
-        return Err(BashError::Parse(
+        return Err(Error::Parse(
             "syntax error near unexpected token".to_string(),
         ));
     }
@@ -182,7 +182,7 @@ fn parse_statements(
     tokens: &[Token],
     pos: &mut usize,
     terminators: &[&str],
-) -> Result<Vec<Statement>, BashError> {
+) -> Result<Vec<Statement>, Error> {
     let mut statements = Vec::new();
     let mut connector = PipelineConnector::Always;
 
@@ -203,7 +203,7 @@ fn parse_statements(
                     PipelineConnector::Or => "||",
                     _ => unreachable!(),
                 };
-                return Err(BashError::Parse(format!(
+                return Err(Error::Parse(format!(
                     "syntax error near unexpected token `{}'",
                     connector_name
                 )));
@@ -236,7 +236,7 @@ fn parse_statements(
             PipelineConnector::Or => "||",
             _ => unreachable!(),
         };
-        return Err(BashError::Parse(format!(
+        return Err(Error::Parse(format!(
             "syntax error near unexpected token `{}'",
             connector_name
         )));
@@ -251,7 +251,7 @@ fn parse_single_statement(
     tokens: &[Token],
     pos: &mut usize,
     terminators: &[&str],
-) -> Result<Option<StatementKind>, BashError> {
+) -> Result<Option<StatementKind>, Error> {
     skip_separators(tokens, pos);
     if *pos >= tokens.len() {
         return Ok(None);
@@ -284,7 +284,7 @@ fn parse_pipeline_statement(
     tokens: &[Token],
     pos: &mut usize,
     terminators: &[&str],
-) -> Result<Option<StatementKind>, BashError> {
+) -> Result<Option<StatementKind>, Error> {
     let mut commands: Vec<CommandInvocation> = Vec::new();
     let mut words: Vec<Word> = Vec::new();
     let mut redirects: Vec<Redirect> = Vec::new();
@@ -309,7 +309,7 @@ fn parse_pipeline_statement(
                 };
                 *pos += 1;
                 let Some(Token::Word(target)) = tokens.get(*pos) else {
-                    return Err(BashError::Parse(
+                    return Err(Error::Parse(
                         "syntax error near unexpected token `newline'".to_string(),
                     ));
                 };
@@ -327,7 +327,7 @@ fn parse_pipeline_statement(
                     continue;
                 }
                 if words.is_empty() && redirects.is_empty() {
-                    return Err(BashError::Parse(
+                    return Err(Error::Parse(
                         "syntax error near unexpected token `|'".to_string(),
                     ));
                 }
@@ -344,7 +344,7 @@ fn parse_pipeline_statement(
                     } else {
                         "newline"
                     };
-                    return Err(BashError::Parse(format!(
+                    return Err(Error::Parse(format!(
                         "syntax error near unexpected token `{tok}'"
                     )));
                 }
@@ -354,7 +354,7 @@ fn parse_pipeline_statement(
     }
 
     if pending_pipe {
-        return Err(BashError::Parse(
+        return Err(Error::Parse(
             "syntax error near unexpected token `newline'".to_string(),
         ));
     }
@@ -368,7 +368,7 @@ fn parse_pipeline_statement(
     }
 }
 
-fn parse_if(tokens: &[Token], pos: &mut usize) -> Result<IfStatement, BashError> {
+fn parse_if(tokens: &[Token], pos: &mut usize) -> Result<IfStatement, Error> {
     let condition = parse_statements(tokens, pos, &["then"])?;
     expect_keyword(tokens, pos, "then")?;
     let body = parse_statements(tokens, pos, &["elif", "else", "fi"])?;
@@ -405,7 +405,7 @@ fn parse_if(tokens: &[Token], pos: &mut usize) -> Result<IfStatement, BashError>
     })
 }
 
-fn parse_while(tokens: &[Token], pos: &mut usize) -> Result<WhileStatement, BashError> {
+fn parse_while(tokens: &[Token], pos: &mut usize) -> Result<WhileStatement, Error> {
     let condition = parse_statements(tokens, pos, &["do"])?;
     expect_keyword(tokens, pos, "do")?;
     let body = parse_statements(tokens, pos, &["done"])?;
@@ -413,7 +413,7 @@ fn parse_while(tokens: &[Token], pos: &mut usize) -> Result<WhileStatement, Bash
     Ok(WhileStatement { condition, body })
 }
 
-fn parse_for(tokens: &[Token], pos: &mut usize) -> Result<ForStatement, BashError> {
+fn parse_for(tokens: &[Token], pos: &mut usize) -> Result<ForStatement, Error> {
     skip_separators(tokens, pos);
 
     let var = match tokens.get(*pos) {
@@ -423,7 +423,7 @@ fn parse_for(tokens: &[Token], pos: &mut usize) -> Result<ForStatement, BashErro
             text
         }
         _ => {
-            return Err(BashError::Parse(
+            return Err(Error::Parse(
                 "syntax error: expected variable name after 'for'".to_string(),
             ));
         }
@@ -435,7 +435,7 @@ fn parse_for(tokens: &[Token], pos: &mut usize) -> Result<ForStatement, BashErro
     match tokens.get(*pos) {
         Some(Token::Word(w)) if w.text() == "in" => *pos += 1,
         _ => {
-            return Err(BashError::Parse(
+            return Err(Error::Parse(
                 "syntax error: expected 'in' after for variable".to_string(),
             ));
         }
@@ -463,7 +463,7 @@ fn parse_for(tokens: &[Token], pos: &mut usize) -> Result<ForStatement, BashErro
     match tokens.get(*pos) {
         Some(Token::Word(w)) if w.text() == "do" => *pos += 1,
         _ => {
-            return Err(BashError::Parse(
+            return Err(Error::Parse(
                 "syntax error: expected 'do' in for loop".to_string(),
             ));
         }
@@ -474,21 +474,21 @@ fn parse_for(tokens: &[Token], pos: &mut usize) -> Result<ForStatement, BashErro
     Ok(ForStatement { var, items, body })
 }
 
-fn expect_keyword(tokens: &[Token], pos: &mut usize, keyword: &str) -> Result<(), BashError> {
+fn expect_keyword(tokens: &[Token], pos: &mut usize, keyword: &str) -> Result<(), Error> {
     skip_separators(tokens, pos);
     match tokens.get(*pos) {
         Some(Token::Word(w)) if w.text() == keyword => {
             *pos += 1;
             Ok(())
         }
-        Some(Token::Word(w)) => Err(BashError::Parse(format!(
+        Some(Token::Word(w)) => Err(Error::Parse(format!(
             "syntax error near unexpected token `{}'",
             w.text()
         ))),
-        Some(_) => Err(BashError::Parse(format!(
+        Some(_) => Err(Error::Parse(format!(
             "syntax error: expected '{keyword}'"
         ))),
-        None => Err(BashError::Parse(format!(
+        None => Err(Error::Parse(format!(
             "syntax error: unexpected end of file, expected '{keyword}'"
         ))),
     }
@@ -522,7 +522,7 @@ fn push_command_to(
 
 // ─── Lexer ────────────────────────────────────────────────────────────────────
 
-fn lex(source: &str, limits: ParseLimits) -> Result<Vec<Token>, BashError> {
+fn lex(source: &str, limits: ParseLimits) -> Result<Vec<Token>, Error> {
     let mut tokens = Vec::new();
     let mut current = Word { parts: Vec::new() };
     let mut current_started = false;
@@ -568,7 +568,7 @@ fn lex(source: &str, limits: ParseLimits) -> Result<Vec<Token>, BashError> {
                 if chars.next_if_eq(&'&').is_some() {
                     tokens.push(Token::AndIf);
                 } else {
-                    return Err(BashError::Parse(
+                    return Err(Error::Parse(
                         "syntax error near unexpected token `&'".to_string(),
                     ));
                 }
@@ -639,7 +639,7 @@ fn lex(source: &str, limits: ParseLimits) -> Result<Vec<Token>, BashError> {
     }
 
     if quote.is_some() {
-        return Err(BashError::Parse(
+        return Err(Error::Parse(
             "unexpected EOF while looking for matching quote".to_string(),
         ));
     }
@@ -652,7 +652,7 @@ fn lex(source: &str, limits: ParseLimits) -> Result<Vec<Token>, BashError> {
 fn consume_command_substitution(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     max_depth: usize,
-) -> Result<String, BashError> {
+) -> Result<String, Error> {
     let mut output = String::new();
     let mut depth = 1usize;
     let mut quote = None;
@@ -698,7 +698,7 @@ fn consume_command_substitution(
                         output.push('(');
                         depth += 1;
                         if depth > max_depth {
-                            return Err(BashError::Parse(format!(
+                            return Err(Error::Parse(format!(
                                 "command substitution nesting exceeds limit ({max_depth})"
                             )));
                         }
@@ -717,7 +717,7 @@ fn consume_command_substitution(
         }
     }
 
-    Err(BashError::Parse(
+    Err(Error::Parse(
         "unexpected EOF while looking for matching `)`".to_string(),
     ))
 }
@@ -725,7 +725,7 @@ fn consume_command_substitution(
 /// Consume an arithmetic expansion body after `$((` and stop at the matching `))`.
 fn consume_arithmetic_substitution(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-) -> Result<String, BashError> {
+) -> Result<String, Error> {
     let mut output = String::new();
     let mut depth = 0usize;
     let mut quote = None;
@@ -775,7 +775,7 @@ fn consume_arithmetic_substitution(
         }
     }
 
-    Err(BashError::Parse(
+    Err(Error::Parse(
         "unexpected EOF while looking for matching '))'".to_string(),
     ))
 }
