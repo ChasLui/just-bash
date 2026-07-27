@@ -55,12 +55,12 @@ describe("isolated shell-state transaction", () => {
     });
 
     const result = await bash.exec(
-      'value=parent; chmod +x /bin/stop; stop; printf \'%s|%s\' "$value" "${leaked[x]}"',
+      'value=parent; chmod +x /bin/stop; stop; printf \'%s|%s|%s\' "$?" "$value" "${leaked[x]}"',
     );
 
-    expect(result.stdout).toBe("");
+    expect(result.stdout).toBe("17|parent|");
     expect(result.stderr).toBe("");
-    expect(result.exitCode).toBe(17);
+    expect(result.exitCode).toBe(0);
     const after = await bash.exec('printf \'%s|%s\' "$value" "${leaked[x]}"');
     expect(after.stdout).toBe("|");
     expect(after.stderr).toBe("");
