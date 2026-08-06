@@ -15,10 +15,24 @@ import {
   searchContent,
 } from "../search-engine/index.js";
 
+/**
+ * The name GNU grep prints for the `-` operand. It appears wherever a real
+ * file name would: the multi-file `file:line` prefix, `-l`/`-L` listings and
+ * `-c` counts.
+ */
+const STDIN_FILENAME = "(standard input)";
+
 /** File entry with optional type info from glob expansion */
 interface FileEntry {
   path: string;
   isFile?: boolean; // undefined means we need to stat
+  /** True for the `-` operand, which names standard input instead of a file. */
+  isStdin?: boolean;
+  /**
+   * True when an earlier `-` already drained stdin. stdin is a stream, so the
+   * second `-` of `grep pat - -` reads EOF and contributes nothing.
+   */
+  stdinAtEof?: boolean;
 }
 
 interface GrepTraversalBudget {
@@ -122,6 +136,10 @@ const grepHelp = {
   name: "grep",
   summary: "print lines that match patterns",
   usage: "grep [OPTION]... PATTERN [FILE]...",
+  description: [
+    "Search for PATTERN in each FILE.",
+    "With no FILE, or when FILE is -, read standard input.",
+  ],
   options: [
     "-E, --extended-regexp    PATTERN is an extended regular expression",
     "-P, --perl-regexp        PATTERN is a Perl regular expression",
@@ -533,7 +551,38 @@ export const grepCommand: RuntimeCommand = {
       }
       filesToSearch.push(...entries);
     };
+    /**
+     * True once a `-` operand has claimed stdin. stdin is a stream, so only the
+     * first reader sees its contents.
+     */
+    let stdinConsumed = false;
+    /**
+     * True once a real path is queued. GNU only forces the file-name prefix
+     * under -r when recursion can actually descend into a directory, and `-` is
+     * never a directory: `grep -r pat -` prints bare lines.
+     */
+    let hasFileTarget = false;
     for (const file of files) {
+      if (file === "-") {
+        // GNU treats `-` as an operand naming standard input. It bypasses glob
+        // expansion, recursion and --include/--exclude entirely: those all
+        // filter on a file name, and stdin has none.
+        if (filesToSearch.length >= traversalBudget.maxResults) {
+          throw new ExecutionLimitError(
+            `grep: array element limit exceeded (${traversalBudget.maxResults})`,
+            "array_elements",
+          );
+        }
+        filesToSearch.push({
+          path: STDIN_FILENAME,
+          isFile: true,
+          isStdin: true,
+          stdinAtEof: stdinConsumed,
+        });
+        stdinConsumed = true;
+        continue;
+      }
+      hasFileTarget = true;
       // Check if this is a glob pattern
       if (file.includes("*") || file.includes("?") || file.includes("[")) {
         const expanded = await expandGlobPatternWithTypes(
@@ -580,7 +629,8 @@ export const grepCommand: RuntimeCommand = {
     }
 
     // Determine if we should show filename (after glob expansion)
-    const showFilename = (filesToSearch.length > 1 || recursive) && !noFilename;
+    const showFilename =
+      (filesToSearch.length > 1 || (recursive && hasFileTarget)) && !noFilename;
 
     // Process files in parallel batches for better performance
     const BATCH_SIZE = 50;
@@ -594,7 +644,7 @@ export const grepCommand: RuntimeCommand = {
           const basename = file.split("/").pop() || file;
 
           // Check exclude patterns for non-recursive case
-          if (excludePatterns.length > 0 && !recursive) {
+          if (excludePatterns.length > 0 && !recursive && !fileEntry.isStdin) {
             if (
               excludePatterns.some((p) =>
                 matchGlob(basename, p, { stripQuotes: true }),
@@ -605,7 +655,7 @@ export const grepCommand: RuntimeCommand = {
           }
 
           // Check include patterns for non-recursive case
-          if (includePatterns.length > 0 && !recursive) {
+          if (includePatterns.length > 0 && !recursive && !fileEntry.isStdin) {
             if (
               !includePatterns.some((p) =>
                 matchGlob(basename, p, { stripQuotes: true }),
@@ -616,25 +666,36 @@ export const grepCommand: RuntimeCommand = {
           }
 
           try {
-            const filePath = ctx.fs.resolvePath(ctx.cwd, file);
-
-            // Skip stat if we already know it's a file from glob expansion
-            let isDirectory = false;
-            if (fileEntry.isFile === undefined) {
-              const stat = await ctx.fs.stat(filePath);
-              isDirectory = stat.isDirectory;
+            let content: string;
+            if (fileEntry.isStdin) {
+              // grep runs regex over text — decode bytes to UTF-8 so multibyte
+              // codepoints match `.` / character classes correctly. A `-` that
+              // arrives after stdin was already drained reads EOF.
+              content =
+                fileEntry.stdinAtEof || ctx.stdin === undefined
+                  ? ""
+                  : decodeBytesToUtf8(ctx.stdin);
             } else {
-              isDirectory = !fileEntry.isFile;
-            }
+              const filePath = ctx.fs.resolvePath(ctx.cwd, file);
 
-            if (isDirectory) {
-              if (!recursive) {
-                return { error: `grep: ${file}: Is a directory\n` };
+              // Skip stat if we already know it's a file from glob expansion
+              let isDirectory = false;
+              if (fileEntry.isFile === undefined) {
+                const stat = await ctx.fs.stat(filePath);
+                isDirectory = stat.isDirectory;
+              } else {
+                isDirectory = !fileEntry.isFile;
               }
-              return null;
-            }
 
-            const content = await ctx.fs.readFile(filePath);
+              if (isDirectory) {
+                if (!recursive) {
+                  return { error: `grep: ${file}: Is a directory\n` };
+                }
+                return null;
+              }
+
+              content = await ctx.fs.readFile(filePath);
+            }
 
             // File-level preFilter: skip searchContent entirely when no needle exists in file.
             // Avoids content.split("\n") and all per-line work for the common zero-match case.

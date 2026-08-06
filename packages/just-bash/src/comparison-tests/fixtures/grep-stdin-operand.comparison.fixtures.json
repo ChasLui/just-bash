@@ -1,0 +1,303 @@
+{
+  "022e1902083fde97": {
+    "command": "printf 'zzz\\n' | grep -v apple f1.txt -",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "f1.txt:banana\n(standard input):zzz\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "024aae49b28542a2": {
+    "command": "printf 'apple stdin\\n' | grep -o apple f1.txt - f2.txt",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "f1.txt:apple\n(standard input):apple\nf2.txt:apple\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "10d4777f4f350109": {
+    "command": "printf '' | grep -c apple -",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "0\n",
+    "stderr": "",
+    "exitCode": 1,
+    "locked": true
+  },
+  "127fb1418ad3c848": {
+    "command": "printf 'apple stdin\\n' | grep -r apple - sub",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n",
+      "sub/a.txt": "apple tree\n"
+    },
+    "stdout": "(standard input):apple stdin\nsub/a.txt:apple tree\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "16ec8be710a002a2": {
+    "command": "printf 'apple stdin\\n' | grep -r apple -",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n",
+      "sub/a.txt": "apple tree\n"
+    },
+    "stdout": "apple stdin\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "1ba37f2e862a537e": {
+    "command": "printf 'apple\\n' | grep -lr apple - sub",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n",
+      "sub/a.txt": "apple tree\n"
+    },
+    "stdout": "(standard input)\nsub/a.txt\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "2a2be74b890630d2": {
+    "command": "printf 'apple\\n' | grep apple nope.txt - 2>/dev/null",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "(standard input):apple\n",
+    "stderr": "",
+    "exitCode": 2,
+    "locked": true
+  },
+  "348a41a560c1971f": {
+    "command": "printf 'apple\\n' | grep -q apple - nope.txt 2>/dev/null",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "43fcf752b8632021": {
+    "command": "printf 'apple stdin\\n' | grep -h apple f1.txt - f2.txt",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "apple\napple stdin\napple pie\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "456faf8ab0cd88f7": {
+    "command": "printf 'zzz\\n' | grep apple -",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "",
+    "stderr": "",
+    "exitCode": 1,
+    "locked": true
+  },
+  "52bb737421b16e6a": {
+    "command": "printf 'apple stdin\\n' | grep -h -l apple f1.txt -",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "f1.txt\n(standard input)\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "57e55a14addf4f6b": {
+    "command": "printf 'apple\\n' | grep -L apple - -",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "(standard input)\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "5f4bc36dba55d12c": {
+    "command": "printf 'apple stdin\\n' | grep -- apple - f1.txt",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "(standard input):apple stdin\nf1.txt:apple\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "9e0d28621247d248": {
+    "command": "printf 'apple s1\\napple s2\\n' | grep -m1 apple f1.txt -",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "f1.txt:apple\n(standard input):apple s1\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "a2fc79d6f2712e45": {
+    "command": "printf 'apple stdin\\n' | grep apple f1.txt - f2.txt",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "f1.txt:apple\n(standard input):apple stdin\nf2.txt:apple pie\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "b254cb8d362f5bb3": {
+    "command": "printf 'zzz\\n' | grep -L apple f1.txt - f2.txt",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "(standard input)\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "b5e41b2ca2975077": {
+    "command": "printf 'x\\napple stdin\\n' | grep -n apple f1.txt - f2.txt",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "f1.txt:1:apple\n(standard input):2:apple stdin\nf2.txt:2:apple pie\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "b9b4678962c5e122": {
+    "command": "printf 'apple\\napple2\\n' | grep -c apple - -",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "(standard input):2\n(standard input):0\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "c15d14bf7188d524": {
+    "command": "printf 'apple\\napple2\\n' | grep apple - -",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "(standard input):apple\n(standard input):apple2\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "d4fb3038630b0e21": {
+    "command": "printf 'apple\\n' | grep -c apple - - -",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "(standard input):1\n(standard input):0\n(standard input):0\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "d546f78360cb8848": {
+    "command": "printf 'apple\\n' | grep --exclude='*' apple -",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "apple\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "dc1475ffd8afead2": {
+    "command": "printf 'apple\\n' | grep apple -",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "apple\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "df13e82ef09a2594": {
+    "command": "printf 'apple\\n' | grep -l apple -",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "(standard input)\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "e6cf1de74078ac7f": {
+    "command": "printf 'apple stdin\\n' | grep -l apple f1.txt - f2.txt",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "f1.txt\n(standard input)\nf2.txt\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "ecc36b0a364e9d88": {
+    "command": "printf 'x\\napple pie\\n' | grep -n apple -",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "2:apple pie\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "fac7023a58142a20": {
+    "command": "printf 'apple\\n' | grep -r apple - -",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n",
+      "sub/a.txt": "apple tree\n"
+    },
+    "stdout": "(standard input):apple\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "fe3c3b65a44d2b2e": {
+    "command": "printf 'apple stdin\\n' | grep -c apple f1.txt - f2.txt",
+    "files": {
+      "f1.txt": "apple\nbanana\n",
+      "f2.txt": "cherry\napple pie\n"
+    },
+    "stdout": "f1.txt:1\n(standard input):1\nf2.txt:1\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  }
+}

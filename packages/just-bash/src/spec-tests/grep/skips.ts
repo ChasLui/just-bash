@@ -102,24 +102,14 @@ const SKIP_TESTS: Map<string, string> = new Map<string, string>([
   ],
 
   // Tests using - for stdin argument position
-  ["busybox-grep.tests:grep - (specify stdin)", "- stdin arg not supported"],
   [
     "busybox-grep.tests:grep - infile (specify stdin and file)",
-    "- stdin arg not supported",
-  ],
-  [
-    "busybox-grep.tests:grep - nofile (specify stdin and nonexisting file)",
-    "- stdin arg not supported",
-  ],
-  [
-    "busybox-grep.tests:grep -q - nofile (specify stdin and nonexisting file, match)",
-    "- stdin arg not supported",
+    "runner rewrites `input` to /tmp/input, so the file-name prefix differs",
   ],
   [
     "busybox-grep.tests:grep -s nofile - (stdin and nonexisting file, match)",
-    "- stdin arg not supported",
+    "-s option not implemented",
   ],
-  ["busybox-grep.tests:grep -L exitcode 0 #2", "- stdin arg not supported"],
 
   // Tests that create external files (>empty, mkdir)
   ["busybox-grep.tests:grep two files", "creates external empty file"],
