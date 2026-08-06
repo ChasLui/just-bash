@@ -5,6 +5,7 @@
 import { utf8ByteLength } from "../../encoding.js";
 import type { ExecResult } from "../../types.js";
 import { ExecutionLimitError } from "../errors.js";
+import { advanceFd, getFdEntry, readFd } from "../fd-table.js";
 import { clearArray, setArrayElement } from "../helpers/array.js";
 import {
   getIfs,
@@ -14,46 +15,6 @@ import {
 import { checkReadonlyError } from "../helpers/readonly.js";
 import { result } from "../helpers/result.js";
 import type { InterpreterContext } from "../types.js";
-
-/**
- * Parse the content of a read-write file descriptor.
- * Format: __rw__:pathLength:path:position:content
- */
-function parseRwFdContent(fdContent: string): {
-  path: string;
-  position: number;
-  content: string;
-} | null {
-  if (!fdContent.startsWith("__rw__:")) {
-    return null;
-  }
-  const afterPrefix = fdContent.slice(7);
-  const firstColonIdx = afterPrefix.indexOf(":");
-  if (firstColonIdx === -1) return null;
-  const pathLength = Number.parseInt(afterPrefix.slice(0, firstColonIdx), 10);
-  if (Number.isNaN(pathLength) || pathLength < 0) return null;
-  const pathStart = firstColonIdx + 1;
-  const path = afterPrefix.slice(pathStart, pathStart + pathLength);
-  const positionStart = pathStart + pathLength + 1;
-  const remaining = afterPrefix.slice(positionStart);
-  const posColonIdx = remaining.indexOf(":");
-  if (posColonIdx === -1) return null;
-  const position = Number.parseInt(remaining.slice(0, posColonIdx), 10);
-  if (Number.isNaN(position) || position < 0) return null;
-  const content = remaining.slice(posColonIdx + 1);
-  return { path, position, content };
-}
-
-/**
- * Encode read-write file descriptor content.
- */
-function encodeRwFdContent(
-  path: string,
-  position: number,
-  content: string,
-): string {
-  return `__rw__:${path.length}:${path}:${position}:${content}`;
-}
 
 export function handleRead(
   ctx: InterpreterContext,
@@ -280,16 +241,32 @@ export function handleRead(
   }
 
   // Use stdin from parameter, or fall back to groupStdin (for piped groups/while loops)
-  // If -u is specified, use the file descriptor content instead
+  // If -u is specified, read from that descriptor's shared position instead.
   let effectiveStdin = stdin;
+  // `-u 0` is just stdin, which never lives in the descriptor table.
+  // A descriptor saved off stdin (`exec 3<&0`) reads stdin too.
+  const savedStdinFd = getFdEntry(ctx, fileDescriptor);
+  const readsFromFd =
+    fileDescriptor > 0 &&
+    !(savedStdinFd?.kind === "dup-in" && savedStdinFd.sourceFd === 0);
 
-  if (fileDescriptor >= 0) {
-    // Read from specified file descriptor
-    if (ctx.state.fileDescriptors) {
-      effectiveStdin = ctx.state.fileDescriptors.get(fileDescriptor) || "";
-    } else {
-      effectiveStdin = "";
+  if (readsFromFd) {
+    const readable = readFd(ctx, fileDescriptor);
+    if ("error" in readable) {
+      // bash distinguishes "you named a descriptor that isn't open" from
+      // "the descriptor is open but not readable". stdout and stderr are
+      // always open and always write-only, so they take the latter even
+      // though they never appear in the descriptor table.
+      const writeOnly =
+        readable.error === "write-only" ||
+        fileDescriptor === 1 ||
+        fileDescriptor === 2;
+      const message = writeOnly
+        ? `bash: read: read error: ${fileDescriptor}: Bad file descriptor\n`
+        : `bash: read: ${fileDescriptor}: invalid file descriptor: Bad file descriptor\n`;
+      return result("", message, 1);
     }
+    effectiveStdin = readable.content;
   } else if (!effectiveStdin && ctx.state.groupStdin !== undefined) {
     effectiveStdin = ctx.state.groupStdin;
   }
@@ -323,27 +300,15 @@ export function handleRead(
   let consumed = 0;
   let foundDelimiter = true; // Assume found unless no newline at end
 
-  // Helper to consume from the appropriate source
+  // Advance whichever input this read consumed from. A descriptor carries a
+  // single shared position, so the next `read -u N` / `read <&N` continues
+  // where this one stopped.
   const consumeInput = (bytesConsumed: number) => {
-    if (fileDescriptor >= 0 && ctx.state.fileDescriptors) {
-      ctx.state.fileDescriptors.set(
-        fileDescriptor,
-        effectiveStdin.substring(bytesConsumed),
-      );
-    } else if (stdinSourceFd >= 0 && ctx.state.fileDescriptors) {
-      // Update the position of a read-write FD that was redirected to stdin
-      const fdContent = ctx.state.fileDescriptors.get(stdinSourceFd);
-      if (fdContent?.startsWith("__rw__:")) {
-        const parsed = parseRwFdContent(fdContent);
-        if (parsed) {
-          // Advance position by bytesConsumed
-          const newPosition = parsed.position + bytesConsumed;
-          ctx.state.fileDescriptors.set(
-            stdinSourceFd,
-            encodeRwFdContent(parsed.path, newPosition, parsed.content),
-          );
-        }
-      }
+    if (readsFromFd) {
+      advanceFd(ctx, fileDescriptor, bytesConsumed);
+    } else if (stdinSourceFd >= 0) {
+      // stdin came from `<&N`; move N forward by exactly what was read.
+      advanceFd(ctx, stdinSourceFd, bytesConsumed);
     } else if (ctx.state.groupStdin !== undefined && !stdin) {
       ctx.state.groupStdin = effectiveStdin.substring(bytesConsumed);
     }

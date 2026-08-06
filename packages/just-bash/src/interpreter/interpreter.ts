@@ -84,20 +84,25 @@ import {
   ReturnError,
 } from "./errors.js";
 import { expandWord, expandWordWithGlob } from "./expansion.js";
+import {
+  advanceFd,
+  closeFd,
+  dupFd,
+  FIRST_USER_FD,
+  getFdEntry,
+  readFd,
+  setFdEntry,
+} from "./fd-table.js";
 import { executeFunctionDef } from "./functions.js";
-import {
-  checkFdLimit,
-  failure,
-  OK,
-  result,
-  testResult,
-} from "./helpers/result.js";
+import { failure, OK, result, testResult } from "./helpers/result.js";
 import { isPosixSpecialBuiltin } from "./helpers/shell-constants.js";
-import {
-  isWordLiteralMatch,
-  parseRwFdContent,
-} from "./helpers/word-matching.js";
+import { isWordLiteralMatch } from "./helpers/word-matching.js";
 import { traceSimpleCommand } from "./helpers/xtrace.js";
+import {
+  effectiveRedirectFd,
+  isNumericFdRedirection,
+  openNumericFds,
+} from "./numeric-fd-redirects.js";
 import { executePipeline as executePipelineHelper } from "./pipeline-execution.js";
 import {
   markProcessSubstitutions,
@@ -542,6 +547,7 @@ export class Interpreter {
   private async executeCommand(
     node: CommandNode,
     stdin: string,
+    stdinOwned = false,
   ): Promise<ExecResult> {
     const procSubMark = markProcessSubstitutions(this.ctx);
     let result: ExecResult;
@@ -586,13 +592,13 @@ export class Interpreter {
       case "While":
         return executeWhile(this.ctx, node, stdin);
       case "Until":
-        return executeUntil(this.ctx, node);
+        return executeUntil(this.ctx, node, stdin);
       case "Case":
         return executeCase(this.ctx, node);
       case "Subshell":
-        return this.executeSubshell(node, stdin);
+        return this.executeSubshell(node, stdin, stdinOwned);
       case "Group":
-        return this.executeGroup(node, stdin);
+        return this.executeGroup(node, stdin, stdinOwned);
       case "FunctionDef":
         return executeFunctionDef(this.ctx, node);
       case "ArithmeticCommand":
@@ -745,11 +751,41 @@ export class Interpreter {
       return fdVarError;
     }
 
+    const restoreTempAssignments = (): void => {
+      for (const [name, value] of tempAssignments) {
+        if (value === undefined) this.ctx.state.env.delete(name);
+        else this.ctx.state.env.set(name, value);
+      }
+    };
+
+    // Open the descriptors this command names by number (`3< file`, `4> log`,
+    // `3<&-`, ...). They must exist before the command runs so `read -u 3`
+    // and `>&4` can see them, and — unless this is `exec` — they are taken
+    // back down once the command's redirections have been delivered.
+    const fdScope = await openNumericFds(this.ctx, node.redirections);
+    if (fdScope.error) {
+      // `exec` keeps the descriptors it managed to open before the failure;
+      // an ordinary command's descriptor changes are all rolled back.
+      if (!isWordLiteralMatch(node.name, ["exec"])) fdScope.restore();
+      restoreTempAssignments();
+      return fdScope.error;
+    }
+
     // Track source FD for stdin from read-write file descriptors
     // This allows the read builtin to update the FD's position after reading
     let stdinSourceFd = -1;
 
+    // Whether one of the redirections below gave this command its own fd 0.
+    // The content alone cannot say: `cmd < empty-file` produces the same empty
+    // string as no redirection at all, and the two mean opposite things —
+    // EOF versus "inherit the shell's stdin".
+    let stdinRedirected = false;
+
     for (const redir of node.redirections) {
+      // Redirections naming a user descriptor were applied to the fd table
+      // above; they never contribute to this command's stdin.
+      if (isNumericFdRedirection(redir)) continue;
+
       if (
         (redir.operator === "<<" || redir.operator === "<<-") &&
         redir.target.type === "HereDoc"
@@ -772,13 +808,12 @@ export class Interpreter {
         // If this is a non-standard fd (not 0), store in fileDescriptors for -u option
         const fd = redir.fd ?? 0;
         if (fd !== 0) {
-          if (!this.ctx.state.fileDescriptors) {
-            this.ctx.state.fileDescriptors = new Map();
-          }
-          checkFdLimit(this.ctx);
-          this.ctx.state.fileDescriptors.set(fd, content);
+          setFdEntry(this.ctx, fd, { kind: "input", content });
         } else {
           stdin = content;
+          // A later redirection wins: stdin no longer comes from a descriptor.
+          stdinSourceFd = -1;
+          stdinRedirected = true;
         }
         continue;
       }
@@ -791,6 +826,8 @@ export class Interpreter {
             `${await expandWord(this.ctx, redir.target as WordNode)}\n`,
           ),
         );
+        stdinSourceFd = -1;
+        stdinRedirected = true;
         continue;
       }
 
@@ -802,43 +839,56 @@ export class Interpreter {
           // pipe and we don't want the smart-utf8 read path turning
           // valid bytes into U+FFFD replacement chars.
           stdin = latin1FromBytes(await readBytesFrom(this.ctx.fs, filePath));
+          stdinSourceFd = -1;
+          stdinRedirected = true;
         } catch {
           const target = await expandWord(this.ctx, redir.target as WordNode);
-          for (const [name, value] of tempAssignments) {
-            if (value === undefined) this.ctx.state.env.delete(name);
-            else this.ctx.state.env.set(name, value);
-          }
+          fdScope.restore();
+          restoreTempAssignments();
           return failure(`bash: ${target}: No such file or directory\n`);
         }
       }
 
-      // Handle <& input redirection from file descriptor
+      // `<&N` — read this command's stdin from descriptor N. The content
+      // handed over is whatever N has not been read yet, and `stdinSourceFd`
+      // lets the consumer advance N's shared position.
       if (redir.operator === "<&" && redir.target.type === "Word") {
         const target = await expandWord(this.ctx, redir.target as WordNode);
-        const sourceFd = Number.parseInt(target, 10);
-        if (!Number.isNaN(sourceFd) && this.ctx.state.fileDescriptors) {
-          const fdContent = this.ctx.state.fileDescriptors.get(sourceFd);
-          if (fdContent !== undefined) {
-            // Handle different FD content formats
-            if (fdContent.startsWith("__rw__:")) {
-              // Read/write mode: format is __rw__:pathLength:path:position:content
-              const parsed = parseRwFdContent(fdContent);
-              if (parsed) {
-                // Return content starting from current position
-                stdin = parsed.content.slice(parsed.position);
-                stdinSourceFd = sourceFd;
-              }
-            } else if (
-              fdContent.startsWith("__file__:") ||
-              fdContent.startsWith("__file_append__:")
-            ) {
-              // These are output-only, can't read from them
-            } else {
-              // Plain content (from exec N< file or here-docs)
-              stdin = fdContent;
-            }
-          }
+        // `0<&-` closes stdin for the command: it owns an empty fd 0, which
+        // is EOF rather than a fall-back to the enclosing shell's stdin.
+        if (target === "-") {
+          stdin = "";
+          stdinSourceFd = -1;
+          stdinRedirected = true;
+          continue;
         }
+        const sourceFd = Number.parseInt(target.replace(/-$/, ""), 10);
+        if (Number.isNaN(sourceFd)) {
+          fdScope.restore();
+          restoreTempAssignments();
+          return failure(`bash: ${target}: ambiguous redirect\n`);
+        }
+        if (sourceFd === 0) continue;
+        // A descriptor saved off stdin (`exec 3<&0`) reads stdin, so
+        // `<&3` leaves this command's stdin exactly as it was.
+        const source = getFdEntry(this.ctx, sourceFd);
+        if (source?.kind === "dup-in" && source.sourceFd === 0) continue;
+        const readable = readFd(this.ctx, sourceFd);
+        if ("error" in readable) {
+          // stdout/stderr are not modelled as readable descriptors, so only
+          // a user descriptor produces bash's diagnostic here.
+          if (sourceFd >= FIRST_USER_FD || readable.error === "write-only") {
+            fdScope.restore();
+            restoreTempAssignments();
+            return failure(`bash: ${sourceFd}: Bad file descriptor\n`);
+          }
+          continue;
+        }
+        stdin = readable.content;
+        stdinSourceFd = sourceFd;
+        // The descriptor is this command's fd 0 now — an exhausted one hands
+        // over "" and that means EOF, not "inherit the shell's stdin".
+        stdinRedirected = true;
       }
     }
 
@@ -939,21 +989,30 @@ export class Interpreter {
         if (args.length > 0) {
           const newCommandName = args.shift() as string;
           quotedArgs.shift();
-          return await this.runCommand(
-            newCommandName,
-            args,
-            quotedArgs,
-            stdin,
-            false,
-            false,
-            stdinSourceFd,
-          );
+          try {
+            return await this.runCommand(
+              newCommandName,
+              args,
+              quotedArgs,
+              stdin,
+              false,
+              false,
+              stdinSourceFd,
+              stdinRedirected,
+            );
+          } finally {
+            // This path never reaches the shared teardown below, so the
+            // command-scoped descriptors have to be closed here.
+            fdScope.restore();
+          }
         }
         // No args - treat as no-op (status 0)
         // Preserve lastExitCode for command subs like $(exit 42)
+        fdScope.restore();
         return result("", "", this.ctx.state.lastExitCode);
       }
       // Literal empty command name - command not found
+      fdScope.restore();
       return failure("bash: : command not found\n", 127);
     }
 
@@ -963,20 +1022,19 @@ export class Interpreter {
       // Process persistent FD redirections
       // Note: {var}>file redirections are already handled by processFdVariableRedirections
       // which sets up the FD mapping persistently. We only need to handle explicit fd redirections here.
+      // Descriptors >= 3 were already opened persistently by openNumericFds
+      // (the fdScope above is never restored on this path). What is left is
+      // the standard streams, which `exec` re-points for the whole shell.
       for (const redir of node.redirections) {
         if (redir.target.type === "HereDoc") continue;
 
         // Skip FD variable redirections - already handled by processFdVariableRedirections
         if (redir.fdVariable) continue;
+        if (isNumericFdRedirection(redir)) continue;
 
         const target = await expandWord(this.ctx, redir.target as WordNode);
-        const fd =
-          redir.fd ??
-          (redir.operator === "<" || redir.operator === "<>" ? 0 : 1);
-
-        if (!this.ctx.state.fileDescriptors) {
-          this.ctx.state.fileDescriptors = new Map();
-        }
+        const fd = effectiveRedirectFd(redir);
+        if (fd === null) continue;
 
         switch (redir.operator) {
           case ">":
@@ -987,8 +1045,11 @@ export class Interpreter {
               target,
             );
             await this.ctx.fs.writeFile(filePath, "", "utf8"); // truncate
-            checkFdLimit(this.ctx);
-            this.ctx.state.fileDescriptors.set(fd, `__file__:${filePath}`);
+            setFdEntry(this.ctx, fd, {
+              kind: "output",
+              path: filePath,
+              append: false,
+            });
             break;
           }
           case ">>": {
@@ -997,11 +1058,11 @@ export class Interpreter {
               this.ctx.state.cwd,
               target,
             );
-            checkFdLimit(this.ctx);
-            this.ctx.state.fileDescriptors.set(
-              fd,
-              `__file_append__:${filePath}`,
-            );
+            setFdEntry(this.ctx, fd, {
+              kind: "output",
+              path: filePath,
+              append: true,
+            });
             break;
           }
           case "<": {
@@ -1012,114 +1073,60 @@ export class Interpreter {
             );
             try {
               const content = await this.ctx.fs.readFile(filePath);
-              checkFdLimit(this.ctx);
-              this.ctx.state.fileDescriptors.set(fd, content);
+              setFdEntry(this.ctx, fd, { kind: "input", content });
             } catch {
               return failure(`bash: ${target}: No such file or directory\n`);
             }
             break;
           }
           case "<>": {
-            // Open file for read/write
-            // Format: __rw__:pathLength:path:position:content
-            // pathLength allows parsing paths with colons
-            // position tracks current file offset for read/write
+            // Open file for read/write; the entry carries its own position
             const filePath = this.ctx.fs.resolvePath(
               this.ctx.state.cwd,
               target,
             );
+            let content = "";
             try {
-              const content = await this.ctx.fs.readFile(filePath);
-              checkFdLimit(this.ctx);
-              this.ctx.state.fileDescriptors.set(
-                fd,
-                `__rw__:${filePath.length}:${filePath}:0:${content}`,
-              );
+              content = await this.ctx.fs.readFile(filePath);
             } catch {
               // File doesn't exist - create empty
               await this.ctx.fs.writeFile(filePath, "", "utf8");
-              checkFdLimit(this.ctx);
-              this.ctx.state.fileDescriptors.set(
+            }
+            setFdEntry(this.ctx, fd, {
+              kind: "readwrite",
+              path: filePath,
+              position: 0,
+              content,
+            });
+            break;
+          }
+          case ">&":
+          case "<&": {
+            const isInput = redir.operator === "<&";
+            // Close the FD
+            if (target === "-") {
+              closeFd(this.ctx, fd);
+              break;
+            }
+            // Move: N>&M- duplicates M onto N then closes M
+            const isMove = target.endsWith("-");
+            const sourceText = isMove ? target.slice(0, -1) : target;
+            const sourceFd = Number.parseInt(sourceText, 10);
+            if (Number.isNaN(sourceFd)) break;
+            if (dupFd(this.ctx, fd, sourceFd)) {
+              // Duplicated an open descriptor.
+            } else if (sourceFd >= FIRST_USER_FD) {
+              return failure(`bash: ${sourceFd}: Bad file descriptor\n`);
+            } else {
+              setFdEntry(
+                this.ctx,
                 fd,
-                `__rw__:${filePath.length}:${filePath}:0:`,
+                isInput
+                  ? { kind: "dup-in", sourceFd }
+                  : { kind: "dup-out", sourceFd },
               );
             }
-            break;
-          }
-          case ">&": {
-            // Duplicate output FD: N>&M means N now writes to same place as M
-            // Move FD: N>&M- means duplicate M to N, then close M
-            if (target === "-") {
-              // Close the FD
-              this.ctx.state.fileDescriptors.delete(fd);
-            } else if (target.endsWith("-")) {
-              // Move operation: N>&M- duplicates M to N then closes M
-              // Net-neutral on FD count (set + delete), skip checkFdLimit
-              const sourceFdStr = target.slice(0, -1);
-              const sourceFd = Number.parseInt(sourceFdStr, 10);
-              if (!Number.isNaN(sourceFd)) {
-                // First, duplicate: copy the FD content/info from source to target
-                const sourceInfo = this.ctx.state.fileDescriptors.get(sourceFd);
-                if (sourceInfo !== undefined) {
-                  this.ctx.state.fileDescriptors.set(fd, sourceInfo);
-                } else {
-                  // Source FD might be 1 (stdout) or 2 (stderr) which aren't in fileDescriptors
-                  // In that case, store as duplication marker
-                  this.ctx.state.fileDescriptors.set(
-                    fd,
-                    `__dupout__:${sourceFd}`,
-                  );
-                }
-                // Then close the source FD
-                this.ctx.state.fileDescriptors.delete(sourceFd);
-              }
-            } else {
-              const sourceFd = Number.parseInt(target, 10);
-              if (!Number.isNaN(sourceFd)) {
-                // Store FD duplication: fd N points to fd M
-                checkFdLimit(this.ctx);
-                this.ctx.state.fileDescriptors.set(
-                  fd,
-                  `__dupout__:${sourceFd}`,
-                );
-              }
-            }
-            break;
-          }
-          case "<&": {
-            // Duplicate input FD: N<&M means N now reads from same place as M
-            // Move FD: N<&M- means duplicate M to N, then close M
-            if (target === "-") {
-              // Close the FD
-              this.ctx.state.fileDescriptors.delete(fd);
-            } else if (target.endsWith("-")) {
-              // Move operation: N<&M- duplicates M to N then closes M
-              // Net-neutral on FD count (set + delete), skip checkFdLimit
-              const sourceFdStr = target.slice(0, -1);
-              const sourceFd = Number.parseInt(sourceFdStr, 10);
-              if (!Number.isNaN(sourceFd)) {
-                // First, duplicate: copy the FD content/info from source to target
-                const sourceInfo = this.ctx.state.fileDescriptors.get(sourceFd);
-                if (sourceInfo !== undefined) {
-                  this.ctx.state.fileDescriptors.set(fd, sourceInfo);
-                } else {
-                  // Source FD might be 0 (stdin) which isn't in fileDescriptors
-                  this.ctx.state.fileDescriptors.set(
-                    fd,
-                    `__dupin__:${sourceFd}`,
-                  );
-                }
-                // Then close the source FD
-                this.ctx.state.fileDescriptors.delete(sourceFd);
-              }
-            } else {
-              const sourceFd = Number.parseInt(target, 10);
-              if (!Number.isNaN(sourceFd)) {
-                // Store FD duplication for input
-                checkFdLimit(this.ctx);
-                this.ctx.state.fileDescriptors.set(fd, `__dupin__:${sourceFd}`);
-              }
-            }
+            if (isMove) closeFd(this.ctx, sourceFd);
             break;
           }
         }
@@ -1170,6 +1177,7 @@ export class Interpreter {
         false,
         false,
         stdinSourceFd,
+        stdinRedirected,
       );
     } catch (error) {
       // For break/continue, we still need to apply redirections before propagating
@@ -1178,8 +1186,17 @@ export class Interpreter {
         controlFlowError = error;
         cmdResult = OK; // break/continue have exit status 0
       } else {
+        fdScope.restore();
         throw error;
       }
+    }
+
+    // A command fed from `<&N` has drained that descriptor: reading is
+    // consuming, so the next reader of N continues after what this command
+    // took. `read` is the exception — it reports exactly how far it got and
+    // advances N itself (see the read builtin's consumeInput).
+    if (stdinSourceFd >= 0 && commandName !== "read") {
+      advanceFd(this.ctx, stdinSourceFd, stdin.length);
     }
 
     // Prepend xtrace output and any assignment warnings to stderr
@@ -1191,7 +1208,15 @@ export class Interpreter {
       };
     }
 
-    cmdResult = await applyRedirections(this.ctx, cmdResult, node.redirections);
+    // Descriptors opened by number stay visible while output is delivered
+    // (`echo hi 4> log >&4`), then go away with the command.
+    cmdResult = await applyRedirections(
+      this.ctx,
+      cmdResult,
+      node.redirections,
+      fdScope.targets.size > 0 ? fdScope.targets : undefined,
+    );
+    fdScope.restore();
 
     // If we caught a break/continue error, re-throw it after applying redirections
     if (controlFlowError) {
@@ -1278,11 +1303,12 @@ export class Interpreter {
     skipFunctions = false,
     useDefaultPath = false,
     stdinSourceFd = -1,
+    stdinRedirected = false,
   ): Promise<ExecResult> {
     const dispatchCtx: BuiltinDispatchContext = {
       ctx: this.ctx,
-      runCommand: (name, a, qa, s, sf, udp, ssf) =>
-        this.runCommand(name, a, qa, s, sf, udp, ssf),
+      runCommand: (name, a, qa, s, sf, udp, ssf, sr) =>
+        this.runCommand(name, a, qa, s, sf, udp, ssf, sr),
       buildExportedEnv: () => this.buildExportedEnv(),
       executeUserScript: (path, a, s) => this.executeUserScript(path, a, s),
     };
@@ -1297,6 +1323,7 @@ export class Interpreter {
       skipFunctions,
       useDefaultPath,
       stdinSourceFd,
+      stdinRedirected,
     );
 
     if (builtinResult !== null) {
@@ -1331,15 +1358,28 @@ export class Interpreter {
   private async executeSubshell(
     node: SubshellNode,
     stdin = "",
+    stdinOwned = false,
   ): Promise<ExecResult> {
-    return executeSubshellHelper(this.ctx, node, stdin, (stmt) =>
-      this.executeStatement(stmt),
+    return executeSubshellHelper(
+      this.ctx,
+      node,
+      stdin,
+      (stmt) => this.executeStatement(stmt),
+      stdinOwned,
     );
   }
 
-  private async executeGroup(node: GroupNode, stdin = ""): Promise<ExecResult> {
-    return executeGroupHelper(this.ctx, node, stdin, (stmt) =>
-      this.executeStatement(stmt),
+  private async executeGroup(
+    node: GroupNode,
+    stdin = "",
+    stdinOwned = false,
+  ): Promise<ExecResult> {
+    return executeGroupHelper(
+      this.ctx,
+      node,
+      stdin,
+      (stmt) => this.executeStatement(stmt),
+      stdinOwned,
     );
   }
 

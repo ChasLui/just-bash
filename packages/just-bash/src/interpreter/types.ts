@@ -318,6 +318,21 @@ export interface IOState {
   groupStdin?: string;
   /** File descriptors for process substitution and here-docs */
   fileDescriptors?: Map<number, string>;
+  /**
+   * Descriptors whose `fileDescriptors` value is verbatim content rather
+   * than one of the `__file__:` / `__rw__:` / `__dupout__:` markers. Kept
+   * beside the table (which is public API and must stay `Map<number,
+   * string>`) so that file content shaped like a marker is never mistaken
+   * for one. Maintained exclusively by `fd-table.ts`.
+   */
+  inputFds?: Set<number>;
+  /**
+   * Descriptors that share one open file description because of `N<&M`, and
+   * therefore share a read offset. Every member of a group maps to the same
+   * Set; descriptors with no aliases have no entry. Maintained exclusively
+   * by `fd-table.ts`.
+   */
+  fdAliases?: Map<number, Set<number>>;
   /** Next available file descriptor for {varname}>file allocation (starts at 10) */
   nextFd?: number;
   /**
@@ -455,7 +470,17 @@ export interface InterpreterContext {
   ) => Promise<ExecResult>;
   executeScript: (node: ScriptNode) => Promise<ExecResult>;
   executeStatement: (node: StatementNode) => Promise<ExecResult>;
-  executeCommand: (node: CommandNode, stdin: string) => Promise<ExecResult>;
+  /**
+   * `stdinOwned` says the caller gave this command its own fd 0, even when the
+   * content is the empty string (`f < empty-file`). Without it an empty stdin
+   * is indistinguishable from "no redirection", and the command would fall
+   * back to the enclosing shell's stdin instead of seeing EOF.
+   */
+  executeCommand: (
+    node: CommandNode,
+    stdin: string,
+    stdinOwned?: boolean,
+  ) => Promise<ExecResult>;
   /** Optional secure fetch function for network-enabled commands */
   fetch?: SecureFetch;
   /** Optional sleep function for testing with mock clocks */

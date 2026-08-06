@@ -17,6 +17,7 @@ import type {
   ForNode,
   HereDocNode,
   IfNode,
+  RedirectionNode,
   StatementNode,
   UntilNode,
   WhileNode,
@@ -47,8 +48,225 @@ import { executeCondition } from "./helpers/condition.js";
 import { getErrorMessage } from "./helpers/errors.js";
 import { handleLoopError } from "./helpers/loop.js";
 import { failure, throwExecutionLimit } from "./helpers/result.js";
-import { applyRedirections, preOpenOutputRedirects } from "./redirections.js";
+import {
+  isNumericFdRedirection,
+  withNumericFds,
+} from "./numeric-fd-redirects.js";
+import {
+  applyRedirections,
+  type ExpandedRedirectTargets,
+  preOpenOutputRedirects,
+} from "./redirections.js";
 import type { InterpreterContext } from "./types.js";
+
+/**
+ * Redirection operators a `while`/`until` loop consumes itself to seed the
+ * stdin its body and condition read from. Everything else on the loop is an
+ * ordinary compound-command redirection handled by preOpen/applyRedirections.
+ */
+const LOOP_STDIN_OPERATORS: ReadonlySet<string> = new Set([
+  "<",
+  "<<",
+  "<<-",
+  "<<<",
+]);
+
+type LoopRedirectPrep =
+  | { error: ExecResult }
+  | {
+      /**
+       * stdin supplied by the loop's OWN input redirections, or undefined when
+       * the loop has none. Distinguishing "no input redirection" from "an input
+       * redirection that produced an empty stream" matters: the first inherits
+       * the enclosing read stream, the second replaces it with an empty one.
+       */
+      ownStdin: string | undefined;
+      redirections: RedirectionNode[];
+      targets: ExpandedRedirectTargets;
+    };
+
+/**
+ * Prepare the loop-level redirections of a `while`/`until` loop.
+ *
+ * Bash installs a loop's redirections once, before the loop starts, keeps them
+ * in effect for the condition and every iteration, and processes the list
+ * STRICTLY LEFT TO RIGHT — so a redirection that fails leaves every earlier
+ * one already applied. `done > out < nosuch` truncates `out` and then fails;
+ * `done < nosuch > out` fails first and leaves `out` alone.
+ *
+ * The walk below reproduces that order:
+ *
+ * - Input redirections (`< file`, here-docs, here-strings) are consumed as
+ *   encountered to produce the stdin the loop body reads from — this is what
+ *   makes `while read line; do ...; done < file` work. A failure here aborts
+ *   with the diagnostic routed through the redirections opened so far, which
+ *   is why `done 2> err < nosuch` lands the message in `err` like bash does.
+ * - Every other redirection is collected into a pending run and pre-opened the
+ *   moment an input redirection (or the end of the list) is reached, using the
+ *   same `preOpenOutputRedirects`/`applyRedirections` pair as `for`/`case`.
+ *   Pre-opening truncates `>` targets before the condition can read them, so
+ *   `done > f < f` sees an empty `f`.
+ *
+ * Two invariants worth preserving when touching this:
+ *
+ * - `ExpandedRedirectTargets` is keyed by POSITION in the array handed to
+ *   `preOpenOutputRedirects`. Each pending run is a fresh call, so its keys
+ *   are rebased onto the accumulated `opened` array before being merged —
+ *   `opened` and `targets` must stay index-coherent for `applyRedirections`.
+ * - Input redirections never enter the pre-open/apply list. They are already
+ *   fully consumed here, and routing them through `preOpenOutputRedirects`
+ *   would expand their targets a second time — with here-string globbing
+ *   semantics that bash does not apply to `<<<`.
+ *
+ * Redirections that name a descriptor by number (`done 3< file`, `done 3> f`)
+ * were already applied to the fd table by `withNumericFds` before this walk
+ * starts, so they are neither loop stdin nor an ordering barrier here. The
+ * `3<` family is skipped outright; the rest ride along in the pending run,
+ * where `preOpenOutputRedirects` and `applyRedirections` ignore them by
+ * descriptor number. Their targets travel in `fdTargets` — keyed by position
+ * in the ORIGINAL list — so a target with side effects (`done 3> "f$((n++))"`)
+ * is expanded exactly once. That is a SECOND index space on top of the
+ * per-run rebasing above: `fdTargets` is re-keyed onto each run before the
+ * call, and the run's result is then re-keyed onto `opened` as usual.
+ */
+async function prepareLoopRedirections(
+  ctx: InterpreterContext,
+  redirections: RedirectionNode[],
+  fdTargets: ExpandedRedirectTargets,
+): Promise<LoopRedirectPrep> {
+  let ownStdin: string | undefined;
+
+  // Output redirections already pre-opened, in list order, with their
+  // pre-expanded targets keyed by position in `opened`.
+  const opened: RedirectionNode[] = [];
+  const targets: ExpandedRedirectTargets = new Map();
+  // The run of output redirections seen since the last input redirection,
+  // alongside each entry's position in the ORIGINAL `redirections` array so
+  // the numeric-fd targets can be re-keyed onto the run.
+  let pending: RedirectionNode[] = [];
+  let pendingSources: number[] = [];
+
+  /** Pre-open the pending run, rebasing its target keys onto `opened`. */
+  const openPending = async (): Promise<ExecResult | null> => {
+    if (pending.length === 0) {
+      return null;
+    }
+    const run = pending;
+    const sources = pendingSources;
+    pending = [];
+    pendingSources = [];
+    // Re-key the targets `withNumericFds` already expanded from original-list
+    // positions onto this run's positions.
+    const runFdTargets: ExpandedRedirectTargets = new Map();
+    for (let i = 0; i < sources.length; i++) {
+      const expanded = fdTargets.get(sources[i]);
+      if (expanded !== undefined) {
+        runFdTargets.set(i, expanded);
+      }
+    }
+    const prepared = await preOpenOutputRedirects(ctx, run, runFdTargets);
+    if (prepared.error) {
+      return prepared.error;
+    }
+    const offset = opened.length;
+    for (const [index, target] of prepared.targets) {
+      targets.set(offset + index, target);
+    }
+    opened.push(...run);
+    return null;
+  };
+
+  for (let index = 0; index < redirections.length; index++) {
+    const redir = redirections[index];
+    if (!LOOP_STDIN_OPERATORS.has(redir.operator)) {
+      pending.push(redir);
+      pendingSources.push(index);
+      continue;
+    }
+
+    // `done 3< file` names a descriptor, not this loop's stdin — the fd table
+    // already holds it. It is not an ordering barrier either, since the whole
+    // numeric pass ran before this walk, so it does not close the pending run.
+    if (isNumericFdRedirection(redir)) continue;
+
+    // Everything to the left of this input redirection is opened first.
+    const openError = await openPending();
+    if (openError) {
+      return {
+        error: await applyRedirections(ctx, openError, opened, targets),
+      };
+    }
+
+    if (
+      (redir.operator === "<<" || redir.operator === "<<-") &&
+      redir.target.type === "HereDoc"
+    ) {
+      const hereDoc = redir.target as HereDocNode;
+      let content = await expandWord(ctx, hereDoc.content);
+      if (hereDoc.stripTabs) {
+        content = content
+          .split("\n")
+          .map((line) => line.replace(/^\t+/, ""))
+          .join("\n");
+      }
+      ownStdin = content;
+    } else if (redir.operator === "<<<" && redir.target.type === "Word") {
+      ownStdin = `${await expandWord(ctx, redir.target as WordNode)}\n`;
+    } else if (redir.operator === "<" && redir.target.type === "Word") {
+      const target = await expandWord(ctx, redir.target as WordNode);
+      try {
+        const filePath = ctx.fs.resolvePath(ctx.state.cwd, target);
+        ownStdin = await ctx.fs.readFile(filePath);
+      } catch {
+        // Redirections to the left are already installed and apply to the
+        // diagnostic; the ones to the right are never opened.
+        return {
+          error: await applyRedirections(
+            ctx,
+            failure(`bash: ${target}: No such file or directory\n`),
+            opened,
+            targets,
+          ),
+        };
+      }
+    }
+  }
+
+  const openError = await openPending();
+  if (openError) {
+    return { error: await applyRedirections(ctx, openError, opened, targets) };
+  }
+
+  return { ownStdin, redirections: opened, targets };
+}
+
+/**
+ * Decide whether a loop takes ownership of the shared read stream
+ * (`ctx.state.groupStdin`).
+ *
+ * A loop only installs — and therefore only restores — a stdin it brought
+ * itself: its own input redirection (`< file`, here-doc, here-string), or the
+ * stdin handed to it as a pipeline stage. A stream merely INHERITED from an
+ * enclosing group or loop must be left in place, because reads inside the body
+ * advance it and restoring it afterwards would rewind the shared read
+ * position: `printf 'a\nb\n' | { while read x; do break; done; read y; }` has
+ * to see `y=b`, not `y=a`.
+ *
+ * `ownStdin` of `""` still counts as ownership — `done < empty-file` gives the
+ * body an empty stream rather than the enclosing one.
+ */
+function resolveLoopStdin(
+  ownStdin: string | undefined,
+  pipelineStdin: string,
+): { owns: true; stdin: string } | { owns: false } {
+  if (ownStdin !== undefined) {
+    return { owns: true, stdin: ownStdin };
+  }
+  if (pipelineStdin !== "") {
+    return { owns: true, stdin: pipelineStdin };
+  }
+  return { owns: false };
+}
 
 class CompoundOutput {
   private stdoutChunks: string[] = [];
@@ -141,6 +359,13 @@ export async function executeIf(
   ctx: InterpreterContext,
   node: IfNode,
 ): Promise<ExecResult> {
+  return withNumericFds(ctx, node.redirections, () => executeIfBody(ctx, node));
+}
+
+async function executeIfBody(
+  ctx: InterpreterContext,
+  node: IfNode,
+): Promise<ExecResult> {
   const output = new CompoundOutput(ctx);
 
   for (const clause of node.clauses) {
@@ -164,12 +389,23 @@ export async function executeFor(
   ctx: InterpreterContext,
   node: ForNode,
 ): Promise<ExecResult> {
+  return withNumericFds(ctx, node.redirections, (fdTargets) =>
+    executeForBody(ctx, node, fdTargets),
+  );
+}
+
+async function executeForBody(
+  ctx: InterpreterContext,
+  node: ForNode,
+  fdTargets: ExpandedRedirectTargets,
+): Promise<ExecResult> {
   // Pre-open output redirects to truncate files BEFORE expanding words
   // This matches bash behavior where redirect files are opened before
   // any command substitutions in the word list are evaluated
   const preparedRedirects = await preOpenOutputRedirects(
     ctx,
     node.redirections,
+    fdTargets,
   );
   if (preparedRedirects.error) {
     return preparedRedirects.error;
@@ -274,12 +510,23 @@ export async function executeCStyleFor(
   ctx: InterpreterContext,
   node: CStyleForNode,
 ): Promise<ExecResult> {
+  return withNumericFds(ctx, node.redirections, (fdTargets) =>
+    executeCStyleForBody(ctx, node, fdTargets),
+  );
+}
+
+async function executeCStyleForBody(
+  ctx: InterpreterContext,
+  node: CStyleForNode,
+  fdTargets: ExpandedRedirectTargets,
+): Promise<ExecResult> {
   // Pre-open output redirects to truncate files BEFORE evaluating expressions
   // This matches bash behavior where redirect files are opened before
   // any command substitutions in the loop are evaluated
   const preparedRedirects = await preOpenOutputRedirects(
     ctx,
     node.redirections,
+    fdTargets,
   );
   if (preparedRedirects.error) {
     return preparedRedirects.error;
@@ -382,44 +629,35 @@ export async function executeWhile(
   node: WhileNode,
   stdin = "",
 ): Promise<ExecResult> {
+  return withNumericFds(ctx, node.redirections, (fdTargets) =>
+    executeWhileBody(ctx, node, stdin, fdTargets),
+  );
+}
+
+async function executeWhileBody(
+  ctx: InterpreterContext,
+  node: WhileNode,
+  stdin: string,
+  fdTargets: ExpandedRedirectTargets,
+): Promise<ExecResult> {
+  const prepared = await prepareLoopRedirections(
+    ctx,
+    node.redirections,
+    fdTargets,
+  );
+  if ("error" in prepared) {
+    return prepared.error;
+  }
+
   const output = new CompoundOutput(ctx);
   let exitCode = 0;
   let iterations = 0;
 
-  // Process here-doc redirections to get stdin content
-  let effectiveStdin = stdin;
-  for (const redir of node.redirections) {
-    if (
-      (redir.operator === "<<" || redir.operator === "<<-") &&
-      redir.target.type === "HereDoc"
-    ) {
-      const hereDoc = redir.target as HereDocNode;
-      let content = await expandWord(ctx, hereDoc.content);
-      if (hereDoc.stripTabs) {
-        content = content
-          .split("\n")
-          .map((line) => line.replace(/^\t+/, ""))
-          .join("\n");
-      }
-      effectiveStdin = content;
-    } else if (redir.operator === "<<<" && redir.target.type === "Word") {
-      effectiveStdin = `${await expandWord(ctx, redir.target as WordNode)}\n`;
-    } else if (redir.operator === "<" && redir.target.type === "Word") {
-      try {
-        const target = await expandWord(ctx, redir.target as WordNode);
-        const filePath = ctx.fs.resolvePath(ctx.state.cwd, target);
-        effectiveStdin = await ctx.fs.readFile(filePath);
-      } catch {
-        const target = await expandWord(ctx, redir.target as WordNode);
-        return failure(`bash: ${target}: No such file or directory\n`);
-      }
-    }
-  }
-
-  // Save and set groupStdin for piped while loops
+  // Install groupStdin only for a stream this loop owns (see resolveLoopStdin)
+  const loopStdin = resolveLoopStdin(prepared.ownStdin, stdin);
   const savedGroupStdin = ctx.state.groupStdin;
-  if (effectiveStdin) {
-    ctx.state.groupStdin = effectiveStdin;
+  if (loopStdin.owns) {
+    ctx.state.groupStdin = loopStdin.stdin;
   }
 
   ctx.state.loopDepth++;
@@ -499,26 +737,68 @@ export async function executeWhile(
         if (loopResult.action === "break") break;
         if (loopResult.action === "continue") continue;
         if (loopResult.action === "error") {
-          return output.build(loopResult.exitCode ?? 1);
+          // Apply output redirections before returning
+          return applyRedirections(
+            ctx,
+            output.build(loopResult.exitCode ?? 1),
+            prepared.redirections,
+            prepared.targets,
+          );
         }
         throw loopResult.error;
       }
     }
   } finally {
     ctx.state.loopDepth--;
-    ctx.state.groupStdin = savedGroupStdin;
+    if (loopStdin.owns) {
+      ctx.state.groupStdin = savedGroupStdin;
+    }
   }
 
-  return output.build(exitCode);
+  // Apply output redirections
+  return applyRedirections(
+    ctx,
+    output.build(exitCode),
+    prepared.redirections,
+    prepared.targets,
+  );
 }
 
 export async function executeUntil(
   ctx: InterpreterContext,
   node: UntilNode,
+  stdin = "",
 ): Promise<ExecResult> {
+  return withNumericFds(ctx, node.redirections, (fdTargets) =>
+    executeUntilBody(ctx, node, stdin, fdTargets),
+  );
+}
+
+async function executeUntilBody(
+  ctx: InterpreterContext,
+  node: UntilNode,
+  stdin: string,
+  fdTargets: ExpandedRedirectTargets,
+): Promise<ExecResult> {
+  const prepared = await prepareLoopRedirections(
+    ctx,
+    node.redirections,
+    fdTargets,
+  );
+  if ("error" in prepared) {
+    return prepared.error;
+  }
+
   const output = new CompoundOutput(ctx);
   let exitCode = 0;
   let iterations = 0;
+
+  // Install groupStdin only for a stream this loop owns (see resolveLoopStdin)
+  const loopStdin = resolveLoopStdin(prepared.ownStdin, stdin);
+  const savedGroupStdin = ctx.state.groupStdin;
+  if (loopStdin.owns) {
+    ctx.state.groupStdin = loopStdin.stdin;
+  }
 
   ctx.state.loopDepth++;
   try {
@@ -556,21 +836,46 @@ export async function executeUntil(
         if (loopResult.action === "break") break;
         if (loopResult.action === "continue") continue;
         if (loopResult.action === "error") {
-          return output.build(loopResult.exitCode ?? 1);
+          // Apply output redirections before returning
+          return applyRedirections(
+            ctx,
+            output.build(loopResult.exitCode ?? 1),
+            prepared.redirections,
+            prepared.targets,
+          );
         }
         throw loopResult.error;
       }
     }
   } finally {
     ctx.state.loopDepth--;
+    if (loopStdin.owns) {
+      ctx.state.groupStdin = savedGroupStdin;
+    }
   }
 
-  return output.build(exitCode);
+  // Apply output redirections
+  return applyRedirections(
+    ctx,
+    output.build(exitCode),
+    prepared.redirections,
+    prepared.targets,
+  );
 }
 
 export async function executeCase(
   ctx: InterpreterContext,
   node: CaseNode,
+): Promise<ExecResult> {
+  return withNumericFds(ctx, node.redirections, (fdTargets) =>
+    executeCaseBody(ctx, node, fdTargets),
+  );
+}
+
+async function executeCaseBody(
+  ctx: InterpreterContext,
+  node: CaseNode,
+  fdTargets: ExpandedRedirectTargets,
 ): Promise<ExecResult> {
   // Pre-open output redirects to truncate files BEFORE expanding case word
   // This matches bash behavior where redirect files are opened before
@@ -578,6 +883,7 @@ export async function executeCase(
   const preparedRedirects = await preOpenOutputRedirects(
     ctx,
     node.redirections,
+    fdTargets,
   );
   if (preparedRedirects.error) {
     return preparedRedirects.error;

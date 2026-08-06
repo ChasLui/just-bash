@@ -87,6 +87,7 @@ export type RunCommandFn = (
   skipFunctions?: boolean,
   useDefaultPath?: boolean,
   stdinSourceFd?: number,
+  stdinRedirected?: boolean,
 ) => Promise<ExecResult>;
 
 interface RevocableCommandContext {
@@ -417,6 +418,13 @@ export async function dispatchBuiltin(
   skipFunctions: boolean,
   _useDefaultPath: boolean,
   stdinSourceFd: number,
+  /**
+   * True when a redirection gave this command its own fd 0. `stdin` alone
+   * cannot express it: `cmd < empty-file` and an unredirected command both
+   * arrive as `""`, but only the first means EOF rather than "inherit the
+   * shell's stdin".
+   */
+  stdinRedirected = false,
 ): Promise<ExecResult | null> {
   const { ctx, runCommand } = dispatchCtx;
 
@@ -453,7 +461,7 @@ export async function dispatchBuiltin(
   // In POSIX mode, eval is a special builtin that cannot be overridden by functions
   // In non-POSIX mode (bash default), functions can override eval
   if (commandName === "eval" && ctx.state.options.posix) {
-    return handleEval(ctx, args, stdin);
+    return handleEval(ctx, args, stdin, stdinRedirected);
   }
   if (commandName === "shift") {
     return handleShift(ctx, args);
@@ -499,7 +507,7 @@ export async function dispatchBuiltin(
   if (!skipFunctions) {
     const func = ctx.state.functions.get(commandName);
     if (func) {
-      return callFunction(ctx, func, args, stdin);
+      return callFunction(ctx, func, args, stdin, undefined, stdinRedirected);
     }
   }
   // Internal transform primitive, reached through `builtin` so a user-defined
@@ -532,7 +540,7 @@ export async function dispatchBuiltin(
   // Simple builtins (can be overridden by functions)
   // eval: In non-POSIX mode, functions can override eval (handled above for POSIX mode)
   if (commandName === "eval") {
-    return handleEval(ctx, args, stdin);
+    return handleEval(ctx, args, stdin, stdinRedirected);
   }
   if (commandName === "cd") {
     return await handleCd(ctx, args);
@@ -547,10 +555,10 @@ export async function dispatchBuiltin(
     return handleLet(ctx, args);
   }
   if (commandName === "command") {
-    return handleCommandBuiltin(dispatchCtx, args, stdin);
+    return handleCommandBuiltin(dispatchCtx, args, stdin, stdinRedirected);
   }
   if (commandName === "builtin") {
-    return handleBuiltinBuiltin(dispatchCtx, args, stdin);
+    return handleBuiltinBuiltin(dispatchCtx, args, stdin, stdinRedirected);
   }
   if (commandName === "shopt") {
     return handleShopt(ctx, args);
@@ -561,7 +569,9 @@ export async function dispatchBuiltin(
       return OK;
     }
     const [cmd, ...rest] = args;
-    return runCommand(cmd, rest, [], stdin, false, false, -1);
+    // Re-dispatch with the same stdin, so the wrapped command inherits fd-0
+    // ownership too (`exec cmd < empty-file` is EOF, not "no redirection").
+    return runCommand(cmd, rest, [], stdin, false, false, -1, stdinRedirected);
   }
   if (commandName === "wait") {
     // wait - wait for background jobs (stub: no-op in this context)
@@ -605,6 +615,8 @@ async function handleCommandBuiltin(
   dispatchCtx: BuiltinDispatchContext,
   args: string[],
   stdin: string,
+  /** Forwarded to the wrapped command: it runs on this command's fd 0. */
+  stdinRedirected = false,
 ): Promise<ExecResult> {
   const { ctx, runCommand } = dispatchCtx;
 
@@ -649,7 +661,16 @@ async function handleCommandBuiltin(
   // Run command without checking functions, but builtins are still available
   // Pass useDefaultPath to use /usr/bin:/bin instead of $PATH
   const [cmd, ...rest] = cmdArgs;
-  return runCommand(cmd, rest, [], stdin, true, useDefaultPath, -1);
+  return runCommand(
+    cmd,
+    rest,
+    [],
+    stdin,
+    true,
+    useDefaultPath,
+    -1,
+    stdinRedirected,
+  );
 }
 
 /**
@@ -659,6 +680,8 @@ async function handleBuiltinBuiltin(
   dispatchCtx: BuiltinDispatchContext,
   args: string[],
   stdin: string,
+  /** Forwarded to the wrapped builtin: it runs on this command's fd 0. */
+  stdinRedirected = false,
 ): Promise<ExecResult> {
   const { runCommand } = dispatchCtx;
 
@@ -682,7 +705,7 @@ async function handleBuiltinBuiltin(
   }
   const [, ...rest] = cmdArgs;
   // Run as builtin (recursive call, skip function lookup)
-  return runCommand(cmd, rest, [], stdin, true, false, -1);
+  return runCommand(cmd, rest, [], stdin, true, false, -1, stdinRedirected);
 }
 
 /**

@@ -1,0 +1,96 @@
+{
+  "029ef9a4af22f501": {
+    "command": "while true; do echo x; break; done > o.txt < nosuch\necho \"rc=$?\"\necho \"o=[$(cat o.txt)]\"",
+    "files": {
+      "o.txt": "keep\n"
+    },
+    "stdout": "rc=1\no=[]\n",
+    "stderr": "/bin/bash: nosuch: No such file or directory\n",
+    "exitCode": 0,
+    "locked": true
+  },
+  "4056dc47122a0f15": {
+    "command": "while true; do echo x; break; done > a.txt < nosuch > b.txt\necho \"rc=$?\"\necho \"a=[$(cat a.txt)] b=[$(cat b.txt)]\"",
+    "files": {
+      "a.txt": "keepa\n",
+      "b.txt": "keepb\n"
+    },
+    "stdout": "rc=1\na=[] b=[keepb]\n",
+    "stderr": "/bin/bash: nosuch: No such file or directory\n",
+    "exitCode": 0,
+    "locked": true
+  },
+  "55c304dbea2f9c5f": {
+    "command": "until false; do echo u; break; done > o.txt < nosuch\necho \"rc=$?\"\necho \"o=[$(cat o.txt)]\"",
+    "files": {
+      "o.txt": "keep\n"
+    },
+    "stdout": "rc=1\no=[]\n",
+    "stderr": "/bin/bash: nosuch: No such file or directory\n",
+    "exitCode": 0,
+    "locked": true
+  },
+  "5ba4d3c97b929674": {
+    "command": "while true; do echo x; break; done > a.txt < nosuch > b.txt\necho \"rc=$?\"\necho \"a=$([ -e a.txt ] && echo yes || echo no) b=$([ -e b.txt ] && echo yes || echo no)\"",
+    "files": {},
+    "stdout": "rc=1\na=yes b=no\n",
+    "stderr": "/bin/bash: nosuch: No such file or directory\n",
+    "exitCode": 0,
+    "locked": true
+  },
+  "625853946873d829": {
+    "command": "while true; do echo x; break; done 2> e.txt < nosuch\necho \"rc=$?\"\necho \"hits=$(grep -c 'No such file or directory' e.txt)\"",
+    "files": {
+      "e.txt": "keep\n"
+    },
+    "stdout": "rc=1\nhits=1\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "91da5cb96c38ee37": {
+    "command": "while read l; do echo \"h:$l\"; done > o.txt <<EOF < nosuch\nalpha\nEOF\necho \"rc=$?\"\necho \"o=[$(cat o.txt)]\"",
+    "files": {
+      "o.txt": "keep\n"
+    },
+    "stdout": "rc=1\no=[]\n",
+    "stderr": "/bin/bash: line 2: nosuch: No such file or directory\n",
+    "exitCode": 0,
+    "locked": true
+  },
+  "c37167907026f157": {
+    "command": "while true; do echo x; break; done >> o.txt < nosuch\necho \"rc=$?\"\necho \"o=[$(cat o.txt)]\"",
+    "files": {
+      "o.txt": "keep\n"
+    },
+    "stdout": "rc=1\no=[keep]\n",
+    "stderr": "/bin/bash: nosuch: No such file or directory\n",
+    "exitCode": 0,
+    "locked": true
+  },
+  "d15827827b1e9040": {
+    "command": "while true; do echo x; break; done >> o.txt < nosuch\necho \"rc=$?\"\necho \"exists=$([ -e o.txt ] && echo yes || echo no) o=[$(cat o.txt)]\"",
+    "files": {},
+    "stdout": "rc=1\nexists=yes o=[]\n",
+    "stderr": "/bin/bash: nosuch: No such file or directory\n",
+    "exitCode": 0,
+    "locked": true
+  },
+  "e6247bbd96681489": {
+    "command": "while true; do echo x; break; done < nosuch > o.txt\necho \"rc=$?\"\necho \"o=[$(cat o.txt)]\"",
+    "files": {
+      "o.txt": "keep\n"
+    },
+    "stdout": "rc=1\no=[keep]\n",
+    "stderr": "/bin/bash: nosuch: No such file or directory\n",
+    "exitCode": 0,
+    "locked": true
+  },
+  "f77f9201e0a8db50": {
+    "command": "n=0\nwhile true; do echo x; break; done > \"s$((n++)).txt\" < nosuch\necho \"rc=$? n=$n\"\necho \"s0=$([ -e s0.txt ] && echo yes || echo no) s1=$([ -e s1.txt ] && echo yes || echo no)\"",
+    "files": {},
+    "stdout": "rc=1 n=1\ns0=yes s1=no\n",
+    "stderr": "/bin/bash: line 1: nosuch: No such file or directory\n",
+    "exitCode": 0,
+    "locked": true
+  }
+}

@@ -20,6 +20,12 @@ export async function handleEval(
   ctx: InterpreterContext,
   args: string[],
   stdin?: string,
+  /**
+   * A redirection gave this `eval` its own fd 0. Empty content is still
+   * ownership: `eval '…' < empty-file` means EOF inside, where an
+   * unredirected `eval` shares the shell's stdin.
+   */
+  stdinRedirected = false,
 ): Promise<ExecResult> {
   // Handle options like bash does:
   // -- ends option processing
@@ -50,12 +56,16 @@ export async function handleEval(
     return OK;
   }
 
-  // Save and set groupStdin for piped eval commands
-  // This allows stdin from the pipeline to flow to commands within eval
+  // `eval` runs in the current shell, so it restores only the stdin it
+  // actually replaced. A pipeline or a redirection gives it its own fd 0
+  // (`printf … | eval '…'`, `eval '…' < file`) and that has to be undone
+  // afterwards. Without one, eval shares the shell's fd 0: reads inside it
+  // move the one shared position, so `{ eval 'read a'; read b; }` must give
+  // `b` the second line rather than replay the first.
   const savedGroupStdin = ctx.state.groupStdin;
-  const effectiveStdin = stdin ?? ctx.state.groupStdin;
-  if (effectiveStdin !== undefined) {
-    ctx.state.groupStdin = effectiveStdin;
+  const ownsStdin = stdinRedirected || (stdin !== undefined && stdin !== "");
+  if (ownsStdin) {
+    ctx.state.groupStdin = stdin ?? "";
   }
 
   try {
@@ -77,7 +87,15 @@ export async function handleEval(
     }
     throw error;
   } finally {
-    // Restore groupStdin
-    ctx.state.groupStdin = savedGroupStdin;
+    // Same rule as command groups: hand the shared position back untouched
+    // only when eval owned fd 0. `undefined` is not a read position, so a body
+    // that cleared shared stdin it does not own (pipeline stages on main, see
+    // #328) gets the inherited position restored rather than propagated.
+    if (
+      ownsStdin ||
+      (savedGroupStdin !== undefined && ctx.state.groupStdin === undefined)
+    ) {
+      ctx.state.groupStdin = savedGroupStdin;
+    }
   }
 }

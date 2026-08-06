@@ -1,0 +1,234 @@
+{
+  "07b73d845debc1bd": {
+    "command": "{ { { read a; }; }; read b; echo \"a=[$a] b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "a=[L1] b=[L2]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "0c9e0ea31e2c8880": {
+    "command": "{ read a; while read x; do echo \"X:$x\"; done < other.txt; read b; echo \"a=[$a] b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n",
+      "other.txt": "O1\nO2\nO3\n"
+    },
+    "stdout": "X:O1\nX:O2\nX:O3\na=[L1] b=[L2]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "124dbc51aae2bf1d": {
+    "command": "{ eval 'read a; echo \"a=[$a]\"' < other.txt; read b; echo \"b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n",
+      "other.txt": "O1\nO2\nO3\n"
+    },
+    "stdout": "a=[O1]\nb=[L1]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "28a816d2d3632e61": {
+    "command": "f() { read x; echo \"x=[$x]\"; } < empty.txt; { read a; f; read b; echo \"a=[$a] b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n",
+      "empty.txt": ""
+    },
+    "stdout": "x=[]\na=[L1] b=[L2]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "2ccccd0e98d641dd": {
+    "command": "{ eval 'while read l; do echo \"E:$l\"; done'; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "E:L1\nE:L2\nE:L3\nE:L4\nE:L5\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "3a0c611cda10a437": {
+    "command": "{ eval 'read a; read c'; read b; echo \"a=[$a] c=[$c] b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "a=[L1] c=[L2] b=[L3]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "583d99b0e8a38d6f": {
+    "command": "{ read a; { read x; echo \"x=[$x]\"; } < empty.txt; read b; echo \"a=[$a] b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n",
+      "empty.txt": ""
+    },
+    "stdout": "x=[]\na=[L1] b=[L2]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "5b9b4e1d1a1ebc39": {
+    "command": "{ { read a; echo \"a=[$a]\"; } <<< \"S1\"; read b; echo \"b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "a=[S1]\nb=[L1]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "5bb969bda6c97a80": {
+    "command": "{ { read a; echo \"a=[$a]\"; } <<EOT\nH1\nEOT\nread b; echo \"b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "a=[H1]\nb=[L1]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "6723871c6848c7a5": {
+    "command": "n=0; while read a; do n=$((n+1)); { echo x | cat; } >/dev/null; done < loop.txt; echo \"iterations: $n\"",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "iterations: 5\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "6b84ec4bde6c8e9a": {
+    "command": "{ read a; { read x; echo \"x=[$x]\"; } < other.txt; read b; echo \"a=[$a] b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n",
+      "other.txt": "O1\nO2\nO3\n"
+    },
+    "stdout": "x=[O1]\na=[L1] b=[L2]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "731214683b5fc3a6": {
+    "command": "{ { read a; }; cat; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "L2\nL3\nL4\nL5\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "760a355a7212adc4": {
+    "command": "{ read a; eval 'read x; echo \"x=[$x]\"' < empty.txt; read b; echo \"a=[$a] b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n",
+      "empty.txt": ""
+    },
+    "stdout": "x=[]\na=[L1] b=[L2]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "7a0dda5553691c92": {
+    "command": "{ { read a; } >/dev/null; read b; echo \"a=[$a] b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "a=[L1] b=[L2]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "9521f508de0a5238": {
+    "command": "f() { read a; echo \"in=[$a]\"; }; { f < other.txt; read b; echo \"b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n",
+      "other.txt": "O1\nO2\nO3\n"
+    },
+    "stdout": "in=[O1]\nb=[L1]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "97e5ad35e4af1b3d": {
+    "command": "{ { read a; read c; read d; read e; read f; }; read b; rc=$?; echo \"b=[$b] rc=$rc\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "b=[] rc=1\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "a231c0764f0775ef": {
+    "command": "while read a; do { read b; }; echo \"pair=[$a][$b]\"; done < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "pair=[L1][L2]\npair=[L3][L4]\npair=[L5][]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "ab20cba35b9c7797": {
+    "command": "{ { read a; }; read b; echo \"a=[$a] b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "a=[L1] b=[L2]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "b47daf8cad1ca4be": {
+    "command": "f() { read q; }; n=0; while read x; do n=$((n+1)); f < /dev/null; done < loop.txt; echo \"iterations: $n\"",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "iterations: 5\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "c3fae8a5b19f99bf": {
+    "command": "f() { read b; echo \"f got [$b]\"; }; while read a; do echo \"a=[$a]\"; f; done < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "a=[L1]\nf got [L2]\na=[L3]\nf got [L4]\na=[L5]\nf got []\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "d924d9289c2082ed": {
+    "command": "{ { { read a; }; read c; }; read b; echo \"a=[$a] c=[$c] b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "a=[L1] c=[L2] b=[L3]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "f0af781cec488a1b": {
+    "command": "f() { read a; echo \"in=[$a]\"; }; { f; f; read b; echo \"b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "in=[L1]\nin=[L2]\nb=[L3]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "f4df2257ae8b19cc": {
+    "command": "f() { read a; echo \"in=[$a]\"; } < other.txt; { f; read b; echo \"b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n",
+      "other.txt": "O1\nO2\nO3\n"
+    },
+    "stdout": "in=[O1]\nb=[L1]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "f982dfb1f4639a74": {
+    "command": "{ { read a; }; read b; echo \"a=[$a] b=[$b]\"; } <<EOT\nH1\nH2\nEOT",
+    "files": {},
+    "stdout": "a=[H1] b=[H2]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "fa64576a9465b0df": {
+    "command": "f() { read x; echo \"x=[$x]\"; }; { read a; f < empty.txt; read b; echo \"a=[$a] b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n",
+      "empty.txt": ""
+    },
+    "stdout": "x=[]\na=[L1] b=[L2]\n",
+    "stderr": "",
+    "exitCode": 0
+  }
+}

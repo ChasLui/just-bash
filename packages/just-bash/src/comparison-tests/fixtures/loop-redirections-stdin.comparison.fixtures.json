@@ -1,0 +1,124 @@
+{
+  "1bb58c023a7e3d11": {
+    "command": "printf 'p1\\np2\\n' | until ! read l; do echo \"u:$l\"; done > out.txt\ncat out.txt",
+    "files": {},
+    "stdout": "u:p1\nu:p2\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "1e0e9742faa27b5b": {
+    "command": "while read l; do echo \"s:$l\"; done <<< \"hello\" > out.txt\ncat out.txt",
+    "files": {},
+    "stdout": "s:hello\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "39035298fab339d9": {
+    "command": "while read l; do echo \"h:$l\"; done > out.txt <<EOF\nalpha\nbeta\nEOF\ncat out.txt",
+    "files": {},
+    "stdout": "h:alpha\nh:beta\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "40fe41c114c96981": {
+    "command": "while read l; do echo \"s:[$l]\"; done <<< *",
+    "files": {
+      "aglob1": "",
+      "aglob2": ""
+    },
+    "stdout": "s:[*]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "42305949b7a93f3e": {
+    "command": "while read l; do echo \"[$l]\"; done < in.txt > out.txt\ncat out.txt",
+    "files": {
+      "in.txt": "a\nb\n"
+    },
+    "stdout": "[a]\n[b]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "574598a08fc6451d": {
+    "command": "while true; do echo x; break; done > out.txt | cat\necho \"---\"\ncat out.txt",
+    "files": {},
+    "stdout": "---\nx\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "9087f53db0e40105": {
+    "command": "while true; do echo o; echo e >&2; break; done 2>&1 | cat",
+    "files": {},
+    "stdout": "o\ne\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "90f788b3434d6ffa": {
+    "command": "while read l; do echo \"got:$l\"; done < in.txt",
+    "files": {
+      "in.txt": "one\ntwo\n"
+    },
+    "stdout": "got:one\ngot:two\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "98da27b468bc4899": {
+    "command": "while read l; do echo \"$l\"; done < nosuch.txt > out.txt\necho \"rc=$?\"\ncat out.txt",
+    "files": {
+      "out.txt": "keep\n"
+    },
+    "stdout": "rc=1\nkeep\n",
+    "stderr": "/bin/bash: nosuch.txt: No such file or directory\n",
+    "exitCode": 0,
+    "locked": true
+  },
+  "a749acbf5a19012b": {
+    "command": "while read l; do echo \"{$l}\"; done > a.txt < in.txt > b.txt\necho \"a=[$(cat a.txt)] b=[$(cat b.txt)]\"",
+    "files": {
+      "in.txt": "e\nf\n"
+    },
+    "stdout": "a=[] b=[{e}\n{f}]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "ab01f4156de7358b": {
+    "command": "for i in 1 2; do\n  while true; do echo \"n$i\"; break; done\ndone > out.txt\ncat out.txt",
+    "files": {},
+    "stdout": "n1\nn2\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "ad1c8cf5e7b450d8": {
+    "command": "until ! read l; do echo \"$l\"; done < nosuch.txt\necho \"rc=$?\"",
+    "files": {},
+    "stdout": "rc=1\n",
+    "stderr": "/bin/bash: nosuch.txt: No such file or directory\n",
+    "exitCode": 0,
+    "locked": true
+  },
+  "babe1561e72daf4a": {
+    "command": "until ! read l; do echo \"<$l>\"; done < in.txt > out.txt\ncat out.txt",
+    "files": {
+      "in.txt": "c\nd\n"
+    },
+    "stdout": "<c>\n<d>\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "be7575df70c1b6e1": {
+    "command": "while true; do\n  while true; do echo inner; break; done > inner.txt\n  echo outer\n  break\ndone > outer.txt\necho \"inner=[$(cat inner.txt)] outer=[$(cat outer.txt)]\"",
+    "files": {},
+    "stdout": "inner=[inner] outer=[outer]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "cf6e0185b56c7166": {
+    "command": "while read l; do echo \"got:$l\"; done > f.txt < f.txt\necho \"rc=$? f=[$(cat f.txt)]\"",
+    "files": {
+      "f.txt": "l1\nl2\n"
+    },
+    "stdout": "rc=0 f=[]\n",
+    "stderr": "",
+    "exitCode": 0
+  }
+}

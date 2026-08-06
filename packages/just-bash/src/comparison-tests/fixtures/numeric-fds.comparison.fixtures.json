@@ -1,0 +1,225 @@
+{
+  "12849b0cc989f39a": {
+    "command": "fn() { read -u 3 a; read -u 3 b; echo \"a=$a b=$b\"; }; fn 3< three.txt",
+    "files": {
+      "three.txt": "one\ntwo\nthree\n",
+      "two.txt": "alpha\nbeta\n",
+      "existing.txt": "one\n"
+    },
+    "stdout": "a=one b=two\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "1b82a9ab204d3cf0": {
+    "command": "true 9> nine.txt; echo world >&9 2>/dev/null; echo \"rc=$?\"; cat nine.txt",
+    "files": {
+      "three.txt": "one\ntwo\nthree\n",
+      "two.txt": "alpha\nbeta\n",
+      "existing.txt": "one\n"
+    },
+    "stdout": "rc=1\n",
+    "stderr": "/bin/bash: 9: Bad file descriptor\n",
+    "exitCode": 0,
+    "locked": true
+  },
+  "343646c6dfbd377b": {
+    "command": "{ read -u 3 a; read -u 3 b; echo \"a=$a b=$b\"; } 3< three.txt",
+    "files": {
+      "three.txt": "one\ntwo\nthree\n",
+      "two.txt": "alpha\nbeta\n",
+      "existing.txt": "one\n"
+    },
+    "stdout": "a=one b=two\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "4493870f5ed68315": {
+    "command": "exec 4>> existing.txt; echo two >&4; exec 4>&-; cat existing.txt",
+    "files": {
+      "three.txt": "one\ntwo\nthree\n",
+      "two.txt": "alpha\nbeta\n",
+      "existing.txt": "one\n"
+    },
+    "stdout": "one\ntwo\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "44f691964ce8c508": {
+    "command": "for i in 1 2; do echo \"line $i\" >&7; done 7> loop.txt; cat loop.txt",
+    "files": {
+      "three.txt": "one\ntwo\nthree\n",
+      "two.txt": "alpha\nbeta\n",
+      "existing.txt": "one\n"
+    },
+    "stdout": "line 1\nline 2\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "4b507f94d7d34637": {
+    "command": "exec 4> out.txt; echo hello >&4; echo world >&4; exec 4>&-; cat out.txt",
+    "files": {
+      "three.txt": "one\ntwo\nthree\n",
+      "two.txt": "alpha\nbeta\n",
+      "existing.txt": "one\n"
+    },
+    "stdout": "hello\nworld\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "55b00aa9181252a4": {
+    "command": "exec 3< two.txt; read line <&3; echo \"1:$line\"; read line <&3; echo \"2:$line\"; read line <&3; echo \"3:rc=$? [$line]\"",
+    "files": {
+      "three.txt": "one\ntwo\nthree\n",
+      "two.txt": "alpha\nbeta\n",
+      "existing.txt": "one\n"
+    },
+    "stdout": "1:alpha\n2:beta\n3:rc=1 []\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "5bf94e808750d64e": {
+    "command": "for i in 1 2; do read -u 3 v; echo \"i=$i v=$v\"; done 3< three.txt",
+    "files": {
+      "three.txt": "one\ntwo\nthree\n",
+      "two.txt": "alpha\nbeta\n",
+      "existing.txt": "one\n"
+    },
+    "stdout": "i=1 v=one\ni=2 v=two\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "6dcbfdb339885b7c": {
+    "command": "exec 3< three.txt; read -u 3 first; echo \"first=$first\"; while read -u 3 l; do echo \"loop:$l\"; done 3< two.txt; read -u 3 second; echo \"second=$second\"; exec 3<&-",
+    "files": {
+      "three.txt": "one\ntwo\nthree\n",
+      "two.txt": "alpha\nbeta\n",
+      "existing.txt": "one\n"
+    },
+    "stdout": "first=one\nloop:alpha\nloop:beta\nsecond=two\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "7778d6c2e3734291": {
+    "command": "while read -u 3 fd; do read line; echo \"fd=$fd stdin=$line\"; done 3< two.txt < three.txt",
+    "files": {
+      "three.txt": "one\ntwo\nthree\n",
+      "two.txt": "alpha\nbeta\n",
+      "existing.txt": "one\n"
+    },
+    "stdout": "fd=alpha stdin=one\nfd=beta stdin=two\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "80b78b30e80427ac": {
+    "command": "exec 3< missing.txt 2>/dev/null; echo \"rc=$?\"; echo still-running",
+    "files": {
+      "three.txt": "one\ntwo\nthree\n",
+      "two.txt": "alpha\nbeta\n",
+      "existing.txt": "one\n"
+    },
+    "stdout": "rc=1\nstill-running\n",
+    "stderr": "/bin/bash: missing.txt: No such file or directory\n",
+    "exitCode": 0,
+    "locked": true
+  },
+  "a7cfd8549b4c466f": {
+    "command": "read -u 3 x 3< three.txt; echo \"x=$x\"; read -u 3 y 2>/dev/null; echo \"rc=$? y=$y\"",
+    "files": {
+      "three.txt": "one\ntwo\nthree\n",
+      "two.txt": "alpha\nbeta\n",
+      "existing.txt": "one\n"
+    },
+    "stdout": "x=one\nrc=1 y=\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "a99a3314a6b2dfbf": {
+    "command": "cnt=0; while IFS= read -r x <&3; do cnt=$((cnt+1)); done 3< two.txt; echo \"$cnt\"",
+    "files": {
+      "three.txt": "one\ntwo\nthree\n",
+      "two.txt": "alpha\nbeta\n",
+      "existing.txt": "one\n"
+    },
+    "stdout": "2\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "ab4ee1d52d32b5e9": {
+    "command": "read -u 3 3<<EOF\nhi\nEOF\necho reply=$REPLY",
+    "files": {
+      "three.txt": "one\ntwo\nthree\n",
+      "two.txt": "alpha\nbeta\n",
+      "existing.txt": "one\n"
+    },
+    "stdout": "reply=hi\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "ae95874ebf0269ce": {
+    "command": "n=0; while read -u 3 line; do n=$((n+1)); echo \"got: $line\"; done 3< three.txt; echo \"iterations: $n\"",
+    "files": {
+      "three.txt": "one\ntwo\nthree\n",
+      "two.txt": "alpha\nbeta\n",
+      "existing.txt": "one\n"
+    },
+    "stdout": "got: one\ngot: two\ngot: three\niterations: 3\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "bc8d30f616f1e5ef": {
+    "command": "exec 5> five.txt; echo hello >&5; exec 5>&-; echo world >&5 2>/dev/null; echo \"rc=$?\"; cat five.txt",
+    "files": {
+      "three.txt": "one\ntwo\nthree\n",
+      "two.txt": "alpha\nbeta\n",
+      "existing.txt": "one\n"
+    },
+    "stdout": "rc=1\nhello\n",
+    "stderr": "/bin/bash: 5: Bad file descriptor\n",
+    "exitCode": 0,
+    "locked": true
+  },
+  "d5a5dbadf3afb74d": {
+    "command": "echo direct 5> five.txt >&5; echo \"rc=$?\"; cat five.txt",
+    "files": {
+      "three.txt": "one\ntwo\nthree\n",
+      "two.txt": "alpha\nbeta\n",
+      "existing.txt": "one\n"
+    },
+    "stdout": "rc=0\ndirect\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "eb717ae71fed8e4c": {
+    "command": "exec 3<&-; echo \"exec=$?\"; true 3<&-; echo \"cmd=$?\"",
+    "files": {
+      "three.txt": "one\ntwo\nthree\n",
+      "two.txt": "alpha\nbeta\n",
+      "existing.txt": "one\n"
+    },
+    "stdout": "exec=0\ncmd=0\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "ecf1605f0314d685": {
+    "command": "exec 3< three.txt; read -u 3 first; echo \"first=$first\"; cat <&3; read -u 3 rest 2>/dev/null; echo \"rc=$? rest=$rest\"",
+    "files": {
+      "three.txt": "one\ntwo\nthree\n",
+      "two.txt": "alpha\nbeta\n",
+      "existing.txt": "one\n"
+    },
+    "stdout": "first=one\ntwo\nthree\nrc=1 rest=\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "fcfad284d094eb53": {
+    "command": "exec 3< two.txt; read -u 3 a; echo \"a=$a\"; exec 3<&-; read -u 3 b 2>/dev/null; echo \"rc=$? b=$b\"",
+    "files": {
+      "three.txt": "one\ntwo\nthree\n",
+      "two.txt": "alpha\nbeta\n",
+      "existing.txt": "one\n"
+    },
+    "stdout": "a=alpha\nrc=1 b=\n",
+    "stderr": "",
+    "exitCode": 0
+  }
+}
