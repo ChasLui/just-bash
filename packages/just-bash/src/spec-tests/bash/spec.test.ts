@@ -37,7 +37,7 @@ const SKIP_FILES = new Set([
   "builtin-trap-bash.test.sh",
   "builtin-trap-err.test.sh",
   "builtin-times.test.sh",
-  "process-sub.test.sh",
+  // "process-sub.test.sh", // Unskipped - all 9 cases pass with <(…) / >(…) support
 
   // Shell-specific features not implemented
   // "builtin-dirs.test.sh", // Unskipped - tests added with SKIP markers

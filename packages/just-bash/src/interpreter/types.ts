@@ -19,6 +19,7 @@ import type {
   FeatureCoverageWriter,
   TraceCallback,
 } from "../types.js";
+import type { ProcessSubstitutionEntry } from "./process-substitution.js";
 
 export type InterpreterExecOptions = Omit<CommandExecOptions, "cwd"> & {
   cwd?: string;
@@ -319,6 +320,17 @@ export interface IOState {
   fileDescriptors?: Map<number, string>;
   /** Next available file descriptor for {varname}>file allocation (starts at 10) */
   nextFd?: number;
+  /**
+   * Process substitutions (`<(cmd)` / `>(cmd)`) whose backing files are still
+   * live, oldest first. Used as a stack: each command execution releases the
+   * entries its own expansion pushed.
+   */
+  processSubstitutions?: ProcessSubstitutionEntry[];
+  /**
+   * True once `/dev/fd` has been routed to a private in-memory filesystem
+   * because the supplied one refused to back a descriptor (read-only sandbox).
+   */
+  processSubstitutionFsMounted?: boolean;
 }
 
 // ============================================================================

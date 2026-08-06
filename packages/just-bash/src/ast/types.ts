@@ -977,6 +977,13 @@ export const AST = {
     return { type: "ArithmeticExpansion", expression };
   },
 
+  processSubstitution(
+    body: ScriptNode,
+    direction: "input" | "output",
+  ): ProcessSubstitutionPart {
+    return { type: "ProcessSubstitution", body, direction };
+  },
+
   assignment(
     name: string,
     value: WordNode | null,

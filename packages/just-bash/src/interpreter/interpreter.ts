@@ -28,6 +28,7 @@ import {
   encodeUtf8ToBytes,
   latin1FromBytes,
   readBytesFrom,
+  stdoutAsBytes,
 } from "../encoding.js";
 import { ExecutionOutputAccumulator } from "../execution-output.js";
 import type { ExecutionScope } from "../execution-scope.js";
@@ -98,6 +99,10 @@ import {
 } from "./helpers/word-matching.js";
 import { traceSimpleCommand } from "./helpers/xtrace.js";
 import { executePipeline as executePipelineHelper } from "./pipeline-execution.js";
+import {
+  markProcessSubstitutions,
+  releaseProcessSubstitutions,
+} from "./process-substitution.js";
 import {
   applyRedirections,
   preOpenOutputRedirects,
@@ -528,7 +533,41 @@ export class Interpreter {
     );
   }
 
+  /**
+   * Execute a command, tearing down any process substitutions its own word
+   * expansion opened. Descriptor numbers are handed out from 63 downwards and
+   * released here, so they are reused per command exactly like bash and no
+   * backing file outlives the command that created it.
+   */
   private async executeCommand(
+    node: CommandNode,
+    stdin: string,
+  ): Promise<ExecResult> {
+    const procSubMark = markProcessSubstitutions(this.ctx);
+    let result: ExecResult;
+    try {
+      result = await this.executeCommandInner(node, stdin);
+    } catch (error) {
+      await releaseProcessSubstitutions(this.ctx, procSubMark).catch(
+        () => undefined,
+      );
+      throw error;
+    }
+    const writer = await releaseProcessSubstitutions(this.ctx, procSubMark);
+    if (!writer.stdout && !writer.stderr) return result;
+    // A `>(cmd)` writer shares the shell's stdout and stderr in bash; append
+    // what it produced once the outer command has finished writing to it.
+    return {
+      ...result,
+      stdout: writer.stdout
+        ? latin1FromBytes(stdoutAsBytes(result)) + writer.stdout
+        : result.stdout,
+      stdoutKind: writer.stdout ? "bytes" : result.stdoutKind,
+      stderr: result.stderr + writer.stderr,
+    };
+  }
+
+  private async executeCommandInner(
     node: CommandNode,
     stdin: string,
   ): Promise<ExecResult> {

@@ -997,6 +997,19 @@ export function parseWordParts(
       continue;
     }
 
+    // Handle process substitution: <(cmd) and >(cmd).
+    // The lexer only folds `<(` / `>(` into a word token when the paren is
+    // immediately adjacent, so reaching here means bash would treat it as a
+    // process substitution too (`< (cmd)` stays a redirection + syntax error).
+    // Heredoc bodies are literal, so they never contain one.
+    if ((char === "<" || char === ">") && value[i + 1] === "(" && !hereDoc) {
+      flushLiteral();
+      const { part, endIndex } = p.parseProcessSubstitution(value, i);
+      parts.push(part);
+      i = endIndex;
+      continue;
+    }
+
     // Handle tilde expansion
     if (char === "~") {
       const prevChar = i > 0 ? value[i - 1] : "";

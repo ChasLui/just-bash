@@ -55,6 +55,9 @@ function initCommonDirectories(
  */
 function initDevFiles(fs: SyncInitFs): void {
   fs.mkdirSync("/dev", { recursive: true });
+  // Backing files for process substitution (`<(cmd)` / `>(cmd)`) are created
+  // here, mirroring the /dev/fd path bash substitutes on Linux.
+  fs.mkdirSync("/dev/fd", { recursive: true });
   fs.writeFileSync("/dev/null", "");
   fs.writeFileSync("/dev/zero", new Uint8Array(0));
   fs.writeFileSync("/dev/stdin", "");

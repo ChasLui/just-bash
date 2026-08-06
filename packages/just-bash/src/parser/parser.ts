@@ -24,6 +24,7 @@ import {
   type ConditionalCommandNode,
   type FunctionDefNode,
   type PipelineNode,
+  type ProcessSubstitutionPart,
   type RedirectionNode,
   type ScriptNode,
   type StatementNode,
@@ -40,6 +41,7 @@ import {
   isDollarDparenSubshell as isDollarDparenSubshellHelper,
   parseBacktickSubstitutionFromString,
   parseCommandSubstitutionFromString,
+  parseProcessSubstitutionFromString,
 } from "./parser-substitution.js";
 import {
   MAX_INPUT_SIZE,
@@ -825,6 +827,18 @@ export class Parser {
     start: number,
   ): { part: CommandSubstitutionPart; endIndex: number } {
     return parseCommandSubstitutionFromString(
+      value,
+      start,
+      () => new Parser(this.parseBudget),
+      (msg) => this.error(msg),
+    );
+  }
+
+  parseProcessSubstitution(
+    value: string,
+    start: number,
+  ): { part: ProcessSubstitutionPart; endIndex: number } {
+    return parseProcessSubstitutionFromString(
       value,
       start,
       () => new Parser(this.parseBudget),

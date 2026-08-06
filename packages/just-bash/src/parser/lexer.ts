@@ -441,6 +441,20 @@ export class Lexer {
       this.registerHeredocFromLookahead(false);
       return this.makeToken(TokenType.DLESS, "<<", pos, startLine, startColumn);
     }
+    // Process substitution: `<(cmd)` / `>(cmd)`. The `(` must be immediately
+    // adjacent — `< (cmd)` stays an input redirection (and a syntax error in
+    // bash). This is a word-level construct, not a redirection operator, so
+    // read it as a word (which also folds in any adjacent prefix/suffix, e.g.
+    // `2>(cat)` is the single word `2` + the substitution). Inside `(( ))`,
+    // `>` is a comparison operator, so the rewrite is suppressed there.
+    if (
+      (c0 === "<" || c0 === ">") &&
+      c1 === "(" &&
+      this.dparenDepth === 0 &&
+      this.scanProcessSubstitution(pos) !== null
+    ) {
+      return this.readWord(pos, startLine, startColumn);
+    }
     // Special handling for (( and )) to track nested parentheses in arithmetic contexts
     // This is needed for C-style for loops: for (( n=0; n<(3-(1)); n++ ))
     if (c0 === "(" && c1 === "(") {
@@ -902,6 +916,13 @@ export class Lexer {
         // Extglob pattern - need slow path to handle it properly
         // Fall through to slow path below
       } else if (
+        (c === "<" || c === ">") &&
+        input[pos + 1] === "(" &&
+        this.dparenDepth === 0
+      ) {
+        // Process substitution glued to the word (`a<(cmd)`) - slow path
+        // concatenates it into the same word, matching bash.
+      } else if (
         // If we hit end or a simple delimiter, we can use the fast path result
         pos >= len ||
         c === " " ||
@@ -1081,6 +1102,29 @@ export class Lexer {
           pos++;
           col++;
           continue;
+        }
+
+        // Process substitution `<(cmd)` / `>(cmd)` is part of the word, so it
+        // must be consumed whole before `<`/`>` are treated as boundaries.
+        if (
+          (char === "<" || char === ">") &&
+          input[pos + 1] === "(" &&
+          this.dparenDepth === 0
+        ) {
+          const procSub = this.scanProcessSubstitution(pos);
+          if (procSub !== null) {
+            value += procSub.content;
+            for (let k = pos; k < procSub.end; k++) {
+              if (input[k] === "\n") {
+                ln++;
+                col = 0;
+              } else {
+                col++;
+              }
+            }
+            pos = procSub.end;
+            continue;
+          }
         }
 
         if (
@@ -2329,6 +2373,62 @@ export class Lexer {
     }
 
     return null;
+  }
+
+  /**
+   * Scan a process substitution `<(...)` / `>(...)` starting at the `<` or `>`.
+   *
+   * Tracks quoting and nesting so parens inside strings or nested
+   * substitutions do not close the construct early. Newlines are allowed
+   * (the body is an ordinary command list). Returns null when the parens are
+   * unbalanced, so the caller can fall back to plain redirection lexing and
+   * let the parser report the syntax error.
+   */
+  private scanProcessSubstitution(
+    startPos: number,
+  ): { content: string; end: number } | null {
+    const input = this.input;
+    const len = input.length;
+    let pos = startPos + 2; // Skip the `<(` / `>(`
+    let depth = 1;
+    let inSingleQuote = false;
+    let inDoubleQuote = false;
+
+    while (pos < len && depth > 0) {
+      const c = input[pos];
+
+      if (inSingleQuote) {
+        if (c === "'") inSingleQuote = false;
+        pos++;
+        continue;
+      }
+
+      if (c === "\\" && pos + 1 < len) {
+        pos += 2;
+        continue;
+      }
+
+      if (inDoubleQuote) {
+        if (c === '"') inDoubleQuote = false;
+        pos++;
+        continue;
+      }
+
+      if (c === "'") {
+        inSingleQuote = true;
+      } else if (c === '"') {
+        inDoubleQuote = true;
+      } else if (c === "(") {
+        depth++;
+      } else if (c === ")") {
+        depth--;
+      }
+      pos++;
+    }
+
+    if (depth !== 0) return null;
+
+    return { content: input.slice(startPos, pos), end: pos };
   }
 
   /**

@@ -384,7 +384,6 @@ The following test files are entirely skipped in `spec.test.ts`:
 - `builtin-trap-bash.test.sh`
 - `builtin-trap-err.test.sh`
 - `builtin-times.test.sh`
-- `process-sub.test.sh`
 
 ### Shell Features Not Implemented
 - `alias.test.sh` - alias expansion

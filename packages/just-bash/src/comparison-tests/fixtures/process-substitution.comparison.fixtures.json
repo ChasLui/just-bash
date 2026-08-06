@@ -1,0 +1,235 @@
+{
+  "01c325f4fd2df45d": {
+    "command": "cat <(cat <(echo deep))",
+    "files": {},
+    "stdout": "deep\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "058c28f8e9d915ea": {
+    "command": "x=1; cat <(x=2; echo $x); echo after=$x",
+    "files": {},
+    "stdout": "2\nafter=1\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "0efecfb8671f9a86": {
+    "command": "cat <(echo in) > >(sed 's/in/OUT/')",
+    "files": {},
+    "stdout": "OUT\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "15e473d07c753afb": {
+    "command": "printf 'a\\nb\\n' | tee >(grep -c b) > /dev/null",
+    "files": {},
+    "stdout": "1\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "2702326abcba5d31": {
+    "command": "echo '<(echo hi)' \"<(echo hi)\"",
+    "files": {},
+    "stdout": "<(echo hi) <(echo hi)\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "3e9af782dc7a5397": {
+    "command": "cat < <(printf 'a\\nb\\n')",
+    "files": {},
+    "stdout": "a\nb\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "429f9e9e2269b3c3": {
+    "command": "printf 'x\\n' | tee >(cat) >(cat) > /dev/null",
+    "files": {},
+    "stdout": "x\nx\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "437b3e98f8700886": {
+    "command": "cat <(echo hi) | tr a-z A-Z",
+    "files": {},
+    "stdout": "HI\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "46a63be8029de200": {
+    "command": "comm -12 <(sort -u x.txt) <(sort -u y.txt)",
+    "files": {
+      "x.txt": "b\na\nb\n",
+      "y.txt": "c\nb\n"
+    },
+    "stdout": "b\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "4cf2c6c0d221a282": {
+    "command": "paste <(printf 'a\\nb\\n') <(printf '1\\n2\\n')",
+    "files": {},
+    "stdout": "a\t1\nb\t2\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "520c1a8824b37972": {
+    "command": "cat <(echo one) <(echo two) <(echo three)",
+    "files": {},
+    "stdout": "one\ntwo\nthree\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "60f0f73c5f361df0": {
+    "command": "echo hi > >(tr a-z A-Z)",
+    "files": {},
+    "stdout": "HI\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "65895a2e77a67686": {
+    "command": "wc -c < <(printf 'abc') | tr -d ' '",
+    "files": {},
+    "stdout": "3\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "6be1bfc2d1a3991f": {
+    "command": "cat <(echo hi)",
+    "files": {},
+    "stdout": "hi\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "99a7207c139319bc": {
+    "command": "v=hello; cat <(echo $v)",
+    "files": {},
+    "stdout": "hello\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "acc9bbbbbf618f16": {
+    "command": "while read -r l; do echo \"got $l\"; done < <(printf '1\\n2\\n')",
+    "files": {},
+    "stdout": "got 1\ngot 2\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "adc3dbb2ce7f58b1": {
+    "command": "diff <(sort a.txt) <(sort b.txt) > /dev/null; echo rc=$?",
+    "files": {
+      "a.txt": "b\na\n",
+      "b.txt": "a\nb\n"
+    },
+    "stdout": "rc=0\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "b308d68722b9f342": {
+    "command": "grep -q zzz <(echo hi); echo rc=$?",
+    "files": {},
+    "stdout": "rc=1\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "b7173da4021b8a5c": {
+    "command": "echo hi > >(false); echo rc=$?",
+    "files": {},
+    "stdout": "rc=0\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "c39dc04d62db3b56": {
+    "command": "for (( i=0; i<(2); i++ )); do echo $i; done",
+    "files": {},
+    "stdout": "0\n1\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "c4203e60e96a23d3": {
+    "command": "echo ignored | grep -c . <(printf 'a\\nb\\n')",
+    "files": {},
+    "stdout": "2\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "d19e9297fa888368": {
+    "command": "echo <(true)",
+    "files": {},
+    "stdout": "/dev/fd/63\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "d4ecc99e492f5734": {
+    "command": "diff <(echo a) <(echo b) > /dev/null; echo rc=$?",
+    "files": {},
+    "stdout": "rc=1\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "df36ad323dff959b": {
+    "command": "echo <(true) <(true) <(true)",
+    "files": {},
+    "stdout": "/dev/fd/63 /dev/fd/62 /dev/fd/61\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "e6c3386822d3348a": {
+    "command": "echo a<(true)",
+    "files": {},
+    "stdout": "a/dev/fd/63\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "ec694650a83f0843": {
+    "command": "(( 3 > (1) )) && echo yes",
+    "files": {},
+    "stdout": "yes\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "eea422fbeef2eec8": {
+    "command": "cat <(echo a; exit 3); echo rc=$?",
+    "files": {},
+    "stdout": "a\nrc=0\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "f0530d91d94cfb55": {
+    "command": "echo 2>(true)",
+    "files": {},
+    "stdout": "2/dev/fd/63\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "f2b739f20b173244": {
+    "command": "cat <(false); echo rc=$?",
+    "files": {},
+    "stdout": "rc=0\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "f2fc4c2ce711d7d5": {
+    "command": "cat <(echo a; echo b)",
+    "files": {},
+    "stdout": "a\nb\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "ffb7e565962bcbd1": {
+    "command": "cat < (echo hi)",
+    "files": {},
+    "stdout": "",
+    "stderr": "/bin/bash: -c: line 0: syntax error near unexpected token `('\n/bin/bash: -c: line 0: `cat < (echo hi)'\n",
+    "exitCode": 2,
+    "locked": true
+  }
+}

@@ -92,6 +92,7 @@ import {
 } from "./helpers/ifs.js";
 import { isNameref, resolveNameref } from "./helpers/nameref.js";
 import { getLiteralValue, isQuotedPart } from "./helpers/word-parts.js";
+import { openProcessSubstitution } from "./process-substitution.js";
 import type { InterpreterContext } from "./types.js";
 
 // Re-export extracted functions for use elsewhere
@@ -642,7 +643,15 @@ export async function expandRedirectTarget(
 
   // Skip glob expansion if noglob is set (set -f) or if the word was quoted
   // Check these BEFORE building glob pattern to avoid double-expanding side-effectful expressions
-  if (hasQuoted || ctx.state.options.noglob) {
+  // A process substitution is side-effectful in the same way: it has already
+  // opened a descriptor above, and re-expanding the word to build a glob
+  // pattern would open a second one. The substituted /dev/fd path never
+  // contains glob metacharacters, so there is nothing to match anyway.
+  if (
+    hasQuoted ||
+    ctx.state.options.noglob ||
+    wordParts.some((p) => p.type === "ProcessSubstitution")
+  ) {
     return { target: value };
   }
 
@@ -868,6 +877,9 @@ async function expandPart(
         throw error;
       }
     }
+
+    case "ProcessSubstitution":
+      return openProcessSubstitution(ctx, part);
 
     case "ArithmeticExpansion": {
       // If original text is available and contains $var patterns (not ${...}),
