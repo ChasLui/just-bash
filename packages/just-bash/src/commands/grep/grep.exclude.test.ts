@@ -116,7 +116,7 @@ describe("grep -L (files without match)", () => {
     expect(result.stdout).toBe("/dir/no-match.txt\n/dir/also-no-match.txt\n");
   });
 
-  it("should return exit code 0 when files without match found", async () => {
+  it("should return exit code 0 when at least one file matched", async () => {
     const env = new Bash({
       files: {
         "/file1.txt": "hello",
@@ -128,7 +128,9 @@ describe("grep -L (files without match)", () => {
     expect(result.stdout).toBe("/file2.txt\n");
   });
 
-  it("should return exit code 1 when all files have matches", async () => {
+  // GNU grep 3.12: `grep -L hello file1 file2` with both files matching prints
+  // nothing and exits 0 — the status tracks selected lines, not printed names.
+  it("should return exit code 0 when all files have matches", async () => {
     const env = new Bash({
       files: {
         "/file1.txt": "hello",
@@ -136,7 +138,7 @@ describe("grep -L (files without match)", () => {
       },
     });
     const result = await env.exec("grep -L hello /file1.txt /file2.txt");
-    expect(result.exitCode).toBe(1);
+    expect(result.exitCode).toBe(0);
     expect(result.stdout).toBe("");
   });
 

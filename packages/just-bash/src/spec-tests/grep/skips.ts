@@ -149,7 +149,28 @@ const SKIP_TESTS: Map<string, string> = new Map<string, string>([
   ],
 
   // -L option (print files without matches)
-  ["busybox-grep.tests:grep -L exitcode 0", "-L option not implemented"],
+  //
+  // BusyBox deliberately inverts -L's exit status — its own comment above these
+  // two cases reads "-L ... has inverted exitcode (if it printed something,
+  // it's 'success')". GNU grep 3.12 and BSD grep both disagree: the status
+  // reports whether a *line was selected*, not whether a *name was printed*.
+  // Measured with GNU grep 3.12 and BSD grep 2.6.0-FreeBSD, `input` holding
+  // one line:
+  //
+  //   input="asd" -> `grep -L qwe input` prints "input", exits 1 (BusyBox: 0)
+  //   input="qwe" -> `grep -L qwe input` prints nothing, exits 0 (BusyBox: 1)
+  //
+  // just-bash follows GNU, so both cases are expected to fail here.
+  // ("grep -L exitcode 0 #2" is skipped above for an unrelated reason — its
+  // expectation is mixed input and does agree with GNU; it just needs `-`.)
+  [
+    "busybox-grep.tests:grep -L exitcode 0",
+    "BusyBox inverts -L exit status; just-bash follows GNU/BSD",
+  ],
+  [
+    "busybox-grep.tests:grep -L exitcode 1",
+    "BusyBox inverts -L exit status; just-bash follows GNU/BSD",
+  ],
 
   // -o option (only matching) - edge cases
   [

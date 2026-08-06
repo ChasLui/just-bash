@@ -1,0 +1,408 @@
+{
+  "009b770e4d52e66b": {
+    "command": "grep -L hello n1.txt missing.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "n1.txt\n",
+    "stderr": "grep: missing.txt: No such file or directory\n",
+    "exitCode": 2,
+    "locked": true
+  },
+  "01d40dba5bc939ae": {
+    "command": "grep -L -q hello m1.txt m2.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "0a10969c7052bbb9": {
+    "command": "grep -L hello n1.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "n1.txt\n",
+    "stderr": "",
+    "exitCode": 1,
+    "locked": true
+  },
+  "0f829363d4be0682": {
+    "command": "grep -L -c hello m1.txt m2.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "1b04a52005e33152": {
+    "command": "grep --files-without-match hello m1.txt m2.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "1c64dbbff705e888": {
+    "command": "grep -L -q hello m1.txt n1.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "207e929298a0994d": {
+    "command": "grep -L hello n1.txt n2.txt; echo status=$?",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "n1.txt\nn2.txt\nstatus=1\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "214274828240cd29": {
+    "command": "grep -L -c hello n1.txt n2.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "n1.txt\nn2.txt\n",
+    "stderr": "",
+    "exitCode": 1,
+    "locked": true
+  },
+  "2262b30f3f1ef888": {
+    "command": "grep -l hello n1.txt n2.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "",
+    "stderr": "",
+    "exitCode": 1,
+    "locked": true
+  },
+  "39aa27a4fd38ee90": {
+    "command": "grep --files-without-match hello n1.txt n2.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "n1.txt\nn2.txt\n",
+    "stderr": "",
+    "exitCode": 1,
+    "locked": true
+  },
+  "43ccef00eaa53b73": {
+    "command": "grep -l hello m1.txt n1.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "m1.txt\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "468791bf3e6d4af8": {
+    "command": "if grep -L hello n1.txt n2.txt >/dev/null; then echo yes; else echo no; fi",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "no\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "570ef3aaae0c5262": {
+    "command": "grep -L hello missing.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "",
+    "stderr": "grep: missing.txt: No such file or directory\n",
+    "exitCode": 2,
+    "locked": true
+  },
+  "574840e45c157cdc": {
+    "command": "grep -L hello m1.txt missing.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "",
+    "stderr": "grep: missing.txt: No such file or directory\n",
+    "exitCode": 2,
+    "locked": true
+  },
+  "574a3323d5002714": {
+    "command": "grep -L -m 1 hello m1.txt n1.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "n1.txt\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "5a5f46cfc6515816": {
+    "command": "grep -L -q hello n1.txt n2.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "",
+    "stderr": "",
+    "exitCode": 1,
+    "locked": true
+  },
+  "5b8adc3899c43896": {
+    "command": "grep -L hello m1.txt m2.txt; echo status=$?",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "status=0\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "7df6db4b52749304": {
+    "command": "grep -L hello m1.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "81ea328383db77f9": {
+    "command": "grep -l hello m1.txt m2.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "m1.txt\nm2.txt\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "83f57d5a494cdaa1": {
+    "command": "grep -L hello m1.txt n1.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "n1.txt\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "a30de201cb61f42e": {
+    "command": "grep -L hello m1.txt m2.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "ae62b94bc5450d2e": {
+    "command": "grep -L -q hello m1.txt missing.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "aff4ca10b0584c67": {
+    "command": "grep -L -c hello m1.txt n1.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "n1.txt\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "b4df228b24cdd393": {
+    "command": "if grep -L hello m1.txt m2.txt >/dev/null; then echo yes; else echo no; fi",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "yes\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "ba01bcd1a77f25b3": {
+    "command": "grep -L hello empty.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "empty.txt\n",
+    "stderr": "",
+    "exitCode": 1,
+    "locked": true
+  },
+  "c785a217d4aa37cd": {
+    "command": "grep -L -n hello m1.txt n1.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "n1.txt\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "ce67dfb9d3ab2b88": {
+    "command": "grep -L -v hello m1.txt n2.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "d5166ed017f4a6b6": {
+    "command": "grep -L -o hello m1.txt n1.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "n1.txt\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "d639fec203c7dffc": {
+    "command": "grep -L hello n1.txt n2.txt",
+    "files": {
+      "m1.txt": "hello\nworld\n",
+      "m2.txt": "hello there\n",
+      "n1.txt": "nothing here\n",
+      "n2.txt": "nope\n",
+      "empty.txt": ""
+    },
+    "stdout": "n1.txt\nn2.txt\n",
+    "stderr": "",
+    "exitCode": 1,
+    "locked": true
+  }
+}

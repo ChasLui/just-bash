@@ -722,13 +722,18 @@ export const grepCommand: RuntimeCommand = {
       }
     }
 
-    // Exit codes: 0 = match found (or files without match for -L), 1 = no match, 2 = error
-    // For -L, success means we found files without matches (stdout has content)
+    // Exit codes: 0 = a line was selected, 1 = no line was selected, 2 = error.
+    //
+    // -L deliberately does NOT get its own rule. GNU grep's status reports
+    // whether a line was *selected*, never whether a filename was *printed*, so
+    // `grep -L` exits 0 when every file matched (and it printed nothing) and 1
+    // when no file matched (and it listed them all). Verified against GNU grep
+    // 3.12 and BSD grep 2.6.0-FreeBSD; note that ripgrep 15.1.0's
+    // --files-without-match really does invert this, which is why
+    // src/commands/rg/rg-search.ts keeps the opposite rule on purpose.
     let exitCode: number;
     if (anyError) {
       exitCode = 2;
-    } else if (filesWithoutMatch) {
-      exitCode = stdout.length > 0 ? 0 : 1;
     } else {
       exitCode = anyMatch ? 0 : 1;
     }

@@ -1349,6 +1349,17 @@ async function searchFiles(
   // Exit codes:
   // - For --files-without-match: 0 if files without matches found, 1 otherwise
   // - For normal mode: 0 if any matches found, 1 otherwise
+  //
+  // The --files-without-match rule below is NOT a copy of grep's and must not
+  // be "fixed" to agree with it: ripgrep really does invert the status here,
+  // where GNU grep does not. Measured with ripgrep 15.1.0 against GNU grep
+  // 3.12, over two files where only the first contains the pattern:
+  //
+  //   both files match -> rg prints nothing, exits 1; grep -L exits 0
+  //   neither matches  -> rg lists both,     exits 0; grep -L exits 1
+  //   mixed            -> both list the miss and exit 0
+  //
+  // See the matching note in src/commands/grep/grep.ts.
   let exitCode: number;
   if (options.filesWithoutMatch) {
     // Success means we found files without matches (stdout has content)
