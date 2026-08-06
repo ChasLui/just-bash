@@ -1,0 +1,269 @@
+{
+  "067bfd45d4b8689f": {
+    "command": "{ echo piped | read v; echo \"v=[$v]\"; read b; echo \"b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\n"
+    },
+    "stdout": "v=[]\nb=[L1]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "0bdbc43af02c15df": {
+    "command": "n=0; while read a; do n=$((n+1)); echo a | cat | cat >/dev/null; done < loop.txt; echo \"iterations: $n\"",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "iterations: 5\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "1f0bd0d9d6f88e08": {
+    "command": "{ echo start | cat >/dev/null; while read l; do echo \"L:$l\"; done; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\n"
+    },
+    "stdout": "L:L1\nL:L2\nL:L3\nL:L4\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "247b15d3ec600ec1": {
+    "command": "n=0; while read a; do n=$((n+1)); echo x | echo y >/dev/null; done < loop.txt; echo \"iterations: $n\"",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "iterations: 5\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "252eac5ac03b4310": {
+    "command": "{ echo A | cat; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\n"
+    },
+    "stdout": "A\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "3367cedd2220bae9": {
+    "command": "n=0; while read a; do n=$((n+1)); (echo x | cat) >/dev/null; done < loop.txt; echo \"iterations: $n\"",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "iterations: 5\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "357b2448ab3a26ea": {
+    "command": "{ read a; false | true | false; echo \"${PIPESTATUS[*]}\"; read b; echo \"b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\n"
+    },
+    "stdout": "1 0 1\nb=[L2]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "3805b8825aa4aa95": {
+    "command": "n=0; while read a; do n=$((n+1)); printf 'x\\ny\\n' | sed 1q >/dev/null; done < loop.txt; echo \"iterations: $n\"",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "iterations: 5\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "3ee15c0daacbb7c2": {
+    "command": "{ cat | tr a-z A-Z; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\n"
+    },
+    "stdout": "L1\nL2\nL3\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "4c24906786b6c22a": {
+    "command": "n=0; while read a; do n=$((n+1)); echo hi | head -1 >/dev/null; done < loop.txt; echo \"iterations: $n\"",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "iterations: 5\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "527a291347cbfe0c": {
+    "command": "{ true | cat; echo \"---\"; read b; echo \"b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\n"
+    },
+    "stdout": "---\nb=[L1]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "5305a9b560761fe3": {
+    "command": "while read o; do while read i; do echo \"$o$i\"; echo x | cat >/dev/null; done < inner.txt; done < outer.txt",
+    "files": {
+      "outer.txt": "A\nB\n",
+      "inner.txt": "1\n2\n"
+    },
+    "stdout": "A1\nA2\nB1\nB2\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "61802d57a1027706": {
+    "command": "f() { echo x | cat >/dev/null; }; n=0; while read a; do n=$((n+1)); f; done < loop.txt; echo \"iterations: $n\"",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "iterations: 5\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "640c900ad55dae76": {
+    "command": "{ read a; true | true; read b; echo \"a=[$a] b=[$b]\"; } <<EOT\nL1\nL2\nEOT\n",
+    "files": {},
+    "stdout": "a=[L1] b=[L2]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "6723871c6848c7a5": {
+    "command": "n=0; while read a; do n=$((n+1)); { echo x | cat; } >/dev/null; done < loop.txt; echo \"iterations: $n\"",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "iterations: 5\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "7849e9a46d0b9783": {
+    "command": "n=0; while read a; do n=$((n+1)); { echo x; } >/dev/null; done < loop.txt; echo \"iterations: $n\"",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "iterations: 5\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "7cbc3e72faddada6": {
+    "command": "n=0; while read a; do n=$((n+1)); eval 'echo x | cat' >/dev/null; done < loop.txt; echo \"iterations: $n\"",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "iterations: 5\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "8a186d05bd45d915": {
+    "command": "{ read a; (exit 3) | true; read b; echo \"a=[$a] b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\n"
+    },
+    "stdout": "a=[L1] b=[L2]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "987819a6133437f4": {
+    "command": "n=0; while read a; do n=$((n+1)); ! echo a | grep -q zzz; done < loop.txt; echo \"iterations: $n\"",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "iterations: 5\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "aa0d5baa225de03c": {
+    "command": "{ echo abc | grep zzz | head -1; echo \"---\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\n"
+    },
+    "stdout": "---\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "b672a71408ce1733": {
+    "command": "while read a; do echo \"got:$a\"; echo z | cat >/dev/null; done < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\n"
+    },
+    "stdout": "got:L1\ngot:L2\ngot:L3\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "bd4e4acb30172b2a": {
+    "command": "n=0; while read a; do n=$((n+1)); echo abc | tr a-z A-Z >/dev/null; done < loop.txt; echo \"iterations: $n\"",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "iterations: 5\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "beb3877d77781923": {
+    "command": "n=0; while read a; do n=$((n+1)); :; done < loop.txt; echo \"iterations: $n\"",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "iterations: 5\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "ca8f2263542e394f": {
+    "command": "n=0; while echo y | grep -q y && read a; do n=$((n+1)); done < loop.txt; echo \"iterations: $n\"",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\n"
+    },
+    "stdout": "iterations: 3\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "e62a982bec2718ee": {
+    "command": "n=0; while read a; do n=$((n+1)); case x in x) echo q | cat;; esac >/dev/null; done < loop.txt; echo \"iterations: $n\"",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "iterations: 5\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "e67133f20adda947": {
+    "command": "{ read a; echo \"a=[$a]\"; true | true; read b; echo \"b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\n"
+    },
+    "stdout": "a=[L1]\nb=[L2]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "e9e20f01dcb7a424": {
+    "command": "n=0; while read a; do n=$((n+1)); true | true; done <<< $'L1\\nL2\\nL3'; echo \"iterations: $n\"",
+    "files": {},
+    "stdout": "iterations: 3\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "ed0c2dc6faa76ac4": {
+    "command": "n=0; while read a; do n=$((n+1)); true | true; done < loop.txt; echo \"iterations: $n\"",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "iterations: 5\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "f1a73290817552a7": {
+    "command": "{ read x | cat; read b; echo \"b=[$b]\"; } < loop.txt",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\n"
+    },
+    "stdout": "b=[L2]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "f88e82bcef99cf53": {
+    "command": "n=0; while read a; do n=$((n+1)); for i in 1 2; do echo x | cat; done >/dev/null; done < loop.txt; echo \"iterations: $n\"",
+    "files": {
+      "loop.txt": "L1\nL2\nL3\nL4\nL5\n"
+    },
+    "stdout": "iterations: 5\n",
+    "stderr": "",
+    "exitCode": 0
+  }
+}

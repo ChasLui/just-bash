@@ -50,6 +50,15 @@ export async function executePipeline(
   const isMultiCommandPipeline = node.commands.length > 1;
   const savedLastArg = ctx.state.lastArg;
 
+  // The enclosing shell's stdin (`< file`, `<<<`, a heredoc on a compound
+  // command, ...). Bash gives the first pipeline stage the shell's fd 0 and
+  // gives every later stage the previous stage's stdout, so only the first
+  // stage can move the shared read position — and only by actually reading.
+  // Running a pipeline is not itself a read: `true | true` must leave the
+  // position where it was. This variable carries that position across
+  // stages so the pipeline can hand it back afterwards.
+  let sharedStdin = ctx.state.groupStdin;
+
   for (let i = 0; i < node.commands.length; i++) {
     const command = node.commands[i];
     const isLast = i === node.commands.length - 1;
@@ -61,13 +70,11 @@ export async function executePipeline(
       // Clear $_ for each pipeline command - they each get fresh subshell context
       ctx.state.lastArg = "";
 
-      // After the first command, clear groupStdin so subsequent commands
-      // only see stdin from the pipeline (even if empty), not the original groupStdin
-      // This prevents commands like head from incorrectly falling back to groupStdin
-      // when they receive empty output from a previous command (e.g., grep with no matches)
-      if (!isFirst) {
-        ctx.state.groupStdin = undefined;
-      }
+      // Only the first stage inherits the shell's stdin. Later stages read
+      // the previous stage's stdout — even when that output is empty — so
+      // hide groupStdin from them; otherwise a command like `head` that got
+      // nothing from `grep` would silently fall back to the shell's stdin.
+      ctx.state.groupStdin = isFirst ? sharedStdin : undefined;
     }
 
     // Determine if this command runs in a subshell context
@@ -119,6 +126,18 @@ export async function executePipeline(
           ctx.state.arrays = savedArrays ?? new Map();
         }
         throw error;
+      }
+    } finally {
+      if (isMultiCommandPipeline) {
+        // The first stage held the shell's stdin, so whatever it consumed
+        // (a `read` builtin advances the position, `true` does not) is now
+        // the shared position. Every stage — including one that threw —
+        // hands that position back to the enclosing shell, so the pipeline
+        // itself never drains stdin.
+        if (isFirst) {
+          sharedStdin = ctx.state.groupStdin;
+        }
+        ctx.state.groupStdin = sharedStdin;
       }
     }
 
