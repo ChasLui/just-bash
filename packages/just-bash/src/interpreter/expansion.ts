@@ -203,9 +203,8 @@ export async function expandWordForRegex(
   const parts: string[] = [];
   for (const part of word.parts) {
     if (part.type === "Escaped") {
-      // For regex patterns, preserve ALL backslash escapes
-      // This allows \[ \] \. \* etc. to work as regex escapes
-      parts.push(`\\${part.value}`);
+      // Quoting makes this character literal in the regular expression.
+      parts.push(escapeRegexChars(part.value));
     } else if (part.type === "SingleQuoted") {
       // Single-quoted content is literal in regex
       parts.push(part.value);

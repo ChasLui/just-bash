@@ -526,7 +526,6 @@ four
 ## END
 
 #### Alias and command sub (bug regression)
-## SKIP (unimplementable): alias expansion not implemented - parsing happens before execution
 cd $TMP
 shopt -s expand_aliases
 echo foo bar > tmp.txt
@@ -535,7 +534,6 @@ a `cat tmp.txt`
 ## stdout: ['foo', 'bar']
 
 #### Alias and arithmetic
-## SKIP (unimplementable): alias expansion not implemented - parsing happens before execution
 shopt -s expand_aliases
 alias a=argv.py
 a $((1 + 2))

@@ -8,16 +8,19 @@
  * Also includes helpers for function source serialization.
  */
 
-import type {
-  CommandNode,
-  FunctionDefNode,
-  GroupNode,
-  PipelineNode,
-  SimpleCommandNode,
-  StatementNode,
-  WordNode,
+import {
+  AST,
+  type CommandNode,
+  type FunctionDefNode,
+  type GroupNode,
+  type PipelineNode,
+  type SimpleCommandNode,
+  type StatementNode,
+  type WordNode,
+  type WordPart,
 } from "../ast/types.js";
 import type { IFileSystem } from "../fs/interface.js";
+import { serializeWord } from "../transform/serialize.js";
 import type { CommandRegistry, ExecResult } from "../types.js";
 import { result } from "./helpers/result.js";
 import { SHELL_BUILTINS, SHELL_KEYWORDS } from "./helpers/shell-constants.js";
@@ -332,10 +335,10 @@ function serializeCompoundCommand(
     const cmd = node as SimpleCommandNode;
     const parts: string[] = [];
     if (cmd.name) {
-      parts.push(serializeWord(cmd.name));
+      parts.push(serializeFunctionWord(cmd.name));
     }
     for (const arg of cmd.args) {
-      parts.push(serializeWord(arg));
+      parts.push(serializeFunctionWord(arg));
     }
     return parts.join(" ");
   }
@@ -350,38 +353,28 @@ function serializeCompoundCommand(
   return "...";
 }
 
+function serializeFunctionWord(word: WordNode): string {
+  return word.parts.map(serializeFunctionWordPart).join("");
+}
+
+function serializeFunctionWordPart(part: WordPart): string {
+  switch (part.type) {
+    case "Literal":
+      return part.value;
+    case "Escaped":
+      return `\\${part.value}`;
+    case "SingleQuoted":
+      return `'${part.value}'`;
+    case "DoubleQuoted":
+      return `"${part.parts.map(serializeFunctionWordPart).join("")}"`;
+    default:
+      return serializeWord(AST.word([part]));
+  }
+}
+
 function serializePipeline(pipeline: PipelineNode): string {
   const parts = pipeline.commands.map((cmd) => serializeCompoundCommand(cmd));
   return (pipeline.negated ? "! " : "") + parts.join(" | ");
-}
-
-function serializeWord(word: WordNode): string {
-  // Simple serialization - just concatenate parts
-  let result = "";
-  for (const part of word.parts) {
-    if (part.type === "Literal") {
-      result += part.value;
-    } else if (part.type === "DoubleQuoted") {
-      result += `"${part.parts.map((p) => serializeWordPart(p)).join("")}"`;
-    } else if (part.type === "SingleQuoted") {
-      result += `'${part.value}'`;
-    } else {
-      result += serializeWordPart(part);
-    }
-  }
-  return result;
-}
-
-function serializeWordPart(part: unknown): string {
-  const p = part as { type: string; value?: string; name?: string };
-  if (p.type === "Literal") {
-    return p.value ?? "";
-  }
-  if (p.type === "Variable") {
-    return `$${p.name}`;
-  }
-  // For other part types, return empty or placeholder
-  return "";
 }
 
 /**

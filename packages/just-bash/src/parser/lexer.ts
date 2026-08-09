@@ -1323,39 +1323,9 @@ export class Lexer {
             continue;
           }
         } else {
-          // Outside quotes, backslash escapes next character
-          // Keep the backslash for:
-          // - backslash itself (so parser can distinguish \\ from \)
-          // - quotes (so parser knows they're escaped)
-          // - glob metacharacters (so parser creates Escaped nodes that won't be glob-expanded)
-          // - parentheses (so \( and \) are treated as literal, not extglob operators)
-          // - dollar sign (so \$ in regex patterns creates Escaped("$") for literal $ matching)
-          // - dash (so \- inside character classes is literal dash, not range)
-          // - regex metacharacters (so \. \^ \+ \{ \} work in [[ =~ ]] patterns)
-          if (
-            nextChar === "\\" ||
-            nextChar === '"' ||
-            nextChar === "'" ||
-            nextChar === "`" ||
-            nextChar === "*" ||
-            nextChar === "?" ||
-            nextChar === "[" ||
-            nextChar === "]" ||
-            nextChar === "(" ||
-            nextChar === ")" ||
-            nextChar === "$" ||
-            nextChar === "-" ||
-            // Regex-specific metacharacters for [[ =~ ]] patterns
-            nextChar === "." ||
-            nextChar === "^" ||
-            nextChar === "+" ||
-            nextChar === "{" ||
-            nextChar === "}"
-          ) {
-            value += char + nextChar;
-          } else {
-            value += nextChar;
-          }
+          // Preserve the escape until word parsing so token classification can
+          // distinguish escaped text from shell syntax.
+          value += char + nextChar;
           pos += 2;
           col += 2;
           continue;

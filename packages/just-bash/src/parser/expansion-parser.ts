@@ -17,6 +17,23 @@ import type { Parser } from "./parser.js";
 import { ParseException } from "./types.js";
 import * as WordParser from "./word-parser.js";
 
+function normalizeRegexBracketEscapes(pattern: string): string {
+  let normalized = "";
+  for (let index = 0; index < pattern.length; index++) {
+    const character = pattern[index];
+    const escaped = pattern[index + 1];
+    if (character !== "\\" || escaped === undefined) {
+      normalized += character;
+      continue;
+    }
+
+    if ("\\[]^-".includes(escaped)) normalized += "\\";
+    normalized += escaped;
+    index++;
+  }
+  return normalized;
+}
+
 /** Ensure a word-parts array is non-empty (use empty-string literal as fallback). */
 function ensureNonEmpty(parts: WordPart[]): WordPart[] {
   return parts.length > 0 ? parts : [AST.literal("")];
@@ -127,7 +144,7 @@ function parseParameterExpansion(
   // Handle array subscript
   if (value[i] === "[") {
     const closeIdx = WordParser.findMatchingBracket(p, value, i, "[", "]");
-    name += value.slice(i, closeIdx + 1);
+    name += `[${WordParser.quoteRemoveEscapes(value.slice(i + 1, closeIdx))}]`;
     i = closeIdx + 1;
 
     // Check for multiple subscripts like ${a[0][0]} - this is invalid syntax
@@ -887,14 +904,8 @@ export function parseWordParts(
   while (i < value.length) {
     const char = value[i];
 
-    // Handle escape sequences
-    // In unquoted context, only certain characters are escapable
-    // In here-docs, only $, `, \, newline are escapable (NOT ")
-    // In regular words, $, `, \, ", newline are escapable
-    // Glob metacharacters (*, ?, [, ]) when escaped should create Escaped nodes
-    // so they're treated as literals during globbing
-    // In regex patterns, ALL escaped characters create Escaped nodes so the backslash
-    // is preserved for the regex engine (e.g., \$ matches literal $)
+    // Handle escape sequences. Unquoted words preserve every escape as an
+    // Escaped part, while here-docs and double quotes use narrower rules.
     if (char === "\\" && i + 1 < value.length) {
       const next = value[i + 1];
 
@@ -907,8 +918,16 @@ export function parseWordParts(
         continue;
       }
 
-      // Characters that should be escaped (result in just the literal char)
-      // Inside parameter expansion default values, \} is also escapable to produce }
+      if (!hereDoc && !singleQuotesAreLiteral) {
+        if (next !== "\n") {
+          flushLiteral();
+          parts.push(AST.escaped(next));
+        }
+        i += 2;
+        continue;
+      }
+
+      // Handle the narrower here-doc and double-quote escape sets.
       const isEscapable = hereDoc
         ? next === "$" || next === "`" || next === "\n"
         : next === "$" ||
@@ -1055,7 +1074,10 @@ export function parseWordParts(
     if (char === "*" || char === "?" || char === "[") {
       flushLiteral();
       const { pattern, endIndex } = WordParser.parseGlobPattern(p, value, i);
-      parts.push({ type: "Glob", pattern });
+      parts.push({
+        type: "Glob",
+        pattern: regexPattern ? normalizeRegexBracketEscapes(pattern) : pattern,
+      });
       i = endIndex;
       continue;
     }

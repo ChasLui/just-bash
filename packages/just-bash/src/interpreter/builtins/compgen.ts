@@ -22,6 +22,7 @@
  *   compgen -o option             - Completion option (plusdirs, dirnames, default, etc.)
  */
 
+import { AST, type WordPart } from "../../ast/types.js";
 import { BoundedStringBuilder } from "../../bounded-builder.js";
 import { utf8ByteLength } from "../../encoding.js";
 import { type ParseException, Parser, parse } from "../../parser/parser.js";
@@ -39,6 +40,14 @@ import {
 } from "../helpers/array.js";
 import { failure, result, success } from "../helpers/result.js";
 import type { InterpreterContext } from "../types.js";
+
+const preserveWordlistEscapes = (part: WordPart): WordPart => {
+  if (part.type === "Escaped") return AST.literal(`\\${part.value}`);
+  if (part.type === "DoubleQuoted") {
+    return { ...part, parts: part.parts.map(preserveWordlistEscapes) };
+  }
+  return part;
+};
 
 // List of shell keywords (matches bash)
 const SHELL_KEYWORDS = [
@@ -1039,8 +1048,11 @@ async function expandWordlistString(
   // Parse the wordlist as a word (not in quotes, so expansions apply)
   const wordNode = parser.parseWordFromString(wordlist, false, false);
   // Expand the word - this handles $(), ${}, etc.
-  // Errors (like arithmetic errors) will propagate up
-  return await expandWord(ctx, wordNode);
+  // Preserve escaped IFS characters for splitWordlist to consume.
+  return await expandWord(
+    ctx,
+    AST.word(wordNode.parts.map(preserveWordlistEscapes)),
+  );
 }
 
 /**

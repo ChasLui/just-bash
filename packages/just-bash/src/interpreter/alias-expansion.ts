@@ -14,6 +14,7 @@ import type { ScriptNode, SimpleCommandNode, WordNode } from "../ast/types.js";
 import { utf8ByteLength } from "../commands/printf/escapes.js";
 import { Parser } from "../parser/parser.js";
 import { ParseException } from "../parser/types.js";
+import { serializeWord } from "../transform/serialize.js";
 import { ExecutionLimitError } from "./errors.js";
 
 /**
@@ -139,7 +140,7 @@ function expandAliasOnce(
     if (!expandNext) {
       // Convert args to strings for re-parsing
       for (const arg of node.args) {
-        const argLiteral = wordNodeToString(arg);
+        const argLiteral = serializeWord(arg);
         fullCommand = appendBounded(
           fullCommand,
           ` ${argLiteral}`,
@@ -273,7 +274,7 @@ function handleComplexAlias(
     fullCommandBytes,
   );
   for (const arg of node.args) {
-    const argLiteral = wordNodeToString(arg);
+    const argLiteral = serializeWord(arg);
     fullCommand = appendBounded(
       fullCommand,
       ` ${argLiteral}`,
@@ -313,46 +314,4 @@ function handleComplexAlias(
     redirections: node.redirections,
     line: node.line,
   };
-}
-
-/**
- * Convert a WordNode back to a string representation for re-parsing.
- * This is a simplified conversion that handles common cases.
- */
-function wordNodeToString(word: WordNode): string {
-  let result = "";
-  for (const part of word.parts) {
-    switch (part.type) {
-      case "Literal":
-        // Escape special characters
-        result += part.value.replace(/([\s"'$`\\*?[\]{}()<>|&;#!])/g, "\\$1");
-        break;
-      case "SingleQuoted":
-        result += `'${part.value}'`;
-        break;
-      case "DoubleQuoted":
-        // Handle double-quoted content
-        result += `"${part.parts.map((p) => (p.type === "Literal" ? p.value : `$${p.type}`)).join("")}"`;
-        break;
-      case "ParameterExpansion":
-        // Use braced form to be safe
-        result += `\${${part.parameter}}`;
-        break;
-      case "CommandSubstitution":
-        // CommandSubstitutionPart has body (ScriptNode), not command string
-        // We need to reconstruct - for simplicity, wrap in $(...)
-        result += `$(...)`;
-        break;
-      case "ArithmeticExpansion":
-        result += `$((${part.expression}))`;
-        break;
-      case "Glob":
-        result += part.pattern;
-        break;
-      default:
-        // For other types, try to preserve as-is
-        break;
-    }
-  }
-  return result;
 }

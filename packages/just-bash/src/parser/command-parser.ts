@@ -261,7 +261,7 @@ function parseAssignment(p: Parser): AssignmentNode {
     if (depth !== 0) {
       p.error(`Invalid assignment: ${value}`);
     }
-    subscript = value.slice(subscriptStart, pos);
+    subscript = WordParser.quoteRemoveEscapes(value.slice(subscriptStart, pos));
     pos++; // skip closing ]
   }
 
