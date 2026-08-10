@@ -13,6 +13,22 @@
     "stderr": "",
     "exitCode": 0
   },
+  "0cfa1441deec7d9a": {
+    "command": "cat <(cat <<EOF\n)\nEOF\n)",
+    "files": {},
+    "stdout": ")\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "0e55a56e27347e7b": {
+    "command": "echo a<(true)c",
+    "files": {},
+    "stdout": "a/dev/fd/63c\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
   "0efecfb8671f9a86": {
     "command": "cat <(echo in) > >(sed 's/in/OUT/')",
     "files": {},
@@ -25,6 +41,14 @@
     "command": "printf 'a\\nb\\n' | tee >(grep -c b) > /dev/null",
     "files": {},
     "stdout": "1\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "237551a8eb90e8b6": {
+    "command": "cat <(case x in x) echo case-ok;; esac)",
+    "files": {},
+    "stdout": "case-ok\n",
     "stderr": "",
     "exitCode": 0,
     "locked": true
@@ -171,6 +195,14 @@
     "stdout": "rc=1\n",
     "stderr": "",
     "exitCode": 0
+  },
+  "dd8cb505c2ee45b0": {
+    "command": "echo <(true)>(cat)",
+    "files": {},
+    "stdout": "/dev/fd/63/dev/fd/62\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
   },
   "df36ad323dff959b": {
     "command": "echo <(true) <(true) <(true)",

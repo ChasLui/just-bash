@@ -111,6 +111,8 @@ export interface Token {
   /** For WORD tokens: quote information */
   quoted?: boolean;
   singleQuoted?: boolean;
+  /** Quote-removed value for a here-document delimiter token. */
+  heredocDelimiter?: string;
 }
 
 /**
@@ -298,8 +300,8 @@ export class Lexer {
   private pendingHeredocs: {
     delimiter: string;
     stripTabs: boolean;
-    quoted: boolean;
   }[] = [];
+  private pendingHeredocDelimiterMode: boolean | undefined;
   // Track depth inside (( )) for C-style for loops and arithmetic commands
   // When > 0, we're inside (( )) and need to track nested parens
   private dparenDepth = 0;
@@ -390,6 +392,21 @@ export class Lexer {
     const c1 = input[pos + 1];
     const c2 = input[pos + 2];
 
+    const stripHeredocTabs = this.pendingHeredocDelimiterMode;
+    this.pendingHeredocDelimiterMode = undefined;
+    if (
+      stripHeredocTabs !== undefined &&
+      c0 !== "\n" &&
+      !(c0 === "#" && this.dparenDepth === 0)
+    ) {
+      return this.readHeredocDelimiterToken(
+        pos,
+        startLine,
+        startColumn,
+        stripHeredocTabs,
+      );
+    }
+
     // Comments - but NOT inside (( )) arithmetic context where # is part of base notation
     if (c0 === "#" && this.dparenDepth === 0) {
       return this.readComment(pos, startLine, startColumn);
@@ -415,7 +432,7 @@ export class Lexer {
     if (c0 === "<" && c1 === "<" && c2 === "-") {
       this.pos = pos + 3;
       this.column = startColumn + 3;
-      this.registerHeredocFromLookahead(true);
+      this.pendingHeredocDelimiterMode = true;
       return this.makeToken(
         TokenType.DLESSDASH,
         "<<-",
@@ -444,26 +461,30 @@ export class Lexer {
     if (c0 === "<" && c1 === "<") {
       this.pos = pos + 2;
       this.column = startColumn + 2;
-      this.registerHeredocFromLookahead(false);
+      this.pendingHeredocDelimiterMode = false;
       return this.makeToken(TokenType.DLESS, "<<", pos, startLine, startColumn);
-    }
-    // Process substitution: `<(cmd)` / `>(cmd)`. The `(` must be immediately
-    // adjacent — `< (cmd)` stays an input redirection (and a syntax error in
-    // bash). This is a word-level construct, not a redirection operator, so
-    // read it as a word (which also folds in any adjacent prefix/suffix, e.g.
-    // `2>(cat)` is the single word `2` + the substitution). Inside `(( ))`,
-    // `>` is a comparison operator, so the rewrite is suppressed there.
-    if (
-      (c0 === "<" || c0 === ">") &&
-      c1 === "(" &&
-      this.dparenDepth === 0 &&
-      this.scanProcessSubstitution(pos) !== null
-    ) {
-      return this.readWord(pos, startLine, startColumn);
     }
     // Special handling for (( and )) to track nested parentheses in arithmetic contexts
     // This is needed for C-style for loops: for (( n=0; n<(3-(1)); n++ ))
     if (c0 === "(" && c1 === "(") {
+      const previousToken = this.tokens[this.tokens.length - 1];
+      if (
+        this.dparenDepth === 0 &&
+        previousToken?.end === pos &&
+        (previousToken.type === TokenType.LESS ||
+          previousToken.type === TokenType.GREAT)
+      ) {
+        this.pos = pos + 1;
+        this.column = startColumn + 1;
+        return this.makeToken(
+          TokenType.LPAREN,
+          "(",
+          pos,
+          startLine,
+          startColumn,
+        );
+      }
+
       // If already inside arithmetic context, (( is just two open parens for grouping
       // Don't start a new arithmetic context
       if (this.dparenDepth > 0) {
@@ -922,13 +943,6 @@ export class Lexer {
         // Extglob pattern - need slow path to handle it properly
         // Fall through to slow path below
       } else if (
-        (c === "<" || c === ">") &&
-        input[pos + 1] === "(" &&
-        this.dparenDepth === 0
-      ) {
-        // Process substitution glued to the word (`a<(cmd)`) - slow path
-        // concatenates it into the same word, matching bash.
-      } else if (
         // If we hit end or a simple delimiter, we can use the fast path result
         pos >= len ||
         c === " " ||
@@ -1108,29 +1122,6 @@ export class Lexer {
           pos++;
           col++;
           continue;
-        }
-
-        // Process substitution `<(cmd)` / `>(cmd)` is part of the word, so it
-        // must be consumed whole before `<`/`>` are treated as boundaries.
-        if (
-          (char === "<" || char === ">") &&
-          input[pos + 1] === "(" &&
-          this.dparenDepth === 0
-        ) {
-          const procSub = this.scanProcessSubstitution(pos);
-          if (procSub !== null) {
-            value += procSub.content;
-            for (let k = pos; k < procSub.end; k++) {
-              if (input[k] === "\n") {
-                ln++;
-                col = 0;
-              } else {
-                col++;
-              }
-            }
-            pos = procSub.end;
-            continue;
-          }
         }
 
         if (
@@ -1428,7 +1419,22 @@ export class Lexer {
               while (input[p] === " " || input[p] === "\t") {
                 p++;
               }
-              const { delim, endPos } = readHeredocDelimiter(input, p);
+              const { delim, endPos, unclosedQuote, unclosedSubstitution } =
+                readHeredocDelimiter(input, p);
+              if (unclosedQuote) {
+                throw new LexerError(
+                  `unexpected EOF while looking for matching \`${unclosedQuote}'`,
+                  ln,
+                  col,
+                );
+              }
+              if (unclosedSubstitution) {
+                throw new LexerError(
+                  "unexpected EOF while looking for matching `)'",
+                  ln,
+                  col,
+                );
+              }
               if (delim.length > 0) {
                 // The first `<` was already appended at the top of the loop;
                 // append the rest through the delimiter and advance past all of
@@ -2004,97 +2010,65 @@ export class Lexer {
     }
   }
 
-  /**
-   * Register a here-document to be read after the next newline
-   */
-  addPendingHeredoc(
-    delimiter: string,
+  private readHeredocDelimiterToken(
+    start: number,
+    line: number,
+    column: number,
     stripTabs: boolean,
-    quoted: boolean,
-  ): void {
-    this.pendingHeredocs.push({ delimiter, stripTabs, quoted });
-  }
-
-  /**
-   * Look ahead from current position to find the here-doc delimiter
-   * and register it as a pending here-doc
-   */
-  private registerHeredocFromLookahead(stripTabs: boolean): void {
-    // Save position (we're just looking ahead, the actual tokens will be parsed later)
-    const savedPos = this.pos;
-    const savedColumn = this.column;
-
-    // Skip whitespace (but not newlines)
-    while (
-      this.pos < this.input.length &&
-      (this.input[this.pos] === " " || this.input[this.pos] === "\t")
-    ) {
-      this.pos++;
-      this.column++;
+  ): Token {
+    const input = this.input;
+    const {
+      delim: delimiter,
+      endPos,
+      quoted,
+      unclosedQuote,
+      unclosedSubstitution,
+    } = readHeredocDelimiter(input, start);
+    if (unclosedQuote) {
+      throw new LexerError(
+        `unexpected EOF while looking for matching \`${unclosedQuote}'`,
+        line,
+        column,
+      );
+    }
+    if (unclosedSubstitution) {
+      throw new LexerError(
+        "unexpected EOF while looking for matching `)'",
+        line,
+        column,
+      );
+    }
+    if (endPos === start) {
+      throw new LexerError("Expected here-document delimiter", line, column);
     }
 
-    // Read the delimiter - may be composed of multiple quoted/unquoted segments
-    // e.g., 'EOF'"2" -> EOF2, EOF -> EOF, "EOF" -> EOF
-    let delimiter = "";
-    let quoted = false;
-
-    // Keep reading segments until we hit whitespace or operator
-    while (this.pos < this.input.length) {
-      const char = this.input[this.pos];
-
-      // Stop at whitespace or operators
-      if (/[\s;<>&|()]/.test(char)) {
-        break;
-      }
-
-      if (char === "'" || char === '"') {
-        // Quoted segment - any quoting makes the whole delimiter quoted
-        quoted = true;
-        const quoteChar = char;
-        this.pos++;
-        this.column++;
-        while (
-          this.pos < this.input.length &&
-          this.input[this.pos] !== quoteChar
-        ) {
-          delimiter += this.input[this.pos];
-          this.pos++;
-          this.column++;
-        }
-        // Skip closing quote
-        if (
-          this.pos < this.input.length &&
-          this.input[this.pos] === quoteChar
-        ) {
-          this.pos++;
-          this.column++;
-        }
-      } else if (char === "\\") {
-        // Backslash escapes the next character (also makes it quoted)
-        quoted = true;
-        this.pos++;
-        this.column++;
-        if (this.pos < this.input.length) {
-          delimiter += this.input[this.pos];
-          this.pos++;
-          this.column++;
-        }
+    let currentLine = line;
+    let currentColumn = column;
+    for (let index = start; index < endPos; index++) {
+      const char = input[index];
+      if (char === "\n") {
+        currentLine += 1;
+        currentColumn = 1;
       } else {
-        // Unquoted character
-        delimiter += char;
-        this.pos++;
-        this.column++;
+        currentColumn += 1;
       }
     }
 
-    // Restore position so actual tokenization continues normally
-    this.pos = savedPos;
-    this.column = savedColumn;
+    this.pos = endPos;
+    this.line = currentLine;
+    this.column = currentColumn;
+    this.pendingHeredocs.push({ delimiter, stripTabs });
 
-    // Register the here-doc if we found a delimiter
-    if (delimiter) {
-      this.pendingHeredocs.push({ delimiter, stripTabs, quoted });
-    }
+    return {
+      type: TokenType.WORD,
+      value: input.slice(start, endPos),
+      start,
+      end: endPos,
+      line,
+      column,
+      quoted,
+      heredocDelimiter: delimiter,
+    };
   }
 
   /**
@@ -2349,62 +2323,6 @@ export class Lexer {
     }
 
     return null;
-  }
-
-  /**
-   * Scan a process substitution `<(...)` / `>(...)` starting at the `<` or `>`.
-   *
-   * Tracks quoting and nesting so parens inside strings or nested
-   * substitutions do not close the construct early. Newlines are allowed
-   * (the body is an ordinary command list). Returns null when the parens are
-   * unbalanced, so the caller can fall back to plain redirection lexing and
-   * let the parser report the syntax error.
-   */
-  private scanProcessSubstitution(
-    startPos: number,
-  ): { content: string; end: number } | null {
-    const input = this.input;
-    const len = input.length;
-    let pos = startPos + 2; // Skip the `<(` / `>(`
-    let depth = 1;
-    let inSingleQuote = false;
-    let inDoubleQuote = false;
-
-    while (pos < len && depth > 0) {
-      const c = input[pos];
-
-      if (inSingleQuote) {
-        if (c === "'") inSingleQuote = false;
-        pos++;
-        continue;
-      }
-
-      if (c === "\\" && pos + 1 < len) {
-        pos += 2;
-        continue;
-      }
-
-      if (inDoubleQuote) {
-        if (c === '"') inDoubleQuote = false;
-        pos++;
-        continue;
-      }
-
-      if (c === "'") {
-        inSingleQuote = true;
-      } else if (c === '"') {
-        inDoubleQuote = true;
-      } else if (c === "(") {
-        depth++;
-      } else if (c === ")") {
-        depth--;
-      }
-      pos++;
-    }
-
-    if (depth !== 0) return null;
-
-    return { content: input.slice(startPos, pos), end: pos };
   }
 
   /**

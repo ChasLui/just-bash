@@ -97,7 +97,7 @@ export function parseFor(
 
   // Check for C-style for: for (( ... ))
   if (p.check(TokenType.DPAREN_START)) {
-    return parseCStyleFor(p, options, forToken.line);
+    return parseCStyleFor(p, options, p.getSourceLine(forToken));
   }
 
   // Regular for: for VAR in WORDS

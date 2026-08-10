@@ -850,6 +850,8 @@ export function parseWordParts(
   regexPattern = false,
   /** When true, \} is treated as escaped } (used in parameter expansion default values) */
   inParameterExpansion = false,
+  /** Whether this token starts the complete shell word. */
+  atWordStart = true,
 ): WordPart[] {
   if (singleQuoted) {
     // Single quotes: no expansion
@@ -1016,14 +1018,16 @@ export function parseWordParts(
       continue;
     }
 
-    // Handle process substitution: <(cmd) and >(cmd).
-    // The lexer only folds `<(` / `>(` into a word token when the paren is
-    // immediately adjacent, so reaching here means bash would treat it as a
-    // process substitution too (`< (cmd)` stays a redirection + syntax error).
-    // Heredoc bodies are literal, so they never contain one.
-    if ((char === "<" || char === ">") && value[i + 1] === "(" && !hereDoc) {
+    // Parameter-expansion operands and other recursively parsed fragments stay
+    // inside one lexer token, so process substitutions in them need this string seam.
+    if (
+      (char === "<" || char === ">") &&
+      value[i + 1] === "(" &&
+      !hereDoc &&
+      !singleQuotesAreLiteral
+    ) {
       flushLiteral();
-      const { part, endIndex } = p.parseProcessSubstitution(value, i);
+      const { part, endIndex } = p.parseProcessSubstitutionFromString(value, i);
       parts.push(part);
       i = endIndex;
       continue;
@@ -1033,7 +1037,7 @@ export function parseWordParts(
     if (char === "~") {
       const prevChar = i > 0 ? value[i - 1] : "";
       const canExpandAfterColon = isAssignment && prevChar === ":";
-      if (i === 0 || prevChar === "=" || canExpandAfterColon) {
+      if ((i === 0 && atWordStart) || prevChar === "=" || canExpandAfterColon) {
         const tildeEnd = WordParser.findTildeEnd(p, value, i);
         const afterTilde = value[tildeEnd];
         if (

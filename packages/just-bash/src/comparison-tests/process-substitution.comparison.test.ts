@@ -128,6 +128,20 @@ describe("Process Substitution - Real Bash Comparison", () => {
     await compareOutputs(env, testDir, "cat <(cat <(echo deep))");
   });
 
+  it("handles a case-pattern closing parenthesis in the body", async () => {
+    const env = await setupFiles(testDir, {});
+    await compareOutputs(
+      env,
+      testDir,
+      "cat <(case x in x) echo case-ok;; esac)",
+    );
+  });
+
+  it("handles a closing parenthesis in a heredoc body", async () => {
+    const env = await setupFiles(testDir, {});
+    await compareOutputs(env, testDir, "cat <(cat <<EOF\n)\nEOF\n)");
+  });
+
   it("runs a multi-command body", async () => {
     const env = await setupFiles(testDir, {});
     await compareOutputs(env, testDir, "cat <(echo a; echo b)");
@@ -170,6 +184,16 @@ describe("Process Substitution - Real Bash Comparison", () => {
   it("concatenates with an adjacent literal", async () => {
     const env = await setupFiles(testDir, {});
     await compareOutputs(env, testDir, "echo a<(true)");
+  });
+
+  it("concatenates with adjacent literals on both sides", async () => {
+    const env = await setupFiles(testDir, {});
+    await compareOutputs(env, testDir, "echo a<(true)c");
+  });
+
+  it("concatenates adjacent input and output substitutions", async () => {
+    const env = await setupFiles(testDir, {});
+    await compareOutputs(env, testDir, "echo <(true)>(cat)");
   });
 
   it("does not read a leading digit as a file descriptor", async () => {

@@ -26,22 +26,31 @@ function asProcSub(part: WordPart): ProcessSubstitutionPart {
 }
 
 describe("process substitution - lexer", () => {
-  it("lexes <(cmd) as a single word token, not a redirection", () => {
+  it("lexes <(cmd) as adjacent operator and parenthesis tokens", () => {
     const tokens = new Lexer("cat <(echo hi)").tokenize();
     expect(tokens.map((t) => [t.type, t.value])).toEqual([
       [TokenType.NAME, "cat"],
-      [TokenType.WORD, "<(echo hi)"],
+      [TokenType.LESS, "<"],
+      [TokenType.LPAREN, "("],
+      [TokenType.NAME, "echo"],
+      [TokenType.NAME, "hi"],
+      [TokenType.RPAREN, ")"],
       [TokenType.EOF, ""],
     ]);
+    expect(tokens[1].end).toBe(tokens[2].start);
   });
 
-  it("lexes >(cmd) as a single word token", () => {
+  it("lexes >(cmd) as adjacent operator and parenthesis tokens", () => {
     const tokens = new Lexer("tee >(cat)").tokenize();
     expect(tokens.map((t) => [t.type, t.value])).toEqual([
       [TokenType.NAME, "tee"],
-      [TokenType.WORD, ">(cat)"],
+      [TokenType.GREAT, ">"],
+      [TokenType.LPAREN, "("],
+      [TokenType.NAME, "cat"],
+      [TokenType.RPAREN, ")"],
       [TokenType.EOF, ""],
     ]);
+    expect(tokens[1].end).toBe(tokens[2].start);
   });
 
   it("keeps `< (` as a redirection operator followed by a paren", () => {
@@ -68,16 +77,25 @@ describe("process substitution - lexer", () => {
     const tokens = new Lexer("echo a<(echo hi)").tokenize();
     expect(tokens.map((t) => [t.type, t.value])).toEqual([
       [TokenType.NAME, "echo"],
-      [TokenType.WORD, "a<(echo hi)"],
+      [TokenType.NAME, "a"],
+      [TokenType.LESS, "<"],
+      [TokenType.LPAREN, "("],
+      [TokenType.NAME, "echo"],
+      [TokenType.NAME, "hi"],
+      [TokenType.RPAREN, ")"],
       [TokenType.EOF, ""],
     ]);
   });
 
   it("does not treat a leading digit as a file descriptor", () => {
-    const tokens = new Lexer("echo 2>(cat)").tokenize();
+    const tokens = new Lexer("echo 2>(b)").tokenize();
     expect(tokens.map((t) => [t.type, t.value])).toEqual([
       [TokenType.NAME, "echo"],
-      [TokenType.WORD, "2>(cat)"],
+      [TokenType.NUMBER, "2"],
+      [TokenType.GREAT, ">"],
+      [TokenType.LPAREN, "("],
+      [TokenType.NAME, "b"],
+      [TokenType.RPAREN, ")"],
       [TokenType.EOF, ""],
     ]);
   });
@@ -96,21 +114,16 @@ describe("process substitution - lexer", () => {
     ]);
   });
 
-  it("falls back to a redirection when the parens are unbalanced", () => {
+  it("preserves an unterminated process substitution for parser diagnostics", () => {
     const tokens = new Lexer("cat <(echo hi").tokenize();
-    expect(tokens[1].type).toBe(TokenType.LESS);
-  });
-
-  it("tracks parens through quotes and nesting", () => {
-    expect(new Lexer("cat <(echo 'a)b')").tokenize()[1].value).toBe(
-      "<(echo 'a)b')",
-    );
-    expect(new Lexer('cat <(echo ")")').tokenize()[1].value).toBe(
-      'cat <(echo ")")'.slice(4),
-    );
-    expect(new Lexer("cat <(cat <(echo x))").tokenize()[1].value).toBe(
-      "<(cat <(echo x))",
-    );
+    expect(tokens.map((token) => token.type)).toEqual([
+      TokenType.NAME,
+      TokenType.LESS,
+      TokenType.LPAREN,
+      TokenType.NAME,
+      TokenType.NAME,
+      TokenType.EOF,
+    ]);
   });
 });
 
@@ -151,6 +164,78 @@ describe("process substitution - parser", () => {
     expect(asProcSub(parts[1]).direction).toBe("input");
   });
 
+  it("concatenates literal prefixes and suffixes", () => {
+    const parts = argParts("echo a<(b)c")[0];
+    expect(parts).toHaveLength(3);
+    expect(parts[0]).toEqual({ type: "Literal", value: "a" });
+    expect(asProcSub(parts[1]).direction).toBe("input");
+    expect(parts[2]).toEqual({ type: "Literal", value: "c" });
+  });
+
+  it("concatenates adjacent process substitutions", () => {
+    const parts = argParts("echo <(a)>(b)")[0];
+    expect(parts).toHaveLength(2);
+    expect(asProcSub(parts[0]).direction).toBe("input");
+    expect(asProcSub(parts[1]).direction).toBe("output");
+  });
+
+  it("concatenates an assignment-shaped suffix", () => {
+    const parts = argParts("echo <(true)x=y")[0];
+    expect(parts).toHaveLength(2);
+    expect(asProcSub(parts[0]).direction).toBe("input");
+    expect(parts[1]).toEqual({ type: "Literal", value: "x=y" });
+  });
+
+  it("keeps an assignment-shaped suffix in the assignment value", () => {
+    const command = new Parser().parse("x=<(true)y=z").statements[0]
+      .pipelines[0].commands[0] as SimpleCommandNode;
+    expect(command.assignments).toHaveLength(1);
+    expect(command.args).toHaveLength(0);
+    const value = command.assignments[0].value;
+    if (!value) throw new Error("expected an assignment value");
+    expect(value.parts).toHaveLength(2);
+    expect(asProcSub(value.parts[0]).direction).toBe("input");
+    expect(value.parts[1]).toEqual({ type: "Literal", value: "y=z" });
+  });
+
+  it("treats grammar-shaped prefixes as command words", () => {
+    for (const [script, prefix, direction] of [
+      ["if<(true)", "if", "input"],
+      ["!<(true)", "!", "input"],
+      ["time<(true)", "time", "input"],
+      ["do<(true)", "do", "input"],
+      ["fi<(true)", "fi", "input"],
+      ["else<(true)", "else", "input"],
+      ["}<(true)", "}", "input"],
+      ["]]<(true)", "]]", "input"],
+      ["{fd}>(true)", "{fd}", "output"],
+    ] as const) {
+      const command = new Parser().parse(script).statements[0].pipelines[0]
+        .commands[0] as SimpleCommandNode;
+      if (!command.name) throw new Error("expected a command name");
+      expect(command.name.parts[0]).toEqual({ type: "Literal", value: prefix });
+      expect(asProcSub(command.name.parts[1]).direction).toBe(direction);
+    }
+  });
+
+  it("keeps control operators and parentheses in the command grammar", () => {
+    for (const script of [
+      "&<(true); echo survived",
+      "&&<(true); echo survived",
+      "||<(true); echo survived",
+    ]) {
+      expect(() => new Parser().parse(script)).toThrow("syntax error");
+    }
+
+    const subshell = new Parser().parse("(<(true))").statements[0].pipelines[0]
+      .commands[0];
+    expect(subshell.type).toBe("Subshell");
+
+    const arithmetic = new Parser().parse("((<(true)))").statements[0]
+      .pipelines[0].commands[0];
+    expect(arithmetic.type).toBe("ArithmeticCommand");
+  });
+
   it("keeps quoted text literal", () => {
     expect(argParts('echo "<(echo hi)"')[0]).toEqual([
       {
@@ -182,7 +267,36 @@ describe("process substitution - parser", () => {
 
   it("reports a parse error for an unterminated substitution", () => {
     expect(() => new Parser().parse("cat <(echo hi")).toThrow(
-      "Expected redirection target",
+      "unexpected EOF while looking for matching `)'",
+    );
+  });
+
+  it("rejects a missing heredoc delimiter", () => {
+    expect(() => new Parser().parse("cat <<; echo survived")).toThrow(
+      "Expected here-document delimiter",
+    );
+  });
+
+  it("rejects an unterminated quoted heredoc delimiter", () => {
+    expect(() => new Parser().parse('cat <<"EOF\nbody\nEOF')).toThrow(
+      "unexpected EOF while looking for matching",
+    );
+  });
+
+  it("recognizes a comment after a heredoc operator", () => {
+    for (const script of [
+      "cat << #comment\necho survived\n",
+      "cat <<#comment\necho survived\n",
+    ]) {
+      expect(() => new Parser().parse(script)).toThrow(
+        "Expected here-document delimiter",
+      );
+    }
+  });
+
+  it("rejects an unterminated process-like heredoc delimiter", () => {
+    expect(() => new Parser().parse("cat <<EOF<(x\nbody\nEOF")).toThrow(
+      "unexpected EOF while looking for matching `)'",
     );
   });
 });

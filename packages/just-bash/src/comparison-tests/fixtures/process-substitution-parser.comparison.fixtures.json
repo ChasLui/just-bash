@@ -1,0 +1,123 @@
+{
+  "098b591d54cc788e": {
+    "command": "echo 2<(((1)))",
+    "files": {},
+    "stdout": "2/dev/fd/63\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "1cce82e69597f0e5": {
+    "command": "[[ /dev/fd/63+ =~ <(true)\\+ ]] && echo regex-ok",
+    "files": {},
+    "stdout": "regex-ok\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "21d5953366edac4a": {
+    "command": "printf \"<%s>\\n\" }<(true) ]]<(true) {fd}>(true)",
+    "files": {},
+    "stdout": "<}/dev/fd/63>\n<]]/dev/fd/62>\n<{fd}/dev/fd/61>\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "32028f231e6bbfec": {
+    "command": "HOME=/home/demo; cat <<EOF$(echo 'x')\n$HOME\nEOF$(echo x)\n",
+    "files": {},
+    "stdout": "/home/demo\nEOFx\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "3c6499c55a0a9106": {
+    "command": "HOME=/tmp/home; x=<(true):~; echo \"$x\"",
+    "files": {},
+    "stdout": "/dev/fd/63:/tmp/home\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "42f843a1595dc1c2": {
+    "command": "[[ <(true){a,b} == '/dev/fd/63{a,b}' ]] && echo conditional-ok",
+    "files": {},
+    "stdout": "conditional-ok\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "45a03bdfe288367d": {
+    "command": "cat <<EOF$(echo x)\ncommand-substitution-literal\nEOF$(echo x)",
+    "files": {},
+    "stdout": "command-substitution-literal\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "5b511c08d2ee319a": {
+    "command": "true\ncat <(\necho outer=$LINENO\ncat <(echo inner=$LINENO)\n)",
+    "files": {},
+    "stdout": "outer=2\ninner=3\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "748b421429feb494": {
+    "command": "&&<(true); echo survived",
+    "files": {},
+    "stdout": "",
+    "stderr": "/bin/bash: -c: line 1: syntax error near unexpected token `&&'\n/bin/bash: -c: line 1: `&&<(true); echo survived'\n",
+    "exitCode": 2,
+    "locked": true
+  },
+  "c3e39b3e53089a4e": {
+    "command": "unset x; printf '<%s>\\n' \"${x:-<(printf ok)}\"",
+    "files": {},
+    "stdout": "<<(printf ok)>\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "cb58ddc4d2487347": {
+    "command": "printf \"<%s>\\n\" <(true)x=y; x=<(true)y=z; printf \"<%s>\\n\" \"$x\"",
+    "files": {},
+    "stdout": "</dev/fd/63x=y>\n</dev/fd/63y=z>\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "cfcdb11968267ae6": {
+    "command": "unset x; cat ${x:-<(printf ok)}",
+    "files": {},
+    "stdout": "ok",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "d0d131629e9e5bde": {
+    "command": "cat <<#comment\necho survived\n",
+    "files": {},
+    "stdout": "",
+    "stderr": "/bin/bash: -c: line 1: syntax error near unexpected token `newline'\n/bin/bash: -c: line 1: `cat <<#comment'\n",
+    "exitCode": 2,
+    "locked": true
+  },
+  "dd6b628d45108f90": {
+    "command": "!<(true); time<(true); do<(true)",
+    "files": {},
+    "stdout": "",
+    "stderr": "/bin/bash: !/dev/fd/63: No such file or directory\n/bin/bash: time/dev/fd/63: No such file or directory\n/bin/bash: do/dev/fd/63: No such file or directory\n",
+    "exitCode": 127,
+    "locked": true
+  },
+  "e9c39f0e3f494adb": {
+    "command": "cat <<\"E\\OF\"\ndouble-quote-backslash\nE\\OF",
+    "files": {},
+    "stdout": "double-quote-backslash\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "fcb395281ba741d1": {
+    "command": "cat <<EOF<(echo hi)\nheredoc-ok\nEOF<(echo hi)",
+    "files": {},
+    "stdout": "heredoc-ok\n",
+    "stderr": "",
+    "exitCode": 0
+  }
+}

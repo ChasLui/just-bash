@@ -8,7 +8,6 @@ import {
   AST,
   type AssignmentNode,
   type RedirectionNode,
-  type RedirectionOperator,
   type SimpleCommandNode,
   type WordNode,
 } from "../ast/types.js";
@@ -18,6 +17,7 @@ import {
   REDIRECTION_AFTER_FD_VARIABLE,
   REDIRECTION_AFTER_NUMBER,
   REDIRECTION_TOKENS,
+  WordParseContext,
 } from "./types.js";
 import * as WordParser from "./word-parser.js";
 
@@ -33,6 +33,9 @@ export function isRedirection(p: Parser): boolean {
     if (currentToken.end !== nextToken.start) {
       return false;
     }
+    if (p.isProcessSubstitutionStart(1)) {
+      return false;
+    }
     return REDIRECTION_AFTER_NUMBER.has(nextToken.type);
   }
 
@@ -40,10 +43,16 @@ export function isRedirection(p: Parser): boolean {
   // e.g., {fd}>file allocates an FD and stores it in variable
   if (t === TokenType.FD_VARIABLE) {
     const nextToken = p.peek(1);
+    if (currentToken.end !== nextToken.start) {
+      return false;
+    }
+    if (p.isProcessSubstitutionStart(1)) {
+      return false;
+    }
     return REDIRECTION_AFTER_FD_VARIABLE.has(nextToken.type);
   }
 
-  return REDIRECTION_TOKENS.has(t);
+  return !p.isProcessSubstitutionStart() && REDIRECTION_TOKENS.has(t);
 }
 
 export function parseRedirection(p: Parser): RedirectionNode {
@@ -68,12 +77,7 @@ export function parseRedirection(p: Parser): RedirectionNode {
     opToken.type === TokenType.DLESS ||
     opToken.type === TokenType.DLESSDASH
   ) {
-    return parseHeredocStart(
-      p,
-      operator,
-      fd,
-      opToken.type === TokenType.DLESSDASH,
-    );
+    return parseHeredocStart(p, fd, opToken.type === TokenType.DLESSDASH);
   }
 
   // Parse target
@@ -87,7 +91,6 @@ export function parseRedirection(p: Parser): RedirectionNode {
 
 function parseHeredocStart(
   p: Parser,
-  _operator: RedirectionOperator,
   fd: number | null,
   stripTabs: boolean,
 ): RedirectionNode {
@@ -97,15 +100,8 @@ function parseHeredocStart(
   }
 
   const delimToken = p.advance();
-  let delimiter = delimToken.value;
+  const delimiter = delimToken.heredocDelimiter ?? delimToken.value;
   const quoted = delimToken.quoted || false;
-
-  // Remove quotes from delimiter
-  if (delimiter.startsWith("'") && delimiter.endsWith("'")) {
-    delimiter = delimiter.slice(1, -1);
-  } else if (delimiter.startsWith('"') && delimiter.endsWith('"')) {
-    delimiter = delimiter.slice(1, -1);
-  }
 
   // Create placeholder redirection
   const redirect = AST.redirection(
@@ -122,7 +118,7 @@ function parseHeredocStart(
 
 export function parseSimpleCommand(p: Parser): SimpleCommandNode {
   // Capture line number at the start of the command for $LINENO
-  const startLine = p.current().line;
+  const startLine = p.getSourceLine();
 
   const assignments: AssignmentNode[] = [];
   let name: WordNode | null = null;
@@ -166,21 +162,6 @@ export function parseSimpleCommand(p: Parser): SimpleCommandNode {
 
     if (isRedirection(p)) {
       redirections.push(parseRedirection(p));
-    } else if (p.check(TokenType.RBRACE)) {
-      // } can be an argument like "echo }" - parse it as a word
-      const token = p.advance();
-      args.push(p.parseWordFromString(token.value, false, false));
-    } else if (p.check(TokenType.LBRACE)) {
-      // { can be an argument like "type -t {" - parse it as a word
-      const token = p.advance();
-      args.push(p.parseWordFromString(token.value, false, false));
-    } else if (p.check(TokenType.DBRACK_END)) {
-      // ]] can be an argument when [[ is parsed as a regular command
-      // (e.g., FOO=bar [[ foo == foo ]] where [[ is not recognized as keyword)
-      const token = p.advance();
-      args.push(p.parseWordFromString(token.value, false, false));
-    } else if (p.isWord()) {
-      args.push(p.parseWord());
     } else if (p.check(TokenType.ASSIGNMENT_WORD)) {
       // Assignment words after command name are treated as arguments
       // (for local, export, declare, etc.)
@@ -210,15 +191,35 @@ export function parseSimpleCommand(p: Parser): SimpleCommandNode {
         const arrayStr = `${baseName}=(${elemStrings.join(" ")})`;
         args.push(p.parseWordFromString(arrayStr, false, false, true));
       } else {
+        const word = p.parseWordFromString(
+          tokenValue,
+          token.quoted,
+          token.singleQuoted,
+          true,
+        );
         args.push(
-          p.parseWordFromString(
-            tokenValue,
-            token.quoted,
-            token.singleQuoted,
-            true,
+          p.parseAdjacentWordParts(
+            word.parts,
+            token.end,
+            WordParseContext.Assignment,
           ),
         );
       }
+    } else if (p.isWord()) {
+      args.push(p.parseWord());
+    } else if (p.check(TokenType.RBRACE)) {
+      // } can be an argument like "echo }" - parse it as a word
+      const token = p.advance();
+      args.push(p.parseWordFromString(token.value, false, false));
+    } else if (p.check(TokenType.LBRACE)) {
+      // { can be an argument like "type -t {" - parse it as a word
+      const token = p.advance();
+      args.push(p.parseWordFromString(token.value, false, false));
+    } else if (p.check(TokenType.DBRACK_END)) {
+      // ]] can be an argument when [[ is parsed as a regular command
+      // (e.g., FOO=bar [[ foo == foo ]] where [[ is not recognized as keyword)
+      const token = p.advance();
+      args.push(p.parseWordFromString(token.value, false, false));
     } else if (p.check(TokenType.LPAREN)) {
       // Bare ( in argument position is a syntax error (e.g., "echo a(b)")
       p.error(`syntax error near unexpected token \`('`);
@@ -307,9 +308,17 @@ function parseAssignment(p: Parser): AssignmentNode {
   // Regular assignment (may include subscript)
   // Pass through the quoting info from the token so tilde expansion is properly suppressed
   // isAssignment=true allows tilde expansion after : (for PATH-like assignments)
-  const wordValue = valueStr
+  let wordValue = valueStr
     ? p.parseWordFromString(valueStr, token.quoted, token.singleQuoted, true)
     : null;
+
+  if (token.end === p.current().start && p.isProcessSubstitutionStart()) {
+    wordValue = p.parseAdjacentWordParts(
+      wordValue?.parts ?? [],
+      token.end,
+      WordParseContext.Assignment,
+    );
+  }
 
   // If we have a subscript, embed it in the name (e.g., "a[0]")
   // The interpreter will parse this out

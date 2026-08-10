@@ -8,4 +8,6 @@ Support process substitution `<(cmd)` and `>(cmd)`.
 in-memory file; `>(cmd)` substitutes a writable path whose contents are fed to
 `cmd` once the outer command finishes. Descriptors are numbered from 63
 downwards like bash and released when the command that opened them completes.
-Previously any use raised `Parse error: Expected redirection target`.
+Process substitutions retain their surrounding word context in assignments,
+conditionals, regular expressions, and heredoc delimiters. Previously any use
+raised `Parse error: Expected redirection target`.

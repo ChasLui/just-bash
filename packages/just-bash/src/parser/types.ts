@@ -12,6 +12,13 @@ export const MAX_TOKENS = 100_000; // Max tokens to parse
 const MAX_PARSE_ITERATIONS = 1_000_000; // Max iterations in parsing loops
 export const MAX_PARSER_DEPTH = 200; // Max recursion depth for nested constructs
 
+export enum WordParseContext {
+  Default = 0,
+  Assignment = 1 << 0,
+  NoBraceExpansion = 1 << 1,
+  Regex = 1 << 2,
+}
+
 // Pre-computed Sets for fast redirection token lookup (avoids array allocation per call)
 export const REDIRECTION_TOKENS: Set<TokenType> = new Set([
   TokenType.LESS,
