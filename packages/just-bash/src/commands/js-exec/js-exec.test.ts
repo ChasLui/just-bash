@@ -173,6 +173,15 @@ describe("js-exec", () => {
       expect(result.exitCode).toBe(1);
       expect(result.stdout).toBe("");
     });
+
+    it("should report a user-thrown legacy exit sentinel", async () => {
+      const env = new Bash({ javascript: true });
+      const result = await env.exec(`js-exec -c "throw new Error('__EXIT__')"`);
+
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toBe("at <eval> (-c:1:16): __EXIT__\n");
+      expect(result.exitCode).toBe(1);
+    });
   });
 
   describe("process.argv", () => {

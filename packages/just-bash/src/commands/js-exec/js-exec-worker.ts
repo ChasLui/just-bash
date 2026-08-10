@@ -10,6 +10,7 @@
  */
 
 import { stripTypeScriptTypes } from "node:module";
+import { setTimeout } from "node:timers/promises";
 import { parentPort } from "node:worker_threads";
 import {
   getQuickJS,
@@ -83,6 +84,8 @@ const MEMORY_LIMIT = 64 * 1024 * 1024;
 /** Maximum execution cycles before interrupt check */
 const INTERRUPT_CYCLES = 100000;
 
+const PROCESS_EXIT_MARKER = "__just_bash_process_exit_marker__";
+
 /**
  * Format a dumped QuickJS error value into a readable error string
  * that includes the file name and line number from the stack trace.
@@ -123,6 +126,17 @@ function throwError(
   message: string,
 ): { error: QuickJSHandle } {
   return { error: context.newError(message) };
+}
+
+function isProcessExit(
+  context: QuickJSContext,
+  error: QuickJSHandle,
+  processExitMarker: QuickJSHandle,
+): boolean {
+  const marker = context.getProp(error, PROCESS_EXIT_MARKER);
+  const isExit = context.sameValue(marker, processExitMarker);
+  marker.dispose();
+  return isExit;
 }
 
 /**
@@ -379,6 +393,7 @@ function setupContext(
   context: QuickJSContext,
   backend: SyncBackend,
   input: JsExecWorkerInput,
+  processExitMarker: QuickJSHandle,
 ): void {
   // --- console ---
   const consoleObj = context.newObject();
@@ -826,7 +841,9 @@ function setupContext(
     }
     backend.exit(code);
     // Throw to stop execution
-    return throwError(context, "__EXIT__");
+    const exitError = context.newError("process.exit()");
+    context.setProp(exitError, PROCESS_EXIT_MARKER, processExitMarker);
+    return { error: exitError };
   });
   context.setProp(processObj, "exit", exitFn);
   exitFn.dispose();
@@ -1070,7 +1087,7 @@ async function initializeWithDefense(): Promise<void> {
   }
   // Yield to let the ExperimentalWarning flush through the event loop.
   // Must use setTimeout (not Promise.resolve) because the warning is a macrotask.
-  await new Promise<void>((r) => setTimeout(r, 0));
+  await setTimeout(0);
 
   // Activate defense after QuickJS is loaded.
   // QuickJS needs only SharedArrayBuffer + Atomics exclusions
@@ -1123,6 +1140,7 @@ async function executeCode(
 
   let runtime: QuickJSRuntime | undefined;
   let context: QuickJSContext | undefined;
+  let processExitMarker: QuickJSHandle | undefined;
   try {
     runtime = qjs.newRuntime();
     runtime.setMemoryLimit(MEMORY_LIMIT);
@@ -1138,7 +1156,8 @@ async function executeCode(
     });
 
     context = runtime.newContext();
-    setupContext(context, backend, input);
+    processExitMarker = context.newObject();
+    setupContext(context, backend, input, processExitMarker);
 
     // Defense-in-depth: remove eval(), neuter Function constructors,
     // and freeze all intrinsic prototypes to prevent prototype pollution.
@@ -1379,20 +1398,13 @@ async function executeCode(
       : context.evalCode(jsCode, filename);
 
     if (result.error) {
-      const errorVal = context.dump(result.error);
-      result.error.dispose();
-
-      // Check if this is a process.exit() call (check raw message before formatting)
-      const rawMsg =
-        typeof errorVal === "object" &&
-        errorVal !== null &&
-        "message" in errorVal
-          ? (errorVal as { message: string }).message
-          : String(errorVal);
-      if (rawMsg === "__EXIT__") {
-        // Exit was already signaled via backend.exit()
+      if (isProcessExit(context, result.error, processExitMarker)) {
+        result.error.dispose();
+        // Exit was already signaled via backend.exit().
         return { success: true };
       }
+      const errorVal = context.dump(result.error);
+      result.error.dispose();
 
       const errorMsg = formatError(errorVal);
       try {
@@ -1406,30 +1418,53 @@ async function executeCode(
 
     // Execute pending jobs (promise callbacks, module bodies).
     // Must always run so .then() chains work in both script and module mode.
-    // Must happen before exit so bridge is still alive.
-    {
-      const pendingResult = runtime.executePendingJobs();
-      if ("error" in pendingResult && pendingResult.error) {
-        const errorVal = context.dump(pendingResult.error);
+    // Must happen before exit so bridge is still alive. Modules use the native
+    // promise bridge to wait for top-level await without polling the VM state.
+    const moduleCompletion = input.isModule
+      ? context.resolvePromise(result.value)
+      : undefined;
+    const pendingResult = runtime.executePendingJobs();
+    if ("error" in pendingResult && pendingResult.error) {
+      if (isProcessExit(context, pendingResult.error, processExitMarker)) {
         pendingResult.error.dispose();
-        const rawPendingMsg =
-          typeof errorVal === "object" &&
-          errorVal !== null &&
-          "message" in errorVal
-            ? (errorVal as { message: string }).message
-            : String(errorVal);
-        if (rawPendingMsg !== "__EXIT__") {
-          const errorMsg = formatError(errorVal);
-          try {
-            backend.writeStderr(`${errorMsg}\n`);
-          } catch {
-            // Output limit exceeded — ignore writeStderr failure
-          }
-          backend.exit(1);
-          return { success: true };
-        }
+        result.value.dispose();
         return { success: true };
       }
+      const errorVal = context.dump(pendingResult.error);
+      pendingResult.error.dispose();
+      result.value.dispose();
+      const errorMsg = formatError(errorVal);
+      try {
+        backend.writeStderr(`${errorMsg}\n`);
+      } catch {
+        // Output limit exceeded — ignore writeStderr failure
+      }
+      backend.exit(1);
+      return { success: true };
+    }
+
+    if (moduleCompletion) {
+      const moduleResult = await moduleCompletion;
+      if (moduleResult.error) {
+        if (isProcessExit(context, moduleResult.error, processExitMarker)) {
+          moduleResult.error.dispose();
+          result.value.dispose();
+          // Exit was already signaled via backend.exit().
+          return { success: true };
+        }
+        const errorVal = context.dump(moduleResult.error);
+        moduleResult.error.dispose();
+        result.value.dispose();
+        const errorMsg = formatError(errorVal);
+        try {
+          backend.writeStderr(`${errorMsg}\n`);
+        } catch {
+          // Output limit exceeded — ignore writeStderr failure
+        }
+        backend.exit(1);
+        return { success: true };
+      }
+      moduleResult.value.dispose();
     }
 
     result.value.dispose();
@@ -1457,6 +1492,7 @@ async function executeCode(
     }
     return { success: true };
   } finally {
+    processExitMarker?.dispose();
     context?.dispose();
     runtime?.dispose();
   }

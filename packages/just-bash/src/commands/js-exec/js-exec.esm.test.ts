@@ -143,6 +143,39 @@ describe("js-exec ESM modules", () => {
     expect(r3.exitCode).toBe(0);
   });
 
+  it(
+    "should time out unresolved top-level await",
+    { timeout: 30000 },
+    async () => {
+      const env = new Bash({
+        javascript: true,
+        executionLimits: { maxJsTimeoutMs: 200 },
+      });
+      const result = await env.exec(
+        `js-exec -m -c "await new Promise(() => {})"`,
+      );
+
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toMatch(
+        /^(?:\njs-exec: execution timeout exceeded\n)?js-exec: Execution timeout: exceeded 200ms limit\n$/,
+      );
+      expect(result.exitCode).toBe(124);
+    },
+  );
+
+  it("should report rejected top-level await", async () => {
+    const env = new Bash({ javascript: true });
+    const result = await env.exec(
+      `js-exec -m -c "await Promise.reject(new Error('top-level await rejected'))"`,
+    );
+
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe(
+      "at <anonymous> (-c:1:31): top-level await rejected\n",
+    );
+    expect(result.exitCode).toBe(1);
+  });
+
   it("should handle transitive imports", async () => {
     const env = new Bash({
       javascript: true,
