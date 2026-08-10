@@ -75,6 +75,12 @@ describe("serialize", () => {
     it("noclobber redirect", () => roundTrip("echo hi >| file.txt"));
     it("read-write redirect", () => roundTrip("cmd <> file.txt"));
     it("fd variable", () => roundTrip("exec {fd}> file.txt"));
+    it("bare fd variable", () => {
+      expect(serialize(parse("{output}> output.log"))).toBe(
+        "{output}> output.log",
+      );
+    });
+    it("fd variable heredoc", () => roundTrip("{input}<<EOF\nvalue\nEOF"));
   });
 
   describe("quoting and word parts", () => {

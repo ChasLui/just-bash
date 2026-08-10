@@ -1,0 +1,34 @@
+{
+  "eedda2d51bc56241": {
+    "command": "{input}<<EOF 3<&$input\nvalue\nEOF\nprintf \"input=[%s] status=%s\\n\" \"$input\" \"$?\"",
+    "files": {},
+    "stdout": "input=[] status=0\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "80c1f08068764538": {
+    "command": "{output}>out.txt; printf \"value=[%s] fd10=\" \"$output\"; if : 2>/dev/null >&10; then echo open; else echo closed; fi; test -f out.txt && echo exists; test ! -s out.txt && echo empty",
+    "files": {},
+    "stdout": "value=[] fd10=closed\nexists\nempty\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "a89fda6dfa2d2453": {
+    "command": ": {input}<<EOF\nvalue\nEOF\nread -u \"$input\" line; printf \"input=%s fd=%s\\n\" \"$line\" \"$input\"",
+    "files": {},
+    "stdout": "input=value fd=10\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  },
+  "b02b896b964e8a40": {
+    "command": "{bare}>bare.txt; : {named}>named.txt; printf \"bare=[%s] named=%s\\n\" \"$bare\" \"$named\"",
+    "files": {},
+    "stdout": "bare=[] named=10\n",
+    "stderr": "",
+    "exitCode": 0,
+    "locked": true
+  }
+}
