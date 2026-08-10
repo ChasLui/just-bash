@@ -113,6 +113,10 @@ import type {
   InterpreterState,
 } from "./types.js";
 
+function unsupportedCommandNode(node: never): never {
+  throw new TypeError(`Unsupported command node: ${JSON.stringify(node)}`);
+}
+
 export type { InterpreterContext, InterpreterState } from "./types.js";
 
 export interface InterpreterOptions {
@@ -595,7 +599,7 @@ export class Interpreter {
       case "ConditionalCommand":
         return this.executeConditionalCommand(node);
       default:
-        return OK;
+        return unsupportedCommandNode(node);
     }
   }
 

@@ -151,6 +151,12 @@ const RESERVED_WORDS = new Map<string, TokenType>([
   ["coproc", TokenType.COPROC],
 ]);
 
+const RESERVED_WORD_TOKEN_TYPES = new Set(RESERVED_WORDS.values());
+
+export function isReservedWordToken(type: TokenType): boolean {
+  return RESERVED_WORD_TOKEN_TYPES.has(type);
+}
+
 /**
  * Check if a string is a valid assignment LHS with optional nested array subscript
  * Handles: VAR, a[0], a[x], a[a[0]], a[x+1], etc.

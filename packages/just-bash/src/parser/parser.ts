@@ -36,7 +36,13 @@ import * as CmdParser from "./command-parser.js";
 import * as CompoundParser from "./compound-parser.js";
 import * as CondParser from "./conditional-parser.js";
 import * as ExpParser from "./expansion-parser.js";
-import { Lexer, type LexerOptions, type Token, TokenType } from "./lexer.js";
+import {
+  isReservedWordToken,
+  Lexer,
+  type LexerOptions,
+  type Token,
+  TokenType,
+} from "./lexer.js";
 import {
   isDollarDparenSubshell as isDollarDparenSubshellHelper,
   parseBacktickSubstitutionFromString,
@@ -325,25 +331,17 @@ export class Parser {
   private isCommandStart(): boolean {
     const t = this.current().type;
     return (
+      isReservedWordToken(t) ||
       t === TokenType.WORD ||
       t === TokenType.NAME ||
       t === TokenType.NUMBER ||
       t === TokenType.ASSIGNMENT_WORD ||
-      t === TokenType.IF ||
-      t === TokenType.FOR ||
-      t === TokenType.WHILE ||
-      t === TokenType.UNTIL ||
-      t === TokenType.CASE ||
+      t === TokenType.FD_VARIABLE ||
       t === TokenType.LPAREN ||
       t === TokenType.LBRACE ||
       t === TokenType.DPAREN_START ||
       t === TokenType.DBRACK_START ||
-      t === TokenType.FUNCTION ||
       t === TokenType.BANG ||
-      // 'time' is a pipeline prefix that can start a command
-      t === TokenType.TIME ||
-      // 'in' can appear as a command name (e.g., 'in' is not reserved outside for/case)
-      t === TokenType.IN ||
       // Redirections can appear before command name (e.g., <<EOF tac)
       // POSIX allows simple_command to start with io_redirect
       t === TokenType.LESS ||
@@ -404,9 +402,11 @@ export class Parser {
         );
       }
 
-      // Safety: if we didn't advance, force advance to prevent infinite loop
+      // A command-start token must either parse or fail, never be discarded.
       if (this.pos === posBefore && !this.check(TokenType.EOF)) {
-        this.advance();
+        this.error(
+          `syntax error near unexpected token \`${this.current().value}'`,
+        );
       }
     }
 
@@ -532,31 +532,40 @@ export class Parser {
   // PIPELINE PARSING
   // ===========================================================================
 
+  private parseTimePrefix(): boolean | undefined {
+    if (!this.check(TokenType.TIME)) return undefined;
+
+    this.advance();
+    let timePosix = false;
+    if (
+      this.check(TokenType.WORD, TokenType.NAME) &&
+      this.current().value === "-p"
+    ) {
+      this.advance();
+      timePosix = true;
+    }
+    return timePosix;
+  }
+
   private parsePipeline(): PipelineNode {
-    // Check for 'time' keyword at the beginning of pipeline
-    // time [-p] pipeline
     let timed = false;
     let timePosix = false;
-    if (this.check(TokenType.TIME)) {
-      this.advance();
-      timed = true;
-      // Check for -p option (POSIX format)
-      if (
-        this.check(TokenType.WORD, TokenType.NAME) &&
-        this.current().value === "-p"
-      ) {
-        this.advance();
-        timePosix = true;
-      }
-    }
-
     let negationCount = 0;
-
-    // Check for ! (negation) - multiple ! tokens can appear
-    // e.g., "! ! true" means double negation (cancels out)
     while (this.check(TokenType.BANG)) {
       this.advance();
       negationCount++;
+    }
+    // A leading `!` makes `time` the command word rather than a timing prefix.
+    if (negationCount === 0) {
+      const parsedTimePosix = this.parseTimePrefix();
+      if (parsedTimePosix !== undefined) {
+        timed = true;
+        timePosix = parsedTimePosix;
+        while (this.check(TokenType.BANG)) {
+          this.advance();
+          negationCount++;
+        }
+      }
     }
     const negated = negationCount % 2 === 1;
 
@@ -593,42 +602,45 @@ export class Parser {
   // ===========================================================================
 
   private parseCommand(): CommandNode {
-    // Check for compound commands
-    if (this.check(TokenType.IF)) {
-      return CompoundParser.parseIf(this);
-    }
-    if (this.check(TokenType.FOR)) {
-      return CompoundParser.parseFor(this);
-    }
-    if (this.check(TokenType.WHILE)) {
-      return CompoundParser.parseWhile(this);
-    }
-    if (this.check(TokenType.UNTIL)) {
-      return CompoundParser.parseUntil(this);
-    }
-    if (this.check(TokenType.CASE)) {
-      return CompoundParser.parseCase(this);
-    }
-    if (this.check(TokenType.LPAREN)) {
-      return CompoundParser.parseSubshell(this);
-    }
-    if (this.check(TokenType.LBRACE)) {
-      return CompoundParser.parseGroup(this);
-    }
-    if (this.check(TokenType.DPAREN_START)) {
-      // Check if this (( )) closes with ) ) (nested subshells) or )) (arithmetic)
-      // Scan ahead to find the matching close
-      if (this.dparenClosesWithSpacedParens()) {
-        // The (( will close with ) ) - treat as nested subshells ( ( ... ) )
-        return this.parseNestedSubshellsFromDparen();
-      }
-      return this.parseArithmeticCommand();
-    }
-    if (this.check(TokenType.DBRACK_START)) {
-      return this.parseConditionalCommand();
-    }
-    if (this.check(TokenType.FUNCTION)) {
-      return this.parseFunctionDef();
+    const token = this.current();
+    switch (token.type) {
+      case TokenType.IF:
+        return CompoundParser.parseIf(this);
+      case TokenType.FOR:
+        return CompoundParser.parseFor(this);
+      case TokenType.WHILE:
+        return CompoundParser.parseWhile(this);
+      case TokenType.UNTIL:
+        return CompoundParser.parseUntil(this);
+      case TokenType.CASE:
+        return CompoundParser.parseCase(this);
+      case TokenType.LPAREN:
+        return CompoundParser.parseSubshell(this);
+      case TokenType.LBRACE:
+        return CompoundParser.parseGroup(this);
+      case TokenType.DPAREN_START:
+        // Check if this (( )) closes with ) ) (nested subshells) or )) (arithmetic)
+        // Scan ahead to find the matching close
+        if (this.dparenClosesWithSpacedParens()) {
+          // The (( will close with ) ) - treat as nested subshells ( ( ... ) )
+          return this.parseNestedSubshellsFromDparen();
+        }
+        return this.parseArithmeticCommand();
+      case TokenType.DBRACK_START:
+        return this.parseConditionalCommand();
+      case TokenType.FUNCTION:
+        return this.parseFunctionDef();
+      // TIME remains an ordinary command after a pipe, where pipeline timing
+      // syntax is not recognized.
+      case TokenType.TIME:
+        break;
+      case TokenType.BANG:
+        this.error(`syntax error near unexpected token \`${token.value}'`);
+        break;
+      default:
+        if (isReservedWordToken(token.type)) {
+          this.error(`syntax error near unexpected token \`${token.value}'`);
+        }
     }
 
     // Check for function definition: name () { ... }
