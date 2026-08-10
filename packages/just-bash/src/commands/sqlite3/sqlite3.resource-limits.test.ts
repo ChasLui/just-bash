@@ -9,8 +9,9 @@ describe("sqlite3 resource limits", () => {
       'sqlite3 :memory: "SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3"',
     );
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("query result exceeds 2 row limit");
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("Error: query result exceeds 2 row limit\n");
   });
 
   it("rejects formatter expansion before building oversized output", async () => {
