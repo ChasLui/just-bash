@@ -39,6 +39,22 @@ describe("fd duplication after redirection (> file 2>&1)", () => {
     expect(f.stdout).toBe("Error! Forbidden (403)\n");
   });
 
+  it("shares the write position between duplicated read-write descriptors", async () => {
+    const both = defineCommand("both", async () => ({
+      stdout: "out",
+      stderr: "err",
+      exitCode: 0,
+    }));
+    const env = new Bash({ customCommands: [both] });
+    const result = await env.exec(
+      "exec 3<>/tmp/f; exec 4>&3; both 1>&3 2>&4; cat /tmp/f",
+    );
+
+    expect(result.stdout).toBe("outerr");
+    expect(result.stderr).toBe("");
+    expect(result.exitCode).toBe(0);
+  });
+
   it("keeps a wrapper script's stdout clean (runner-payload shape)", async () => {
     const fail = defineCommand("failing-tool", async () => ({
       stdout: "",

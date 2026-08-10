@@ -6,28 +6,20 @@
  * - Function calls (with positional parameters and local scopes)
  */
 
-import type {
-  FunctionDefNode,
-  HereDocNode,
-  RedirectionNode,
-  WordNode,
-} from "../ast/types.js";
+import type { FunctionDefNode } from "../ast/types.js";
 import type { ExecResult } from "../types.js";
 import { clearLocalVarStackForScope } from "./builtins/variable-assignment.js";
-import { ExitError, ReturnError } from "./errors.js";
-import { expandWord } from "./expansion.js";
+import { ControlFlowError, ExitError, ReturnError } from "./errors.js";
 import { cloneArray } from "./helpers/array.js";
 import { OK, result, throwExecutionLimit } from "./helpers/result.js";
 import { POSIX_SPECIAL_BUILTINS } from "./helpers/shell-constants.js";
 import {
-  isNumericFdRedirection,
-  type NumericFdScope,
-  openNumericFds,
-} from "./numeric-fd-redirects.js";
-import {
   applyRedirections,
-  type ExpandedRedirectTargets,
-  preExpandRedirectTargets,
+  createRedirectionTransaction,
+  type PreparedRedirections,
+  preparedRedirectionError,
+  routeControlFlowError,
+  SIMPLE_REDIRECTION_POLICY,
 } from "./redirections.js";
 import type { InterpreterContext } from "./types.js";
 
@@ -49,61 +41,6 @@ export function executeFunctionDef(
   };
   ctx.state.functions.set(node.name, funcWithSource);
   return OK;
-}
-
-/**
- * Process input redirections to get stdin content for function calls.
- * Handles heredocs (<<, <<-), here-strings (<<<), and file input (<).
- *
- * `redirected` is reported separately from the content: `f() { …; } < empty`
- * yields the same empty string as a definition with no redirection, but it
- * means EOF inside the function rather than "inherit the shell's stdin".
- */
-async function processInputRedirections(
-  ctx: InterpreterContext,
-  redirections: RedirectionNode[],
-): Promise<{ stdin: string; redirected: boolean }> {
-  let stdin = "";
-  let redirected = false;
-
-  for (const redir of redirections) {
-    // Descriptors named by number never feed the function's stdin.
-    if (isNumericFdRedirection(redir)) continue;
-    if (
-      (redir.operator === "<<" || redir.operator === "<<-") &&
-      redir.target.type === "HereDoc"
-    ) {
-      const hereDoc = redir.target as HereDocNode;
-      let content = await expandWord(ctx, hereDoc.content);
-      // <<- strips leading tabs from each line
-      if (hereDoc.stripTabs) {
-        content = content
-          .split("\n")
-          .map((line) => line.replace(/^\t+/, ""))
-          .join("\n");
-      }
-      // Only handle fd 0 (stdin) for now
-      const fd = redir.fd ?? 0;
-      if (fd === 0) {
-        stdin = content;
-        redirected = true;
-      }
-    } else if (redir.operator === "<<<" && redir.target.type === "Word") {
-      stdin = `${await expandWord(ctx, redir.target as WordNode)}\n`;
-      redirected = true;
-    } else if (redir.operator === "<" && redir.target.type === "Word") {
-      const target = await expandWord(ctx, redir.target as WordNode);
-      const filePath = ctx.fs.resolvePath(ctx.state.cwd, target);
-      try {
-        stdin = await ctx.fs.readFile(filePath);
-        redirected = true;
-      } catch {
-        // File not found - stdin remains unchanged
-      }
-    }
-  }
-
-  return { stdin, redirected };
 }
 
 export async function callFunction(
@@ -243,37 +180,22 @@ export async function callFunction(
     ctx.state.callDepth--;
   };
 
-  let preExpandedTargets: ExpandedRedirectTargets = new Map();
-  let fdScope: NumericFdScope | null = null;
+  let prepared: PreparedRedirections | null = null;
+  const redirectionTransaction = createRedirectionTransaction(
+    ctx,
+    func.redirections,
+    SIMPLE_REDIRECTION_POLICY,
+  );
   try {
-    // Descriptors named by number on the function definition are open for
-    // the duration of each call, like any other compound command.
-    fdScope = await openNumericFds(ctx, func.redirections);
-    if (fdScope.error) return fdScope.error;
-
-    // Redirect expansion is part of the function frame and must be protected by
-    // the same finally cleanup as body execution.
-    const { targets, error: expandError } = await preExpandRedirectTargets(
-      ctx,
-      func.redirections,
-      fdScope.targets,
-    );
-    preExpandedTargets = targets;
-    if (expandError) return result("", expandError, 1);
-
-    // Process redirections on the function definition to get stdin
-    // Only use redirection-based stdin if no pipeline stdin was passed
-    const redirectionStdin = await processInputRedirections(
-      ctx,
-      func.redirections,
-    );
-    const effectiveStdin = stdin || redirectionStdin.stdin;
+    prepared = await redirectionTransaction.prepare(stdin);
+    if (prepared.error) return preparedRedirectionError(prepared);
+    const effectiveStdin = prepared.stdin ?? stdin;
     // The body owns fd 0 when anything gave the function one: a pipe or a
     // redirection on the call (`f < file`), or one on the definition
     // (`f() { …; } < file`). Empty content is still ownership — it means EOF,
     // not "read the enclosing shell's stdin".
     const stdinOwned =
-      stdinRedirected || redirectionStdin.redirected || stdin !== "";
+      stdinRedirected || prepared.stdin !== undefined || stdin !== "";
     const execResult = await ctx.executeCommand(
       func.body,
       effectiveStdin,
@@ -285,23 +207,20 @@ export async function callFunction(
       ctx,
       execResult,
       func.redirections,
-      preExpandedTargets,
+      prepared.targets,
+      prepared.dupSources,
+      prepared.standardRoutes,
     );
   } catch (error) {
-    // Handle return statement - convert to normal exit with the specified code
-    if (error instanceof ReturnError) {
-      const returnResult = result(error.stdout, error.stderr, error.exitCode);
-      // Apply output redirections even when returning
-      return applyRedirections(
-        ctx,
-        returnResult,
-        func.redirections,
-        preExpandedTargets,
-      );
+    if (error instanceof ControlFlowError && prepared) {
+      await routeControlFlowError(ctx, error, func.redirections, prepared);
+      if (error instanceof ReturnError) {
+        return result(error.stdout, error.stderr, error.exitCode);
+      }
     }
     throw error;
   } finally {
-    fdScope?.restore();
+    redirectionTransaction.finish();
     cleanup();
   }
 }

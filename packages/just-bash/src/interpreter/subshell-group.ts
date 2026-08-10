@@ -6,7 +6,6 @@
 
 import type {
   GroupNode,
-  HereDocNode,
   ScriptNode,
   StatementNode,
   SubshellNode,
@@ -25,19 +24,17 @@ import {
   ReturnError,
   SubshellExitError,
 } from "./errors.js";
-import { expandWord } from "./expansion.js";
-import { setFdEntry } from "./fd-table.js";
+import {
+  advanceFd,
+  type FdEntry,
+  getFdAliasMembers,
+  getFdEntry,
+} from "./fd-table.js";
 import { getErrorMessage } from "./helpers/errors.js";
 import { failure, result } from "./helpers/result.js";
 import {
-  isNumericFdRedirection,
-  withNumericFds,
-} from "./numeric-fd-redirects.js";
-import {
-  applyRedirections,
-  type ExpandedRedirectTargets,
-  preOpenOutputRedirects,
-  processFdVariableRedirections,
+  type PreparedRedirections,
+  withPreparedRedirections,
 } from "./redirections.js";
 import { beginIsolatedShellState } from "./state-transaction.js";
 import type { InterpreterContext } from "./types.js";
@@ -59,16 +56,54 @@ export async function executeSubshell(
   /** See `executeGroup`: empty content can still be an owned, empty fd 0. */
   stdinOwned = false,
 ): Promise<ExecResult> {
-  return withNumericFds(ctx, node.redirections, (fdTargets) =>
-    executeSubshellBody(
+  const parentLoopDepth = ctx.state.loopDepth;
+  const parentDescriptors = new Map<number, FdEntry>();
+  for (const fd of ctx.state.fileDescriptors?.keys() ?? []) {
+    const entry = getFdEntry(ctx, fd);
+    if (entry) parentDescriptors.set(fd, entry);
+  }
+  const restoreState = beginIsolatedShellState(ctx.state);
+  ctx.state.parentHasLoopContext = parentLoopDepth > 0;
+  ctx.state.loopDepth = 0;
+  ctx.state.bashPid = ctx.state.nextVirtualPid++;
+  try {
+    return await withPreparedRedirections(
       ctx,
-      node,
+      node.redirections,
       stdin,
-      executeStatement,
-      stdinOwned,
-      fdTargets,
-    ),
-  );
+      (prepared) =>
+        executeSubshellBody(
+          ctx,
+          node,
+          prepared.stdin ?? stdin,
+          executeStatement,
+          stdinOwned || prepared.stdin !== undefined,
+        ),
+    );
+  } finally {
+    const consumedDescriptors = new Map<number, number>();
+    for (const [fd, parentEntry] of parentDescriptors) {
+      const childEntry = getFdEntry(ctx, fd);
+      const consumed =
+        parentEntry.kind === "input" && childEntry?.kind === "input"
+          ? parentEntry.content.length - childEntry.content.length
+          : parentEntry.kind === "readwrite" &&
+              childEntry?.kind === "readwrite" &&
+              parentEntry.path === childEntry.path
+            ? childEntry.position - parentEntry.position
+            : 0;
+      if (consumed <= 0) continue;
+      const sourceFd = Math.min(...getFdAliasMembers(ctx, fd));
+      consumedDescriptors.set(
+        sourceFd,
+        Math.max(consumedDescriptors.get(sourceFd) ?? 0, consumed),
+      );
+    }
+    restoreState();
+    for (const [fd, consumed] of consumedDescriptors) {
+      advanceFd(ctx, fd, consumed);
+    }
+  }
 }
 
 async function executeSubshellBody(
@@ -77,29 +112,7 @@ async function executeSubshellBody(
   stdin: string,
   executeStatement: ExecuteStatementFn,
   stdinOwned: boolean,
-  fdTargets: ExpandedRedirectTargets,
 ): Promise<ExecResult> {
-  // Pre-open output redirects to truncate files BEFORE executing body
-  // This matches bash behavior where redirect files are opened before
-  // any command substitutions in the subshell body are evaluated
-  const preparedRedirects = await preOpenOutputRedirects(
-    ctx,
-    node.redirections,
-    fdTargets,
-  );
-  if (preparedRedirects.error) {
-    return preparedRedirects.error;
-  }
-
-  const parentLoopDepth = ctx.state.loopDepth;
-  const restore = beginIsolatedShellState(ctx.state);
-  // Track if parent has loop context - break/continue in subshell should exit subshell
-  ctx.state.parentHasLoopContext = parentLoopDepth > 0;
-  ctx.state.loopDepth = 0;
-
-  // Subshells get a new BASHPID (unlike $$ which stays the same)
-  ctx.state.bashPid = ctx.state.nextVirtualPid++;
-
   // Save any existing groupStdin and set new one from pipeline
   if (stdinOwned || stdin) {
     ctx.state.groupStdin = stdin;
@@ -115,7 +128,6 @@ async function executeSubshellBody(
       exitCode = res.exitCode;
     }
   } catch (error) {
-    restore();
     // ExecutionLimitError must always propagate - these are safety limits
     if (error instanceof ExecutionLimitError) {
       output.prependTo(error);
@@ -134,14 +146,7 @@ async function executeSubshellBody(
         error.stderr,
         error.internalOutputAccounting.stderr,
       );
-      // Apply output redirections before returning
-      const bodyResult = output.build(0);
-      return applyRedirections(
-        ctx,
-        bodyResult,
-        node.redirections,
-        preparedRedirects.targets,
-      );
+      return output.build(0);
     }
     // BreakError/ContinueError should NOT propagate out of subshell
     // They only affect loops within the subshell
@@ -156,14 +161,7 @@ async function executeSubshellBody(
         error.stderr,
         error.internalOutputAccounting.stderr,
       );
-      // Apply output redirections before returning
-      const bodyResult = output.build(0);
-      return applyRedirections(
-        ctx,
-        bodyResult,
-        node.redirections,
-        preparedRedirects.targets,
-      );
+      return output.build(0);
     }
     // ExitError in subshell should NOT propagate - just return the exit code
     // (subshells are like separate processes)
@@ -178,14 +176,7 @@ async function executeSubshellBody(
         error.stderr,
         error.internalOutputAccounting.stderr,
       );
-      // Apply output redirections before returning
-      const bodyResult = output.build(error.exitCode);
-      return applyRedirections(
-        ctx,
-        bodyResult,
-        node.redirections,
-        preparedRedirects.targets,
-      );
+      return output.build(error.exitCode);
     }
     // ReturnError in subshell (e.g., f() ( return 42; )) should also just exit
     // with the given code, since subshells are like separate processes
@@ -200,14 +191,7 @@ async function executeSubshellBody(
         error.stderr,
         error.internalOutputAccounting.stderr,
       );
-      // Apply output redirections before returning
-      const bodyResult = output.build(error.exitCode);
-      return applyRedirections(
-        ctx,
-        bodyResult,
-        node.redirections,
-        preparedRedirects.targets,
-      );
+      return output.build(error.exitCode);
     }
     if (error instanceof ErrexitError) {
       // Apply output redirections before propagating
@@ -221,35 +205,14 @@ async function executeSubshellBody(
         error.stderr,
         error.internalOutputAccounting.stderr,
       );
-      const bodyResult = output.build(error.exitCode);
-      return applyRedirections(
-        ctx,
-        bodyResult,
-        node.redirections,
-        preparedRedirects.targets,
-      );
+      return output.build(error.exitCode);
     }
     // Apply output redirections before returning
     output.append("stderr", `${getErrorMessage(error)}\n`);
-    const bodyResult = output.build(1);
-    return applyRedirections(
-      ctx,
-      bodyResult,
-      node.redirections,
-      preparedRedirects.targets,
-    );
+    return output.build(1);
   }
 
-  restore();
-
-  // Apply output redirections
-  const bodyResult = output.build(exitCode);
-  return applyRedirections(
-    ctx,
-    bodyResult,
-    node.redirections,
-    preparedRedirects.targets,
-  );
+  return output.build(exitCode);
 }
 
 /**
@@ -268,8 +231,8 @@ export async function executeGroup(
    */
   stdinOwned = false,
 ): Promise<ExecResult> {
-  return withNumericFds(ctx, node.redirections, (fdTargets) =>
-    executeGroupBody(ctx, node, stdin, executeStatement, stdinOwned, fdTargets),
+  return withPreparedRedirections(ctx, node.redirections, stdin, (prepared) =>
+    executeGroupBody(ctx, node, stdin, executeStatement, stdinOwned, prepared),
   );
 }
 
@@ -279,77 +242,18 @@ async function executeGroupBody(
   stdin: string,
   executeStatement: ExecuteStatementFn,
   stdinOwned: boolean,
-  fdTargets: ExpandedRedirectTargets,
+  prepared: PreparedRedirections,
 ): Promise<ExecResult> {
   const output = new ExecutionOutputAccumulator(ctx.executionScope, "group");
   let exitCode = 0;
-
-  const preparedRedirects = await preOpenOutputRedirects(
-    ctx,
-    node.redirections,
-    fdTargets,
-  );
-  if (preparedRedirects.error) return preparedRedirects.error;
-
-  // Process FD variable redirections ({varname}>file syntax)
-  const fdVarError = await processFdVariableRedirections(
-    ctx,
-    node.redirections,
-    preparedRedirects.targets,
-  );
-  if (fdVarError) {
-    return fdVarError;
-  }
 
   // Process heredoc and input redirections to get stdin content.
   // `ownsStdin` records whether the group gets its *own* fd 0 — from a
   // pipeline (`… | { …; }`) or from a redirection on the group itself
   // (`{ …; } < file`, `<<EOT`, `<<<`). A group without one shares the
   // enclosing shell's stdin, which decides what has to be restored below.
-  let effectiveStdin = stdin;
-  let ownsStdin = stdinOwned || stdin !== "";
-  for (const redir of node.redirections) {
-    // `} 3< file` / `} 3<<EOF` are descriptors, handled by the fd table.
-    if (isNumericFdRedirection(redir)) continue;
-    if (
-      (redir.operator === "<<" || redir.operator === "<<-") &&
-      redir.target.type === "HereDoc"
-    ) {
-      const hereDoc = redir.target as HereDocNode;
-      let content = await expandWord(ctx, hereDoc.content);
-      if (hereDoc.stripTabs) {
-        content = content
-          .split("\n")
-          .map((line) => line.replace(/^\t+/, ""))
-          .join("\n");
-      }
-      // If this is a non-standard fd (not 0), store in fileDescriptors for -u option
-      const fd = redir.fd ?? 0;
-      if (fd !== 0) {
-        setFdEntry(ctx, fd, { kind: "input", content });
-      } else {
-        effectiveStdin = content;
-        ownsStdin = true;
-      }
-    } else if (redir.operator === "<<<" && redir.target.type === "Word") {
-      effectiveStdin = `${
-        preparedRedirects.targets.get(node.redirections.indexOf(redir)) ?? ""
-      }\n`;
-      ownsStdin = true;
-    } else if (redir.operator === "<" && redir.target.type === "Word") {
-      try {
-        const target =
-          preparedRedirects.targets.get(node.redirections.indexOf(redir)) ?? "";
-        const filePath = ctx.fs.resolvePath(ctx.state.cwd, target);
-        effectiveStdin = await ctx.fs.readFile(filePath);
-        ownsStdin = true;
-      } catch {
-        const target =
-          preparedRedirects.targets.get(node.redirections.indexOf(redir)) ?? "";
-        return result("", `bash: ${target}: No such file or directory\n`, 1);
-      }
-    }
-  }
+  const effectiveStdin = prepared.stdin ?? stdin;
+  const ownsStdin = stdinOwned || stdin !== "" || prepared.stdin !== undefined;
 
   // A group restores only the stdin it actually replaced.
   //
@@ -408,14 +312,7 @@ async function executeGroupBody(
   // Restore groupStdin
   restoreGroupStdin();
 
-  // Apply output redirections
-  const bodyResult = output.build(exitCode);
-  return applyRedirections(
-    ctx,
-    bodyResult,
-    node.redirections,
-    preparedRedirects.targets,
-  );
+  return output.build(exitCode);
 }
 
 /**

@@ -40,7 +40,8 @@ export type FdEntry =
   | { kind: "output"; path: string; append: boolean }
   | { kind: "readwrite"; path: string; position: number; content: string }
   | { kind: "dup-out"; sourceFd: number }
-  | { kind: "dup-in"; sourceFd: number };
+  | { kind: "dup-in"; sourceFd: number }
+  | { kind: "closed" };
 
 /**
  * A descriptor's raw value, whether it is known to hold content, and which
@@ -132,6 +133,8 @@ export function encodeFdEntry(entry: FdEntry): string {
       return `${DUP_OUT_PREFIX}${entry.sourceFd}`;
     case "dup-in":
       return `${DUP_IN_PREFIX}${entry.sourceFd}`;
+    case "closed":
+      throw new Error("Closed descriptors have no table encoding");
   }
 }
 
@@ -163,6 +166,13 @@ function aliasGroup(
   fd: number,
 ): Set<number> | undefined {
   return ctx.state.fdAliases?.get(fd);
+}
+
+export function getFdAliasMembers(
+  ctx: InterpreterContext,
+  fd: number,
+): number[] {
+  return [...(aliasGroup(ctx, fd) ?? [fd])];
 }
 
 /** Drop `fd` from its alias group; the last remaining member stops aliasing. */
@@ -275,6 +285,25 @@ export function dupFd(
   return true;
 }
 
+export function moveFd(
+  ctx: InterpreterContext,
+  fd: number,
+  sourceFd: number,
+): boolean {
+  const raw = getRawFd(ctx, sourceFd);
+  if (raw === undefined) return false;
+  if (fd === sourceFd) return true;
+  const isInput = ctx.state.inputFds?.has(sourceFd) === true;
+  const aliases = [...(aliasGroup(ctx, sourceFd) ?? [])].filter(
+    (member) => member !== sourceFd,
+  );
+  closeFd(ctx, sourceFd);
+  setRawFd(ctx, fd, raw, isInput);
+  const survivor = aliases.find((member) => isFdOpen(ctx, member));
+  if (survivor !== undefined) joinAliasGroup(ctx, fd, survivor);
+  return true;
+}
+
 /**
  * Readable bytes remaining on `fd`.
  * Returns a reason instead of content when the fd cannot be read from, so
@@ -295,6 +324,8 @@ export function readFd(
     case "dup-out":
       return { error: "write-only" };
     case "dup-in":
+      return { error: "not-open" };
+    case "closed":
       return { error: "not-open" };
   }
 }
@@ -329,6 +360,43 @@ export function advanceFd(
   for (const member of aliasGroup(ctx, fd) ?? [fd]) {
     writeRawFd(ctx, member, raw, isInput);
   }
+}
+
+export async function writeFdEntry(
+  ctx: InterpreterContext,
+  entry: FdEntry,
+  descriptors: number[],
+  content: string,
+  encoding: "binary" | "utf8",
+): Promise<boolean> {
+  if (entry.kind === "output") {
+    await ctx.fs.appendFile(entry.path, content, encoding);
+    return true;
+  }
+  const liveEntry = descriptors
+    .map((fd) => getFdEntry(ctx, fd))
+    .find(
+      (candidate): candidate is Extract<FdEntry, { kind: "readwrite" }> =>
+        candidate?.kind === "readwrite",
+    );
+  const writeEntry = liveEntry ?? entry;
+  if (writeEntry.kind !== "readwrite") return false;
+
+  const updatedContent =
+    writeEntry.content.slice(0, writeEntry.position) +
+    content +
+    writeEntry.content.slice(writeEntry.position + content.length);
+  const updated: FdEntry = {
+    ...writeEntry,
+    position: writeEntry.position + content.length,
+    content: updatedContent,
+  };
+  await ctx.fs.writeFile(writeEntry.path, updatedContent, encoding);
+  const raw = encodeFdEntry(updated);
+  for (const fd of descriptors) {
+    if (isFdOpen(ctx, fd)) writeRawFd(ctx, fd, raw, false);
+  }
+  return true;
 }
 
 /**

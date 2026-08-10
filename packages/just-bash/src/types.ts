@@ -42,6 +42,12 @@ export interface ExecResult {
   stdoutEncoding?: "binary";
   /** @internal PIPESTATUS override used by synthesized transform builtins. */
   internalPipeStatusOverride?: number[];
+  /** @internal Leaf command that produced output through wrapper builtins. */
+  internalProducerCommand?: string;
+  /** @internal Whether `exec` gives the producer external diagnostic formatting. */
+  internalProducerOmitsShellPrefix?: boolean;
+  /** @internal Bytes consumed from a descriptor-backed stdin stream. */
+  internalStdinConsumed?: number;
   /**
    * Bytes in the current result that have already been charged to the shared
    * execution output budget. Interpreter plumbing must preserve this when it

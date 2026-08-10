@@ -1,0 +1,53 @@
+{
+  "054df19fe4346154": {
+    "command": "exec >&all.txt; printf out; printf err >&2",
+    "files": {},
+    "stdout": "",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "1f8ee3e9d4901a3d": {
+    "command": "exec 3>&1; runner=exec; $runner >out.txt; echo after; cat out.txt >&3",
+    "files": {},
+    "stdout": "after\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "62b3ba73f0e8520d": {
+    "command": "fn() { printf before; printf problem >&2; return 4; } >out.txt 2>err.txt; fn; printf 'rc=%s out=%s err=%s' \"$?\" \"$(cat out.txt)\" \"$(cat err.txt)\"",
+    "files": {},
+    "stdout": "rc=4 out=before err=problem",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "be018183c46a5762": {
+    "command": "nosuchcommand 2<<EOF\nvalue\nEOF",
+    "files": {},
+    "stdout": "",
+    "stderr": "",
+    "exitCode": 127,
+    "locked": true
+  },
+  "c44d990bcd297e28": {
+    "command": "shopt -s expand_aliases; alias routed=': >alias.txt'; eval routed; echo after; test -f alias.txt && echo exists; test ! -s alias.txt && echo empty",
+    "files": {},
+    "stdout": "after\nexists\nempty\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "d00476b48ae1403e": {
+    "command": "echo hi 1<<EOF\nvalue\nEOF",
+    "files": {},
+    "stdout": "",
+    "stderr": "bash: echo: write error: Bad file descriptor\n",
+    "exitCode": 1,
+    "locked": true
+  },
+  "d6e5edf8fde1d9dc": {
+    "command": "read -u 1 one 1<<EOF\nfirst\nEOF\nread -u 2 two 2<<EOF\nsecond\nEOF\nprintf '%s:%s' \"$one\" \"$two\"",
+    "files": {},
+    "stdout": "first:second",
+    "stderr": "",
+    "exitCode": 0
+  }
+}

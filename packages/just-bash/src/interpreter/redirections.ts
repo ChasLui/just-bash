@@ -10,9 +10,21 @@
  * - {fd}>file : Allocate FD and store in variable
  */
 
-import type { RedirectionNode, WordNode } from "../ast/types.js";
-import { utf8ByteLength } from "../encoding.js";
+import type { HereDocNode, RedirectionNode, WordNode } from "../ast/types.js";
+import {
+  encodeUtf8ToBytes,
+  latin1FromBytes,
+  readBytesFrom,
+  utf8ByteLength,
+} from "../encoding.js";
 import type { ExecResult } from "../types.js";
+import {
+  ControlFlowError,
+  ErrexitError,
+  ExecutionLimitError,
+  ExitError,
+  ReturnError,
+} from "./errors.js";
 import {
   expandRedirectTarget,
   expandWord,
@@ -22,16 +34,25 @@ import {
   closeFd,
   dupFd,
   type FdEntry,
+  type FdSnapshot,
   FIRST_USER_FD,
+  getFdAliasMembers,
   getFdEntry,
+  isFdOpen,
+  moveFd,
+  readFd,
+  rememberFd,
+  restoreFds,
   setFdEntry,
+  writeFdEntry,
 } from "./fd-table.js";
 import { checkReadonlyError } from "./helpers/readonly.js";
-import { checkFdLimit, result as makeResult } from "./helpers/result.js";
-import { isNumericFdRedirection } from "./numeric-fd-redirects.js";
+import { result as makeResult } from "./helpers/result.js";
+import {
+  effectiveRedirectFd,
+  isNumericFdRedirection,
+} from "./numeric-fd-redirects.js";
 import type { InterpreterContext } from "./types.js";
-
-class RedirectTargetDoesNotExist extends Error {}
 
 /**
  * Check if a redirect target is valid for output (not a directory, respects noclobber).
@@ -88,351 +109,1001 @@ function getFileEncoding(content: string): "binary" | "utf8" {
   return "binary";
 }
 
-/**
- * Pre-expanded redirect targets, keyed by index into the redirections array.
- * This allows us to expand redirect targets (including side effects) before
- * executing a function body, then apply the redirections after.
- */
+/** Expanded targets keyed by their position in the original redirection list. */
 export type ExpandedRedirectTargets = Map<number, string>;
 
-/**
- * Pre-expand redirect targets for function definitions.
- * This is needed because redirections on function definitions are evaluated
- * each time the function is called, and any side effects (like $((i++)))
- * must occur BEFORE the function body executes.
- */
-export async function preExpandRedirectTargets(
-  ctx: InterpreterContext,
-  redirections: RedirectionNode[],
-  alreadyExpanded?: ExpandedRedirectTargets,
-): Promise<{ targets: ExpandedRedirectTargets; error?: string }> {
-  const targets: ExpandedRedirectTargets = new Map(alreadyExpanded);
+type PreparedDupSource =
+  | { kind: "standard"; fd: number }
+  | { kind: "entry"; entry: FdEntry; descriptors: number[] };
 
-  for (let i = 0; i < redirections.length; i++) {
-    const redir = redirections[i];
-    if (redir.target.type === "HereDoc") {
-      continue;
-    }
-    // Targets the numeric-fd pass already expanded must not be expanded
-    // again — a command substitution in a redirect target runs once.
-    if (targets.has(i)) {
-      continue;
-    }
+export type PreparedDupSources = Map<number, PreparedDupSource>;
 
-    const isFdRedirect = redir.operator === ">&" || redir.operator === "<&";
-    if (isFdRedirect) {
-      // Check for "$@" with multiple positional params - this is an ambiguous redirect
-      if (hasQuotedMultiValueAt(ctx, redir.target as WordNode)) {
-        return { targets, error: "bash: $@: ambiguous redirect\n" };
-      }
-      targets.set(i, await expandWord(ctx, redir.target as WordNode));
-    } else {
-      const expandResult = await expandRedirectTarget(
-        ctx,
-        redir.target as WordNode,
-      );
-      if ("error" in expandResult) {
-        return { targets, error: expandResult.error };
-      }
-      targets.set(i, expandResult.target);
-    }
-  }
+export type PreparedRedirections = {
+  targets: ExpandedRedirectTargets;
+  dupSources: PreparedDupSources;
+  standardRoutes: Map<number, FdEntry>;
+  stdin: string | undefined;
+  stdinSourceFd: number;
+  error: ExecResult | null;
+  errorCause?: ExitError | ExecutionLimitError;
+};
 
-  return { targets };
-}
+export type RedirectionPolicy = "scoped" | "bare" | "persistent";
 
-/**
- * Allocate the next available file descriptor (starting at 10).
- * Returns the allocated FD number.
- */
-function allocateFd(ctx: InterpreterContext): number {
-  if (ctx.state.nextFd === undefined) {
-    ctx.state.nextFd = 10;
-  }
-  const fd = ctx.state.nextFd;
-  const maxFds = ctx.limits.maxFileDescriptors;
-  if (fd >= maxFds) {
-    throw new Error(
-      `bash: cannot allocate file descriptor: too many open files (max ${maxFds})`,
-    );
-  }
-  ctx.state.nextFd++;
+export const SIMPLE_REDIRECTION_POLICY: RedirectionPolicy = "scoped";
+export const BARE_REDIRECTION_POLICY: RedirectionPolicy = "bare";
+export const EXEC_REDIRECTION_POLICY: RedirectionPolicy = "persistent";
+
+type RedirectionTransactionState = {
+  numericSnapshot: FdSnapshot;
+  fdVariableSnapshot: FdSnapshot;
+  standardSnapshot: FdSnapshot;
+  standardClosedSnapshot: Map<number, boolean>;
+  fdVariableEnv: Map<string, string | undefined>;
+  nextFd: number | undefined;
+  policy: RedirectionPolicy;
+};
+
+export type RedirectionTransaction = {
+  prepare: (inheritedStdin?: string) => Promise<PreparedRedirections>;
+  finish: () => void;
+};
+
+const fdLimitError = (ctx: InterpreterContext): ExecutionLimitError =>
+  new ExecutionLimitError(
+    `too many open file descriptors (max ${ctx.limits.maxFileDescriptors})`,
+    "file_descriptors",
+  );
+
+const hasFdCapacity = (ctx: InterpreterContext, fd: number): boolean =>
+  isFdOpen(ctx, fd) ||
+  (ctx.state.fileDescriptors?.size ?? 0) < ctx.limits.maxFileDescriptors;
+
+const nextFdVariable = (ctx: InterpreterContext): number => {
+  let fd = Math.max(ctx.state.nextFd ?? 10, 10);
+  while (isFdOpen(ctx, fd)) fd += 1;
   return fd;
+};
+
+const parseDupTarget = (
+  target: string,
+): { sourceFd: number; move: boolean } | null => {
+  const move = target.endsWith("-");
+  const sourceText = move ? target.slice(0, -1) : target;
+  if (!/^\d+$/.test(sourceText)) return null;
+  return { sourceFd: Number.parseInt(sourceText, 10), move };
+};
+
+const getDupSource = (
+  ctx: InterpreterContext,
+  sourceFd: number,
+  input: boolean,
+): PreparedDupSource | null => {
+  const entry = getFdEntry(ctx, sourceFd);
+  if (sourceFd < FIRST_USER_FD) {
+    return entry
+      ? { kind: "entry", entry, descriptors: getFdAliasMembers(ctx, sourceFd) }
+      : { kind: "standard", fd: sourceFd };
+  }
+  if (!entry) return null;
+  if (input) {
+    return entry.kind === "input" ||
+      entry.kind === "readwrite" ||
+      entry.kind === "dup-in"
+      ? { kind: "entry", entry, descriptors: getFdAliasMembers(ctx, sourceFd) }
+      : null;
+  }
+  return entry.kind === "output" ||
+    entry.kind === "readwrite" ||
+    entry.kind === "dup-out"
+    ? { kind: "entry", entry, descriptors: getFdAliasMembers(ctx, sourceFd) }
+    : null;
+};
+
+async function openOutputEntry(
+  ctx: InterpreterContext,
+  target: string,
+  append: boolean,
+  isClobber: boolean,
+  handleWriteError = true,
+): Promise<{ entry?: FdEntry; error?: ExecResult }> {
+  const filePath = ctx.fs.resolvePath(ctx.state.cwd, target);
+  const error = await checkOutputRedirectTarget(ctx, filePath, target, {
+    checkNoclobber: !append,
+    isClobber,
+  });
+  if (error) return { error: makeResult("", error, 1) };
+  if (target === "/dev/full") {
+    return {
+      error: makeResult("", "bash: /dev/full: No space left on device\n", 1),
+    };
+  }
+  if (target === "/dev/stdout") {
+    return { entry: { kind: "dup-out", sourceFd: 1 } };
+  }
+  if (target === "/dev/stderr") {
+    return { entry: { kind: "dup-out", sourceFd: 2 } };
+  }
+  try {
+    if (append) await ctx.fs.appendFile(filePath, "", "binary");
+    else await ctx.fs.writeFile(filePath, "", "binary");
+  } catch (error) {
+    if (!handleWriteError) throw error;
+    return {
+      error: makeResult(
+        "",
+        `bash: ${target}: cannot open redirect target\n`,
+        1,
+      ),
+    };
+  }
+  return { entry: { kind: "output", path: filePath, append } };
 }
 
+async function readInputEntry(
+  ctx: InterpreterContext,
+  target: string,
+  readwrite: boolean,
+): Promise<{ entry?: FdEntry; error?: ExecResult }> {
+  const filePath = ctx.fs.resolvePath(ctx.state.cwd, target);
+  try {
+    const content = await ctx.fs.readFile(filePath);
+    return readwrite
+      ? {
+          entry: {
+            kind: "readwrite",
+            path: filePath,
+            position: 0,
+            content,
+          },
+        }
+      : { entry: { kind: "input", content } };
+  } catch {
+    if (!readwrite) {
+      return {
+        error: makeResult(
+          "",
+          `bash: ${target}: No such file or directory\n`,
+          1,
+        ),
+      };
+    }
+    try {
+      await ctx.fs.writeFile(filePath, "", "binary");
+      return {
+        entry: {
+          kind: "readwrite",
+          path: filePath,
+          position: 0,
+          content: "",
+        },
+      };
+    } catch {
+      return {
+        error: makeResult(
+          "",
+          `bash: ${target}: No such file or directory\n`,
+          1,
+        ),
+      };
+    }
+  }
+}
+
+const hereDocContent = async (
+  ctx: InterpreterContext,
+  hereDoc: HereDocNode,
+): Promise<string> => {
+  const content = await expandWord(ctx, hereDoc.content);
+  return hereDoc.stripTabs
+    ? content
+        .split("\n")
+        .map((line) => line.replace(/^\t+/, ""))
+        .join("\n")
+    : content;
+};
+
 /**
- * Process FD variable redirections ({varname}>file syntax).
- * This allocates FDs and sets variables before command execution.
- * Returns an error result if there's an issue, or null if successful.
+ * Expand and install one command's redirections in source order.
+ *
+ * Each redirect is fully prepared before the next begins. A later failure
+ * therefore preserves earlier file effects and descriptor allocations, while
+ * the failing redirect itself cannot mutate the descriptor table after an
+ * unsuccessful open.
  */
-export async function processFdVariableRedirections(
+async function prepareRedirectionsWithState(
   ctx: InterpreterContext,
   redirections: RedirectionNode[],
-  preExpandedTargets?: ExpandedRedirectTargets,
-): Promise<ExecResult | null> {
+  inheritedStdin: string,
+  transaction: RedirectionTransactionState,
+): Promise<PreparedRedirections> {
+  const targets: ExpandedRedirectTargets = new Map();
+  const dupSources: PreparedDupSources = new Map();
+  const standardRoute = (fd: number, fallback: FdEntry): FdEntry =>
+    ctx.state.closedStandardFds?.has(fd)
+      ? { kind: "closed" }
+      : (getFdEntry(ctx, fd) ?? fallback);
+  const standardRoutes = new Map<number, FdEntry>([
+    [0, standardRoute(0, { kind: "dup-in", sourceFd: 0 })],
+    [1, standardRoute(1, { kind: "dup-out", sourceFd: 1 })],
+    [2, standardRoute(2, { kind: "dup-out", sourceFd: 2 })],
+  ]);
+  const snapshot = transaction.numericSnapshot;
+  let stdin: string | undefined;
+  let stdinSourceFd = -1;
+  const initialStdin = standardRoutes.get(0);
+  if (initialStdin?.kind === "input") {
+    stdin = initialStdin.content;
+    stdinSourceFd = 0;
+  } else if (initialStdin?.kind === "readwrite") {
+    stdin = initialStdin.content.slice(initialStdin.position);
+    stdinSourceFd = 0;
+  }
+  const base = (): PreparedRedirections => ({
+    targets,
+    dupSources,
+    standardRoutes,
+    stdin,
+    stdinSourceFd,
+    error: null,
+  });
+  const fail = async (
+    error: ExecResult,
+    index: number,
+    errorCause?: ExitError | ExecutionLimitError,
+  ): Promise<PreparedRedirections> => {
+    const prepared = {
+      ...base(),
+      error: await applyRedirections(
+        ctx,
+        error,
+        redirections.slice(0, index),
+        targets,
+        dupSources,
+        standardRoutes,
+      ),
+    };
+    if (errorCause) {
+      return { ...prepared, errorCause };
+    }
+    return prepared;
+  };
+  const requireCapacity = async (
+    fd: number,
+    index: number,
+  ): Promise<PreparedRedirections | null> => {
+    if (hasFdCapacity(ctx, fd)) return null;
+    const cause = fdLimitError(ctx);
+    return fail(
+      makeResult("", cause.stderr, ExecutionLimitError.EXIT_CODE),
+      index,
+      cause,
+    );
+  };
+  const persistStandard = (fd: number | null, entry: FdEntry): void => {
+    if (fd !== null && fd < FIRST_USER_FD) standardRoutes.set(fd, entry);
+    if (
+      transaction.policy === "persistent" &&
+      fd !== null &&
+      fd < FIRST_USER_FD
+    ) {
+      ctx.state.closedStandardFds?.delete(fd);
+      setFdEntry(ctx, fd, entry);
+    }
+  };
+  const bindTemporaryStandard = (fd: number, entry: FdEntry): void => {
+    standardRoutes.set(fd, entry);
+    rememberFd(ctx, transaction.standardSnapshot, fd);
+    if (!transaction.standardClosedSnapshot.has(fd)) {
+      transaction.standardClosedSnapshot.set(
+        fd,
+        ctx.state.closedStandardFds?.has(fd) === true,
+      );
+    }
+    ctx.state.closedStandardFds?.delete(fd);
+    setFdEntry(ctx, fd, entry);
+  };
+  const getPreparedDupSource = (
+    sourceFd: number,
+    input: boolean,
+  ): PreparedDupSource | null => {
+    if (sourceFd < FIRST_USER_FD) {
+      const entry = standardRoutes.get(sourceFd);
+      if (entry?.kind === "closed") return null;
+      return entry
+        ? {
+            kind: "entry",
+            entry,
+            descriptors: getFdAliasMembers(ctx, sourceFd),
+          }
+        : { kind: "standard", fd: sourceFd };
+    }
+    return getDupSource(ctx, sourceFd, input);
+  };
+
   for (let index = 0; index < redirections.length; index++) {
     const redir = redirections[index];
-    if (!redir.fdVariable || redir.target.type !== "Word") continue;
-    checkReadonlyError(ctx, redir.fdVariable);
+    const effectiveFd = effectiveRedirectFd(redir);
 
-    const isFdRedirect = redir.operator === ">&" || redir.operator === "<&";
-    let target = preExpandedTargets?.get(index);
-    if (target !== undefined) {
-      // Prepared by the compound-command open step; never expand it again.
-    } else if (isFdRedirect) {
-      if (hasQuotedMultiValueAt(ctx, redir.target as WordNode))
-        return makeResult("", "bash: $@: ambiguous redirect\n", 1);
+    if (redir.target.type === "HereDoc") {
+      const content = await hereDocContent(ctx, redir.target);
+      if (redir.fdVariable) {
+        try {
+          checkReadonlyError(ctx, redir.fdVariable);
+        } catch (error) {
+          if (!(error instanceof ExitError)) throw error;
+          return fail(
+            makeResult(error.stdout, error.stderr, error.exitCode),
+            index,
+            error,
+          );
+        }
+        const fd = nextFdVariable(ctx);
+        const capacityError = await requireCapacity(fd, index);
+        if (capacityError) return capacityError;
+        rememberFd(ctx, transaction.fdVariableSnapshot, fd);
+        if (!transaction.fdVariableEnv.has(redir.fdVariable)) {
+          transaction.fdVariableEnv.set(
+            redir.fdVariable,
+            ctx.state.env.get(redir.fdVariable),
+          );
+        }
+        setFdEntry(ctx, fd, { kind: "input", content });
+        ctx.state.env.set(redir.fdVariable, String(fd));
+        ctx.state.nextFd = fd + 1;
+      } else if (effectiveFd !== null && effectiveFd >= FIRST_USER_FD) {
+        const capacityError = await requireCapacity(effectiveFd, index);
+        if (capacityError) return capacityError;
+        rememberFd(ctx, snapshot, effectiveFd);
+        setFdEntry(ctx, effectiveFd, { kind: "input", content });
+      } else if (effectiveFd === 0 || effectiveFd === null) {
+        stdin = latin1FromBytes(encodeUtf8ToBytes(content));
+        stdinSourceFd = -1;
+        persistStandard(effectiveFd, { kind: "input", content: stdin });
+      } else {
+        const entry: FdEntry = { kind: "input", content };
+        if (transaction.policy === "persistent") {
+          persistStandard(effectiveFd, entry);
+        } else {
+          bindTemporaryStandard(effectiveFd, entry);
+        }
+      }
+      continue;
+    }
+
+    let target: string;
+    const isDup = redir.operator === ">&" || redir.operator === "<&";
+    if (isDup) {
+      if (hasQuotedMultiValueAt(ctx, redir.target as WordNode)) {
+        return fail(makeResult("", "bash: $@: ambiguous redirect\n", 1), index);
+      }
+      target = await expandWord(ctx, redir.target as WordNode);
+    } else if (redir.operator === "<<<") {
       target = await expandWord(ctx, redir.target as WordNode);
     } else {
       const expanded = await expandRedirectTarget(
         ctx,
         redir.target as WordNode,
       );
-      if ("error" in expanded) return makeResult("", expanded.error, 1);
+      if ("error" in expanded) {
+        return fail(makeResult("", expanded.error, 1), index);
+      }
       target = expanded.target;
     }
+    targets.set(index, target);
 
-    if (target.includes("\0"))
-      return makeResult(
-        "",
-        `bash: ${target.replace(/\0/g, "")}: No such file or directory\n`,
-        1,
+    if (target.includes("\0")) {
+      return fail(
+        makeResult(
+          "",
+          `bash: ${target.replace(/\0/g, "")}: No such file or directory\n`,
+          1,
+        ),
+        index,
       );
+    }
 
-    ctx.state.fileDescriptors ??= new Map();
-    if (isFdRedirect && target === "-") {
-      const existingFd = ctx.state.env.get(redir.fdVariable);
-      if (existingFd !== undefined) {
-        const fdNum = Number.parseInt(existingFd, 10);
-        if (!Number.isNaN(fdNum)) closeFd(ctx, fdNum);
+    if (redir.fdVariable) {
+      try {
+        checkReadonlyError(ctx, redir.fdVariable);
+      } catch (error) {
+        if (!(error instanceof ExitError)) throw error;
+        return fail(
+          makeResult(error.stdout, error.stderr, error.exitCode),
+          index,
+          error,
+        );
+      }
+
+      if (isDup && target === "-") {
+        const existingFd = Number.parseInt(
+          ctx.state.env.get(redir.fdVariable) ?? "",
+          10,
+        );
+        if (!Number.isNaN(existingFd)) {
+          rememberFd(ctx, transaction.fdVariableSnapshot, existingFd);
+          closeFd(ctx, existingFd);
+        }
+        continue;
+      }
+
+      const fd = nextFdVariable(ctx);
+      const plannedDuplicate = isDup ? parseDupTarget(target) : null;
+      if (plannedDuplicate) {
+        const source = getPreparedDupSource(
+          plannedDuplicate.sourceFd,
+          redir.operator === "<&",
+        );
+        if (!source) {
+          return fail(
+            makeResult(
+              "",
+              `bash: ${plannedDuplicate.sourceFd}: Bad file descriptor\n`,
+              1,
+            ),
+            index,
+          );
+        }
+      }
+      const netNeutralMove =
+        plannedDuplicate?.move === true &&
+        plannedDuplicate.sourceFd >= FIRST_USER_FD;
+      if (!netNeutralMove) {
+        const capacityError = await requireCapacity(fd, index);
+        if (capacityError) return capacityError;
+      }
+      rememberFd(ctx, transaction.fdVariableSnapshot, fd);
+      if (!transaction.fdVariableEnv.has(redir.fdVariable)) {
+        transaction.fdVariableEnv.set(
+          redir.fdVariable,
+          ctx.state.env.get(redir.fdVariable),
+        );
+      }
+      let entry: FdEntry | undefined;
+      let duplicate: { sourceFd: number; move: boolean } | undefined;
+
+      if (isDup) {
+        const parsed = plannedDuplicate;
+        if (!parsed) {
+          if (redir.operator === "<&") {
+            return fail(
+              makeResult("", `bash: ${target}: ambiguous redirect\n`, 1),
+              index,
+            );
+          }
+          const opened = await openOutputEntry(ctx, target, false, false);
+          if (opened.error) return fail(opened.error, index);
+          entry = opened.entry;
+        } else {
+          const source = getPreparedDupSource(
+            parsed.sourceFd,
+            redir.operator === "<&",
+          );
+          if (!source) {
+            return fail(
+              makeResult(
+                "",
+                `bash: ${parsed.sourceFd}: Bad file descriptor\n`,
+                1,
+              ),
+              index,
+            );
+          }
+          duplicate = parsed;
+          if (source.kind === "standard") {
+            entry = {
+              kind: redir.operator === "<&" ? "dup-in" : "dup-out",
+              sourceFd: source.fd,
+            };
+          } else if (parsed.sourceFd < FIRST_USER_FD) {
+            entry = source.entry;
+          }
+        }
+      } else if (
+        redir.operator === ">" ||
+        redir.operator === ">|" ||
+        redir.operator === ">>" ||
+        redir.operator === "&>" ||
+        redir.operator === "&>>"
+      ) {
+        const append = redir.operator === ">>" || redir.operator === "&>>";
+        const opened = await openOutputEntry(
+          ctx,
+          target,
+          append,
+          redir.operator === ">|",
+        );
+        if (opened.error) return fail(opened.error, index);
+        entry = opened.entry;
+      } else if (redir.operator === "<<<") {
+        entry = { kind: "input", content: `${target}\n` };
+      } else if (redir.operator === "<" || redir.operator === "<>") {
+        const opened = await readInputEntry(
+          ctx,
+          target,
+          redir.operator === "<>",
+        );
+        if (opened.error) return fail(opened.error, index);
+        entry = opened.entry;
+      }
+
+      if (duplicate && duplicate.sourceFd >= FIRST_USER_FD) {
+        const duplicated = duplicate.move
+          ? moveFd(ctx, fd, duplicate.sourceFd)
+          : dupFd(ctx, fd, duplicate.sourceFd);
+        if (!duplicated) {
+          return fail(
+            makeResult(
+              "",
+              `bash: ${duplicate.sourceFd}: Bad file descriptor\n`,
+              1,
+            ),
+            index,
+          );
+        }
+      } else if (entry) {
+        setFdEntry(ctx, fd, entry);
+      }
+      if (
+        duplicate?.move &&
+        duplicate.sourceFd !== fd &&
+        duplicate.sourceFd < FIRST_USER_FD
+      ) {
+        closeFd(ctx, duplicate.sourceFd);
+      }
+      ctx.state.env.set(redir.fdVariable, String(fd));
+      ctx.state.nextFd = fd + 1;
+      continue;
+    }
+
+    if (isNumericFdRedirection(redir)) {
+      const fd = effectiveFd as number;
+      if (isDup && target === "-") {
+        rememberFd(ctx, snapshot, fd);
+        closeFd(ctx, fd);
+        continue;
+      }
+      const plannedDuplicate = isDup ? parseDupTarget(target) : null;
+      if (plannedDuplicate) {
+        const source = getPreparedDupSource(
+          plannedDuplicate.sourceFd,
+          redir.operator === "<&",
+        );
+        if (!source) {
+          return fail(
+            makeResult(
+              "",
+              `bash: ${plannedDuplicate.sourceFd}: Bad file descriptor\n`,
+              1,
+            ),
+            index,
+          );
+        }
+      }
+      const netNeutralMove =
+        plannedDuplicate?.move === true &&
+        plannedDuplicate.sourceFd >= FIRST_USER_FD;
+      if (!netNeutralMove) {
+        const capacityError = await requireCapacity(fd, index);
+        if (capacityError) return capacityError;
+      }
+      rememberFd(ctx, snapshot, fd);
+
+      if (isDup) {
+        const parsed = plannedDuplicate;
+        if (!parsed) {
+          if (redir.operator === "<&") {
+            return fail(
+              makeResult("", `bash: ${target}: ambiguous redirect\n`, 1),
+              index,
+            );
+          }
+          const opened = await openOutputEntry(ctx, target, false, false);
+          if (opened.error) return fail(opened.error, index);
+          setFdEntry(ctx, fd, opened.entry as FdEntry);
+          continue;
+        }
+        const source = getPreparedDupSource(
+          parsed.sourceFd,
+          redir.operator === "<&",
+        );
+        if (!source) {
+          return fail(
+            makeResult(
+              "",
+              `bash: ${parsed.sourceFd}: Bad file descriptor\n`,
+              1,
+            ),
+            index,
+          );
+        }
+        if (source.kind === "standard") {
+          setFdEntry(ctx, fd, {
+            kind: redir.operator === "<&" ? "dup-in" : "dup-out",
+            sourceFd: source.fd,
+          });
+        } else if (parsed.sourceFd < FIRST_USER_FD) {
+          setFdEntry(ctx, fd, source.entry);
+        } else if (
+          !(parsed.move
+            ? moveFd(ctx, fd, parsed.sourceFd)
+            : dupFd(ctx, fd, parsed.sourceFd))
+        ) {
+          return fail(
+            makeResult(
+              "",
+              `bash: ${parsed.sourceFd}: Bad file descriptor\n`,
+              1,
+            ),
+            index,
+          );
+        }
+        if (
+          parsed.move &&
+          parsed.sourceFd !== fd &&
+          parsed.sourceFd < FIRST_USER_FD
+        )
+          closeFd(ctx, parsed.sourceFd);
+        continue;
+      }
+
+      if (
+        redir.operator === ">" ||
+        redir.operator === ">|" ||
+        redir.operator === ">>"
+      ) {
+        const opened = await openOutputEntry(
+          ctx,
+          target,
+          redir.operator === ">>",
+          redir.operator === ">|",
+        );
+        if (opened.error) return fail(opened.error, index);
+        setFdEntry(ctx, fd, opened.entry as FdEntry);
+      } else if (redir.operator === "<<<") {
+        setFdEntry(ctx, fd, { kind: "input", content: `${target}\n` });
+      } else if (redir.operator === "<" || redir.operator === "<>") {
+        const opened = await readInputEntry(
+          ctx,
+          target,
+          redir.operator === "<>",
+        );
+        if (opened.error) return fail(opened.error, index);
+        setFdEntry(ctx, fd, opened.entry as FdEntry);
       }
       continue;
     }
 
-    let fdInfo: FdEntry | undefined;
-    if (isFdRedirect) {
-      const sourceFd = Number.parseInt(target, 10);
-      if (!Number.isNaN(sourceFd)) fdInfo = getFdEntry(ctx, sourceFd);
-    } else if (
+    if (isDup) {
+      if (target === "-") {
+        if (effectiveFd === 0) {
+          stdin = "";
+          stdinSourceFd = -1;
+        }
+        if (effectiveFd !== null && effectiveFd < FIRST_USER_FD) {
+          standardRoutes.set(effectiveFd, { kind: "closed" });
+          if (transaction.policy === "persistent") {
+            closeFd(ctx, effectiveFd);
+            ctx.state.closedStandardFds ??= new Set();
+            ctx.state.closedStandardFds.add(effectiveFd);
+          }
+        }
+        continue;
+      }
+      const parsed = parseDupTarget(target);
+      if (!parsed) {
+        if (redir.operator === "<&") {
+          return fail(
+            makeResult("", `bash: ${target}: ambiguous redirect\n`, 1),
+            index,
+          );
+        }
+        const opened = await openOutputEntry(ctx, target, false, false, false);
+        if (opened.error) return fail(opened.error, index);
+        const entry = opened.entry as FdEntry;
+        dupSources.set(index, {
+          kind: "entry",
+          entry,
+          descriptors: [],
+        });
+        if (redir.fd == null) {
+          persistStandard(1, entry);
+          persistStandard(2, entry);
+        } else {
+          persistStandard(effectiveFd, entry);
+        }
+        continue;
+      }
+      const source = getPreparedDupSource(
+        parsed.sourceFd,
+        redir.operator === "<&",
+      );
+      if (!source) {
+        return fail(
+          makeResult("", `bash: ${parsed.sourceFd}: Bad file descriptor\n`, 1),
+          index,
+        );
+      }
+      dupSources.set(index, source);
+      if (
+        source.kind === "entry" &&
+        transaction.policy === "persistent" &&
+        effectiveFd !== null &&
+        effectiveFd < FIRST_USER_FD &&
+        parsed.sourceFd >= FIRST_USER_FD
+      ) {
+        if (!dupFd(ctx, effectiveFd, parsed.sourceFd)) {
+          return fail(
+            makeResult(
+              "",
+              `bash: ${parsed.sourceFd}: Bad file descriptor\n`,
+              1,
+            ),
+            index,
+          );
+        }
+        standardRoutes.set(
+          effectiveFd,
+          getFdEntry(ctx, effectiveFd) as FdEntry,
+        );
+        ctx.state.closedStandardFds?.delete(effectiveFd);
+      } else if (source.kind === "standard") {
+        persistStandard(effectiveFd, {
+          kind: redir.operator === "<&" ? "dup-in" : "dup-out",
+          sourceFd: source.fd,
+        });
+      } else {
+        persistStandard(effectiveFd, source.entry);
+      }
+      if (redir.operator === "<&" && effectiveFd === 0) {
+        if (source.kind === "standard") {
+          stdin = source.fd === 0 ? inheritedStdin : "";
+          stdinSourceFd = -1;
+        } else if (
+          source.entry.kind === "input" ||
+          source.entry.kind === "readwrite"
+        ) {
+          const readable =
+            parsed.sourceFd < FIRST_USER_FD && !isFdOpen(ctx, parsed.sourceFd)
+              ? {
+                  content:
+                    source.entry.kind === "input"
+                      ? source.entry.content
+                      : source.entry.content.slice(source.entry.position),
+                }
+              : readFd(ctx, parsed.sourceFd);
+          if ("error" in readable) {
+            return fail(
+              makeResult(
+                "",
+                `bash: ${parsed.sourceFd}: Bad file descriptor\n`,
+                1,
+              ),
+              index,
+            );
+          }
+          stdin = readable.content;
+          stdinSourceFd = isFdOpen(ctx, parsed.sourceFd) ? parsed.sourceFd : -1;
+        } else {
+          stdin = inheritedStdin;
+          stdinSourceFd = -1;
+        }
+      }
+      if (parsed.move) {
+        if (parsed.sourceFd >= FIRST_USER_FD) {
+          closeFd(ctx, parsed.sourceFd);
+        } else {
+          standardRoutes.set(parsed.sourceFd, { kind: "closed" });
+          if (transaction.policy === "persistent") {
+            closeFd(ctx, parsed.sourceFd);
+            ctx.state.closedStandardFds ??= new Set();
+            ctx.state.closedStandardFds.add(parsed.sourceFd);
+          }
+        }
+      }
+      continue;
+    }
+
+    if (
       redir.operator === ">" ||
-      redir.operator === ">>" ||
       redir.operator === ">|" ||
+      redir.operator === ">>" ||
       redir.operator === "&>" ||
       redir.operator === "&>>"
     ) {
-      const filePath = ctx.fs.resolvePath(ctx.state.cwd, target);
-      const append = redir.operator === ">>" || redir.operator === "&>>";
-      const redirectOptions = append
-        ? { checkNoclobber: false }
-        : { checkNoclobber: true, isClobber: redir.operator === ">|" };
-      const error = await checkOutputRedirectTarget(
+      const opened = await openOutputEntry(
         ctx,
-        filePath,
         target,
-        redirectOptions,
+        redir.operator === ">>" || redir.operator === "&>>",
+        redir.operator === ">|",
+        false,
       );
-      if (error) return makeResult("", error, 1);
-      checkFdLimit(ctx);
-      if (append) await ctx.fs.appendFile(filePath, "", "binary");
-      else await ctx.fs.writeFile(filePath, "", "binary");
-      fdInfo = { kind: "output", path: filePath, append };
-    } else if (redir.operator === "<<<") {
-      fdInfo = { kind: "input", content: `${target}\n` };
-    } else if (redir.operator === "<" || redir.operator === "<>") {
+      if (opened.error) return fail(opened.error, index);
+      const entry = opened.entry as FdEntry;
+      if (redir.operator === "&>" || redir.operator === "&>>") {
+        persistStandard(1, entry);
+        persistStandard(2, entry);
+      } else {
+        persistStandard(effectiveFd, entry);
+      }
+      continue;
+    }
+
+    if (redir.operator === "<<<") {
+      stdin = latin1FromBytes(encodeUtf8ToBytes(`${target}\n`));
+      stdinSourceFd = -1;
+      persistStandard(effectiveFd, { kind: "input", content: stdin });
+    } else if (redir.operator === "<") {
+      const filePath = ctx.fs.resolvePath(ctx.state.cwd, target);
       try {
-        const filePath = ctx.fs.resolvePath(ctx.state.cwd, target);
-        fdInfo = { kind: "input", content: await ctx.fs.readFile(filePath) };
+        stdin = (await readBytesFrom(ctx.fs, filePath)) as unknown as string;
+        stdinSourceFd = -1;
+        persistStandard(effectiveFd, { kind: "input", content: stdin });
       } catch {
-        return makeResult(
-          "",
-          `bash: ${target}: No such file or directory\n`,
-          1,
+        return fail(
+          makeResult("", `bash: ${target}: No such file or directory\n`, 1),
+          index,
         );
       }
+    } else if (redir.operator === "<>") {
+      const opened = await readInputEntry(ctx, target, true);
+      if (opened.error) return fail(opened.error, index);
+      const entry = opened.entry as FdEntry;
+      persistStandard(effectiveFd, entry);
+      if (effectiveFd === 0 && entry.kind === "readwrite") {
+        stdin = entry.content;
+        stdinSourceFd = -1;
+      }
     }
-
-    checkFdLimit(ctx);
-    const fd = allocateFd(ctx);
-    ctx.state.env.set(redir.fdVariable, String(fd));
-    if (fdInfo !== undefined) setFdEntry(ctx, fd, fdInfo);
   }
 
-  return null; // Success
+  return base();
 }
 
-/**
- * Pre-open (truncate) output redirect files before command execution.
- * This is needed for compound commands (subshell, for, case, [[) where
- * bash opens/truncates the redirect file BEFORE evaluating any words in
- * the command body (including command substitutions).
- *
- * Example: `(echo \`cat FILE\`) > FILE`
- * - Bash first truncates FILE (making it empty)
- * - Then executes the subshell, where `cat FILE` returns empty string
- *
- * Returns an error result if there's an issue (like directory or noclobber),
- * or null if pre-opening succeeded.
- */
-export async function preOpenOutputRedirects(
+export function createRedirectionTransaction(
   ctx: InterpreterContext,
   redirections: RedirectionNode[],
-  alreadyExpanded?: ExpandedRedirectTargets,
-): Promise<{
-  targets: ExpandedRedirectTargets;
-  error: ExecResult | null;
-}> {
-  for (const redirection of redirections) {
-    if (redirection.fdVariable) checkReadonlyError(ctx, redirection.fdVariable);
+  policy: RedirectionPolicy,
+): RedirectionTransaction {
+  const state: RedirectionTransactionState = {
+    numericSnapshot: new Map(),
+    fdVariableSnapshot: new Map(),
+    standardSnapshot: new Map(),
+    standardClosedSnapshot: new Map(),
+    fdVariableEnv: new Map(),
+    nextFd: ctx.state.nextFd,
+    policy,
+  };
+  let finished = false;
+  return {
+    prepare: (inheritedStdin = "") =>
+      prepareRedirectionsWithState(ctx, redirections, inheritedStdin, state),
+    finish: () => {
+      if (finished) return;
+      finished = true;
+      if (policy !== "persistent") {
+        restoreFds(ctx, state.numericSnapshot);
+      }
+      if (policy !== "persistent") {
+        restoreFds(ctx, state.standardSnapshot);
+        for (const [fd, wasClosed] of state.standardClosedSnapshot) {
+          if (wasClosed) {
+            ctx.state.closedStandardFds ??= new Set();
+            ctx.state.closedStandardFds.add(fd);
+          } else {
+            ctx.state.closedStandardFds?.delete(fd);
+          }
+        }
+      }
+      if (policy === "bare") {
+        restoreFds(ctx, state.fdVariableSnapshot);
+        for (const [name, value] of state.fdVariableEnv) {
+          if (value === undefined) ctx.state.env.delete(name);
+          else ctx.state.env.set(name, value);
+        }
+        ctx.state.nextFd = state.nextFd;
+      }
+    },
+  };
+}
+
+export function preparedRedirectionError(
+  prepared: PreparedRedirections,
+): ExecResult {
+  if (!prepared.error) throw new Error("Expected a redirection error");
+  if (prepared.errorCause) {
+    prepared.errorCause.stdout = prepared.error.stdout;
+    prepared.errorCause.stderr = prepared.error.stderr;
+    throw prepared.errorCause;
   }
-  const expanded = await preExpandRedirectTargets(
+  return prepared.error;
+}
+
+export async function routeControlFlowError(
+  ctx: InterpreterContext,
+  error: ControlFlowError,
+  redirections: RedirectionNode[],
+  prepared: PreparedRedirections,
+): Promise<void> {
+  const exitCode =
+    error instanceof ExitError ||
+    error instanceof ReturnError ||
+    error instanceof ErrexitError
+      ? error.exitCode
+      : error instanceof ExecutionLimitError
+        ? ExecutionLimitError.EXIT_CODE
+        : 0;
+  const routed = await applyRedirections(
+    ctx,
+    makeResult(error.stdout, error.stderr, exitCode),
+    redirections,
+    prepared.targets,
+    prepared.dupSources,
+    prepared.standardRoutes,
+  );
+  error.stdout = routed.stdout;
+  error.stderr = routed.stderr;
+  error.internalOutputAccounting = routed.internalOutputAccounting ?? {
+    stdout: utf8ByteLength(routed.stdout),
+    stderr: utf8ByteLength(routed.stderr),
+  };
+}
+
+export async function withPreparedRedirections(
+  ctx: InterpreterContext,
+  redirections: RedirectionNode[],
+  inheritedStdin: string,
+  run: (prepared: PreparedRedirections) => Promise<ExecResult>,
+): Promise<ExecResult> {
+  const transaction = createRedirectionTransaction(
     ctx,
     redirections,
-    alreadyExpanded,
+    SIMPLE_REDIRECTION_POLICY,
   );
-  if (expanded.error)
-    return {
-      targets: expanded.targets,
-      error: makeResult("", expanded.error, 1),
-    };
-
-  const targetsToOpen: Array<{ filePath: string; target: string }> = [];
-  for (let index = 0; index < redirections.length; index++) {
-    const redir = redirections[index];
-    if (redir.target.type === "HereDoc") {
-      continue;
+  let prepared: PreparedRedirections | undefined;
+  try {
+    prepared = await transaction.prepare(inheritedStdin);
+    if (prepared.error) return preparedRedirectionError(prepared);
+    const savedGroupStdin = ctx.state.groupStdin;
+    const savedGroupStdinSourceFd = ctx.state.groupStdinSourceFd;
+    if (prepared.stdin !== undefined) {
+      ctx.state.groupStdin = prepared.stdin;
+      ctx.state.groupStdinSourceFd = prepared.stdinSourceFd;
     }
-
-    // Descriptors named by number are opened (and truncated) by the
-    // numeric-fd pass, which runs before this one.
-    if (isNumericFdRedirection(redir)) {
-      continue;
-    }
-
-    // Only handle output truncation redirects (>, >|, &>)
-    // Append (>>, &>>) doesn't need pre-truncation
-    // >&word needs special handling - it's a file redirect only if word is not a number
-    const isGreaterAmpersand = redir.operator === ">&";
-    if (
-      redir.operator !== ">" &&
-      redir.operator !== ">|" &&
-      redir.operator !== "&>" &&
-      !isGreaterAmpersand
-    ) {
-      continue;
-    }
-
-    // Expand redirect target with glob handling (failglob, ambiguous redirect)
-    // For >&, use plain expansion first to check if it's a number
-    const target = expanded.targets.get(index);
-    if (target === undefined) continue;
-    if (isGreaterAmpersand) {
-      // If it's a number, -, or has explicit fd, it's an FD redirect, not a file redirect
-      if (
-        target === "-" ||
-        !Number.isNaN(Number.parseInt(target, 10)) ||
-        redir.fd != null
-      ) {
-        continue;
-      }
-    }
-    const filePath = ctx.fs.resolvePath(ctx.state.cwd, target);
-    const isClobber = redir.operator === ">|";
-
-    // Reject paths containing null bytes - these cause filesystem errors
-    // and are never valid in bash
-    if (filePath.includes("\0")) {
-      return {
-        targets: expanded.targets,
-        error: makeResult(
-          "",
-          `bash: ${target}: No such file or directory\n`,
-          1,
-        ),
-      };
-    }
-
-    // Check if target is a directory or noclobber prevents overwrite
     try {
-      const exists = await ctx.fs.exists(filePath);
-      if (!exists) throw new RedirectTargetDoesNotExist();
-      const stat = await ctx.fs.stat(filePath);
-      if (stat.isDirectory) {
-        return {
-          targets: expanded.targets,
-          error: makeResult("", `bash: ${target}: Is a directory\n`, 1),
-        };
-      }
-      // Check noclobber: if file exists and noclobber is set, refuse to overwrite
-      // unless using >| (clobber operator) or writing to /dev/null
-      if (
-        ctx.state.options.noclobber &&
-        !isClobber &&
-        !stat.isDirectory &&
-        target !== "/dev/null"
-      ) {
-        return {
-          targets: expanded.targets,
-          error: makeResult(
-            "",
-            `bash: ${target}: cannot overwrite existing file\n`,
-            1,
-          ),
-        };
-      }
-    } catch (error) {
-      if (!(error instanceof RedirectTargetDoesNotExist)) {
-        return {
-          targets: expanded.targets,
-          error: makeResult(
-            "",
-            `bash: ${target}: cannot open redirect target\n`,
-            1,
-          ),
-        };
+      const result = await run(prepared);
+      return await applyRedirections(
+        ctx,
+        result,
+        redirections,
+        prepared.targets,
+        prepared.dupSources,
+        prepared.standardRoutes,
+      );
+    } finally {
+      if (prepared.stdin !== undefined) {
+        ctx.state.groupStdin = savedGroupStdin;
+        ctx.state.groupStdinSourceFd = savedGroupStdinSourceFd;
       }
     }
-
-    // /dev/full always returns ENOSPC when written to
-    if (target === "/dev/full") {
-      return {
-        targets: expanded.targets,
-        error: makeResult("", `bash: /dev/full: No space left on device\n`, 1),
-      };
-    }
-    if (
-      target !== "/dev/null" &&
-      target !== "/dev/stdout" &&
-      target !== "/dev/stderr"
-    )
-      targetsToOpen.push({ filePath, target });
+  } catch (error) {
+    if (!(error instanceof ControlFlowError) || !prepared) throw error;
+    await routeControlFlowError(ctx, error, redirections, prepared);
+    throw error;
+  } finally {
+    transaction.finish();
   }
-
-  // Only begin destructive opens after every target has expanded and passed
-  // policy validation. This prevents a later directory/noclobber failure from
-  // leaving an earlier redirect truncated.
-  for (const { filePath, target } of targetsToOpen) {
-    try {
-      await ctx.fs.writeFile(filePath, "", "binary");
-    } catch {
-      return {
-        targets: expanded.targets,
-        error: makeResult(
-          "",
-          `bash: ${target}: cannot open redirect target\n`,
-          1,
-        ),
-      };
-    }
-  }
-
-  return { targets: expanded.targets, error: null };
 }
 
 export async function applyRedirections(
   ctx: InterpreterContext,
   result: ExecResult,
   redirections: RedirectionNode[],
-  preExpandedTargets?: ExpandedRedirectTargets,
+  targets: ExpandedRedirectTargets,
+  dupSources: PreparedDupSources = new Map(),
+  standardRoutes: Map<number, FdEntry> = new Map(),
+  writeErrorCommand = "bash",
+  omitShellPrefix = false,
 ): Promise<ExecResult> {
   // Output redirected away from the caller still consumes the shared budget.
   // Unredirected pipeline output is charged once at the pipeline boundary.
@@ -463,10 +1134,10 @@ export async function applyRedirections(
   const getStdoutEncoding = (_content: string): "binary" | "utf8" =>
     stdoutFileEncoding;
 
-  // Where fds 1 and 2 currently point as the redirection list is processed
-  // left to right. File redirections write their stream eagerly and update
-  // the fd's sink; duplication operators (`2>&1`, `1>&2`) only re-point the
-  // fd to a snapshot of the source fd's current sink. Content still held in
+  // Where fds 1 and 2 point after replaying the already-prepared redirection
+  // list. File targets were opened before command execution; this pass only
+  // selects sinks. Duplication operators (`2>&1`, `1>&2`) re-point the fd to a
+  // snapshot of the source fd's current sink. Content still held in
   // a stream when the list ends is delivered to that fd's final sink below —
   // so `cmd > file 2>&1` sends stderr to `file`, `cmd 2>&1 > file` sends
   // stderr to the caller's stdout, and `cmd > all 2>&1 2> err` lets the
@@ -475,9 +1146,58 @@ export async function applyRedirections(
     | { kind: "live-stdout" }
     | { kind: "live-stderr" }
     | { kind: "file"; path: string; append: boolean }
+    | {
+        kind: "descriptor";
+        source: Extract<PreparedDupSource, { kind: "entry" }>;
+      }
+    | { kind: "invalid-output"; fd: 1 | 2 }
     | { kind: "discard" };
   let fd1Sink: RedirectSink = { kind: "live-stdout" };
   let fd2Sink: RedirectSink = { kind: "live-stderr" };
+  const sinkFromDupSource = (
+    source: PreparedDupSource | undefined,
+  ): RedirectSink | null => {
+    if (!source) return null;
+    if (source.kind === "entry") {
+      if (source.entry.kind === "dup-out") {
+        if (source.entry.sourceFd === 1) return { kind: "live-stdout" };
+        if (source.entry.sourceFd === 2) return { kind: "live-stderr" };
+      }
+      if (source.entry.kind === "output" || source.entry.kind === "readwrite") {
+        return { kind: "descriptor", source };
+      }
+      return null;
+    }
+    if (source.fd === 1) return fd1Sink;
+    if (source.fd === 2) return fd2Sink;
+    return null;
+  };
+  const persistentSink = (fd: 1 | 2): RedirectSink | null => {
+    const entry = standardRoutes.get(fd) ?? getFdEntry(ctx, fd);
+    if (!entry) return null;
+    if (entry.kind === "closed") return { kind: "invalid-output", fd };
+    if (entry.kind === "input" || entry.kind === "dup-in") {
+      return { kind: "invalid-output", fd };
+    }
+    if (entry.kind === "dup-out") {
+      if (entry.sourceFd === 1) return { kind: "live-stdout" };
+      if (entry.sourceFd === 2) return { kind: "live-stderr" };
+      return null;
+    }
+    if (entry.kind === "output" || entry.kind === "readwrite") {
+      return {
+        kind: "descriptor",
+        source: {
+          kind: "entry",
+          entry,
+          descriptors: getFdAliasMembers(ctx, fd),
+        },
+      };
+    }
+    return null;
+  };
+  fd1Sink = persistentSink(1) ?? fd1Sink;
+  fd2Sink = persistentSink(2) ?? fd2Sink;
 
   for (let i = 0; i < redirections.length; i++) {
     const redir = redirections[i];
@@ -485,53 +1205,14 @@ export async function applyRedirections(
       continue;
     }
 
-    // Use pre-expanded target if available, otherwise expand now
-    let target: string;
-    const preExpanded = preExpandedTargets?.get(i);
-    if (preExpanded !== undefined) {
-      target = preExpanded;
-    } else {
-      // For FD-to-FD redirects (>&), use plain expansion without glob handling
-      // For file redirects, use glob expansion with failglob/ambiguous redirect handling
-      const isFdRedirect = redir.operator === ">&" || redir.operator === "<&";
-      if (isFdRedirect) {
-        // Check for "$@" with multiple positional params - this is an ambiguous redirect
-        if (hasQuotedMultiValueAt(ctx, redir.target as WordNode)) {
-          stderr += "bash: $@: ambiguous redirect\n";
-          exitCode = 1;
-          stdout = "";
-          continue;
-        }
-        target = await expandWord(ctx, redir.target as WordNode);
-      } else {
-        const expandResult = await expandRedirectTarget(
-          ctx,
-          redir.target as WordNode,
-        );
-        if ("error" in expandResult) {
-          stderr += expandResult.error;
-          exitCode = 1;
-          // When redirect fails, discard the output that would have been redirected
-          stdout = "";
-          continue;
-        }
-        target = expandResult.target;
-      }
-    }
-
-    // Skip FD variable redirections in applyRedirections - they're already handled
-    // by processFdVariableRedirections and don't affect stdout/stderr directly
+    // FD variable redirections were expanded, opened, and allocated before
+    // command execution. They do not route this command's stdout or stderr.
     if (redir.fdVariable) {
       continue;
     }
 
-    // Reject paths containing null bytes - these cause filesystem errors
-    if (target.includes("\0")) {
-      stderr += `bash: ${target.replace(/\0/g, "")}: No such file or directory\n`;
-      exitCode = 1;
-      stdout = "";
-      continue;
-    }
+    const target = targets.get(i);
+    if (target === undefined) continue;
 
     switch (redir.operator) {
       case ">":
@@ -542,7 +1223,6 @@ export async function applyRedirections(
           break;
         }
         const isAppend = redir.operator === ">>";
-        const isClobber = redir.operator === ">|";
         // Opening /dev/stdout or /dev/stderr duplicates the CURRENT target
         // of fd 1 / fd 2, like `N>&1` / `N>&2`: `> /dev/stderr` re-points
         // fd 1 to wherever fd 2 points right now, and the self-referential
@@ -579,27 +1259,6 @@ export async function applyRedirections(
           break;
         }
         const filePath = ctx.fs.resolvePath(ctx.state.cwd, target);
-        const error = await checkOutputRedirectTarget(ctx, filePath, target, {
-          ...(isAppend ? {} : { checkNoclobber: true, isClobber }),
-        });
-        if (error) {
-          stderr += error;
-          exitCode = 1;
-          if (fd === 1) {
-            stdout = "";
-          }
-          break;
-        }
-        // Opening the target is a side effect of processing the redirection
-        // list even when the fd is re-pointed again later: `>` truncates and
-        // `>>` creates the file if missing. Content is delivered to each
-        // fd's FINAL sink after the list is processed, so `cmd > a > b`
-        // truncates `a` but writes to `b`.
-        if (isAppend) {
-          await ctx.fs.appendFile(filePath, "", "binary");
-        } else {
-          await ctx.fs.writeFile(filePath, "", "binary");
-        }
         if (fd === 1) {
           fd1Sink = { kind: "file", path: filePath, append: isAppend };
         } else {
@@ -610,211 +1269,35 @@ export async function applyRedirections(
 
       case ">&":
       case "<&": {
-        // In bash, <& and >& are essentially the same for FD duplication
-        // 1<&2 and 1>&2 both make fd 1 point to where fd 2 points
         const fd = redir.fd ?? (redir.operator === "<&" ? 0 : 1);
-        // Duplications onto a user descriptor (`3>&1`, `3<&4`) and onto
-        // stdin (`<&3`) are performed against the fd table before the
-        // command runs — see numeric-fd-redirects.ts and the `<&` branch of
-        // executeSimpleCommandInner. They never move stdout/stderr, so this
-        // stream-routing pass must leave them alone.
-        if (fd >= FIRST_USER_FD || fd === 0) {
-          break;
-        }
-        // Handle >&- or <&- close operation
-        // NOTE: For command-level redirections, FD close is TEMPORARY - it only
-        // affects the command during its execution. By the time applyRedirections
-        // is called, the command has already completed, so we should NOT modify
-        // the persistent FD state here. The FD will be restored after this command.
-        // Permanent FD closes are handled by `exec N>&-` in executeSimpleCommand.
+        if (fd >= FIRST_USER_FD || fd === 0) break;
         if (target === "-") {
-          // Don't delete the FD - command-level redirections are temporary
+          if (fd === 1) fd1Sink = { kind: "discard" };
+          else fd2Sink = { kind: "discard" };
           break;
         }
-        // Handle FD move operation: N>&M- (duplicate M to N, then close M)
-        // Net-neutral on FD count (set + delete), skip checkFdLimit
-        if (target.endsWith("-")) {
-          const sourceFdStr = target.slice(0, -1);
-          const sourceFd = Number.parseInt(sourceFdStr, 10);
-          if (!Number.isNaN(sourceFd)) {
-            // First, duplicate: point the target at whatever the source is
-            if (dupFd(ctx, fd, sourceFd)) {
-              // Then close the source FD (only for user FDs 3+)
-              if (sourceFd >= FIRST_USER_FD) closeFd(ctx, sourceFd);
-            } else if (sourceFd === 1 || sourceFd === 2) {
-              // stdout/stderr are not in the table; record which one.
-              setFdEntry(ctx, fd, { kind: "dup-out", sourceFd });
-            } else if (sourceFd === 0) {
-              setFdEntry(ctx, fd, { kind: "dup-in", sourceFd });
-            } else if (sourceFd >= FIRST_USER_FD) {
-              // Source FD is a user FD (3+) that isn't open - bad file descriptor
-              stderr += `bash: ${sourceFd}: Bad file descriptor\n`;
-              exitCode = 1;
-            }
-          }
-          break;
-        }
-        // >&2, 1>&2, 1<&2: duplicate fd 1 from fd 2 — fd 1 now points to a
-        // snapshot of wherever fd 2 points at this spot in the list. Content
-        // is not moved here: a later redirection may still repoint fd 1, so
-        // remaining stdout is delivered once the whole list is processed.
-        if (target === "2" || target === "&2") {
-          if (fd === 1) {
-            fd1Sink = fd2Sink;
-          }
-        }
-        // 2>&1, 2<&1: duplicate fd 2 from fd 1 — same deferred delivery.
-        else if (target === "1" || target === "&1") {
-          if (fd === 2) {
-            fd2Sink = fd1Sink;
-          } else {
-            // 1>&1 is a no-op, but other fds redirect to stdout
-            stdout += stderr;
-            stderr = "";
-          }
-        }
-        // Handle writing to a user-allocated FD (>&$fd)
-        else {
-          const targetFd = Number.parseInt(target, 10);
-          if (!Number.isNaN(targetFd)) {
-            // Writing through a descriptor the script opened: `>&N`.
-            // Every open descriptor already carries its own file position
-            // (append semantics), so successive writes accumulate the way
-            // they do through a single open file description in bash.
-            const writeThrough = async (path: string): Promise<void> => {
-              if (fd === 1) {
-                await ctx.fs.appendFile(
-                  path,
-                  stdout,
-                  getStdoutEncoding(stdout),
-                );
-                stdout = "";
-              } else if (fd === 2) {
-                await ctx.fs.appendFile(path, stderr, getFileEncoding(stderr));
-                stderr = "";
-              }
-            };
-            const reportBadFd = (): void => {
-              stderr += `bash: ${targetFd}: Bad file descriptor\n`;
-              exitCode = 1;
-              stdout = "";
-            };
-            const entry = getFdEntry(ctx, targetFd);
-            if (entry?.kind === "output" || entry?.kind === "readwrite") {
-              await writeThrough(entry.path);
-            } else if (entry?.kind === "dup-out") {
-              // __dupout__:N means this FD writes wherever FD N writes.
-              if (entry.sourceFd === 1) {
-                // Duplicates stdout - output stays on stdout (no-op for 1>&N)
-              } else if (entry.sourceFd === 2) {
-                // Duplicates stderr - send stdout there instead
-                if (fd === 1) {
-                  stderr += stdout;
-                  stdout = "";
-                }
-              } else {
-                const source = getFdEntry(ctx, entry.sourceFd);
-                if (source?.kind === "output") {
-                  await writeThrough(source.path);
-                }
-              }
-            } else if (entry?.kind === "dup-in" || entry?.kind === "input") {
-              // A read-side descriptor: writing to it is an error.
-              reportBadFd();
-            } else if (targetFd >= FIRST_USER_FD) {
-              // User FD range (3+) but FD not found - bad file descriptor
-              // For FDs 3-9 (manually allocated) and 10+ (auto-allocated),
-              // if the FD is not in fileDescriptors, it means it was closed or never opened
-              reportBadFd();
-            }
-          } else if (redir.operator === ">&") {
-            // In bash, N>&word where word is not a number or '-' is treated as a file redirect
-            // If no explicit fd (redir.fd == null), redirects BOTH stdout and stderr (equivalent to &>word)
-            // If explicit fd (e.g., 1>&word), redirects just that fd to the file
-            const filePath = ctx.fs.resolvePath(ctx.state.cwd, target);
-            const error = await checkOutputRedirectTarget(
-              ctx,
-              filePath,
-              target,
-              {
-                checkNoclobber: true,
-              },
-            );
-            if (error) {
-              stderr = error;
-              exitCode = 1;
-              stdout = "";
-              break;
-            }
-            // Truncate now; content is delivered to the final sinks after
-            // the whole redirection list is processed.
-            await ctx.fs.writeFile(filePath, "", "binary");
-            if (redir.fd == null) {
-              // >&word (no explicit fd) - both stdout and stderr to the file
-              fd1Sink = { kind: "file", path: filePath, append: false };
-              fd2Sink = fd1Sink;
-            } else if (fd === 1) {
-              // 1>&word - redirect stdout to file
-              fd1Sink = { kind: "file", path: filePath, append: false };
-            } else if (fd === 2) {
-              // 2>&word - redirect stderr to file
-              fd2Sink = { kind: "file", path: filePath, append: false };
-            }
-          }
+        const sourceSink = sinkFromDupSource(dupSources.get(i));
+        if (!sourceSink) break;
+        if (redir.fd == null && parseDupTarget(target) === null) {
+          fd1Sink = sourceSink;
+          fd2Sink = sourceSink;
+        } else if (fd === 1) {
+          fd1Sink = sourceSink;
+        } else if (fd === 2) {
+          fd2Sink = sourceSink;
         }
         break;
       }
 
       case "&>": {
-        // /dev/full always returns ENOSPC when written to
-        if (target === "/dev/full") {
-          stderr = `bash: echo: write error: No space left on device\n`;
-          exitCode = 1;
-          stdout = "";
-          break;
-        }
         const filePath = ctx.fs.resolvePath(ctx.state.cwd, target);
-        const error = await checkOutputRedirectTarget(ctx, filePath, target, {
-          checkNoclobber: true,
-        });
-        if (error) {
-          stderr = error;
-          exitCode = 1;
-          stdout = "";
-          break;
-        }
-        // Truncate now; content is delivered to the final sinks after the
-        // whole redirection list is processed.
-        await ctx.fs.writeFile(filePath, "", "binary");
         fd1Sink = { kind: "file", path: filePath, append: false };
         fd2Sink = fd1Sink;
         break;
       }
 
       case "&>>": {
-        // /dev/full always returns ENOSPC when written to
-        if (target === "/dev/full") {
-          stderr = `bash: echo: write error: No space left on device\n`;
-          exitCode = 1;
-          stdout = "";
-          break;
-        }
         const filePath = ctx.fs.resolvePath(ctx.state.cwd, target);
-        const error = await checkOutputRedirectTarget(
-          ctx,
-          filePath,
-          target,
-          {},
-        );
-        if (error) {
-          stderr = error;
-          exitCode = 1;
-          stdout = "";
-          break;
-        }
-        // Create if missing; content is delivered to the final sinks after
-        // the whole redirection list is processed.
-        await ctx.fs.appendFile(filePath, "", "binary");
         fd1Sink = { kind: "file", path: filePath, append: true };
         fd2Sink = fd1Sink;
         break;
@@ -834,10 +1317,16 @@ export async function applyRedirections(
   // non-empty write clobbers the earlier one — matching bash's
   // independent-open behavior.
   if (stdout !== "" || stderr !== "") {
-    const pendingStdout = stdout;
-    const pendingStderr = stderr;
+    let pendingStdout = stdout;
+    let pendingStderr = stderr;
     stdout = "";
     stderr = "";
+    if (fd1Sink.kind === "invalid-output" && pendingStdout !== "") {
+      pendingStdout = "";
+      pendingStderr += `${omitShellPrefix ? "" : "bash: "}${writeErrorCommand}: write error: Bad file descriptor\n`;
+      exitCode = 1;
+    }
+    if (fd2Sink.kind === "invalid-output") pendingStderr = "";
     const deliverToFile = async (
       sink: { path: string; append: boolean },
       content: string,
@@ -849,7 +1338,10 @@ export async function applyRedirections(
         await ctx.fs.writeFile(sink.path, content, encoding);
       }
     };
-    if (fd1Sink === fd2Sink && fd1Sink.kind === "file") {
+    if (
+      fd1Sink === fd2Sink &&
+      (fd1Sink.kind === "file" || fd1Sink.kind === "descriptor")
+    ) {
       // stdout-then-stderr order, not the command's temporal write order:
       // ExecResult accumulates the two streams separately, so interleaving
       // is not recorded anywhere in the interpreter. This matches the
@@ -857,7 +1349,17 @@ export async function applyRedirections(
       // bare `2>&1`.
       const combined = pendingStdout + pendingStderr;
       if (combined !== "") {
-        await deliverToFile(fd1Sink, combined, getStdoutEncoding(combined));
+        if (fd1Sink.kind === "file") {
+          await deliverToFile(fd1Sink, combined, getStdoutEncoding(combined));
+        } else {
+          await writeFdEntry(
+            ctx,
+            fd1Sink.source.entry,
+            fd1Sink.source.descriptors,
+            combined,
+            getStdoutEncoding(combined),
+          );
+        }
       }
     } else {
       for (const [content, sink, isStdout] of [
@@ -881,35 +1383,22 @@ export async function applyRedirections(
               isStdout ? getStdoutEncoding(content) : getFileEncoding(content),
             );
             break;
+          case "descriptor":
+            await writeFdEntry(
+              ctx,
+              sink.source.entry,
+              sink.source.descriptors,
+              content,
+              isStdout ? getStdoutEncoding(content) : getFileEncoding(content),
+            );
+            break;
+          case "invalid-output":
+            break;
           case "discard":
             break;
         }
       }
     }
-  }
-
-  // Apply persistent FD redirections (from exec)
-  // Check if fd 1 (stdout) is redirected to fd 2 (stderr) via exec 1>&2
-  const fd1Entry = getFdEntry(ctx, 1);
-  if (fd1Entry?.kind === "dup-out" && fd1Entry.sourceFd === 2) {
-    // fd 1 is duplicated to fd 2 - stdout goes to stderr
-    stderr += stdout;
-    stdout = "";
-  } else if (fd1Entry?.kind === "output") {
-    // fd 1 is redirected to a file
-    await ctx.fs.appendFile(fd1Entry.path, stdout, getStdoutEncoding(stdout));
-    stdout = "";
-  }
-
-  // Check if fd 2 (stderr) is redirected
-  const fd2Entry = getFdEntry(ctx, 2);
-  if (fd2Entry?.kind === "dup-out" && fd2Entry.sourceFd === 1) {
-    // fd 2 is duplicated to fd 1 - stderr goes to stdout
-    stdout += stderr;
-    stderr = "";
-  } else if (fd2Entry?.kind === "output") {
-    await ctx.fs.appendFile(fd2Entry.path, stderr, getFileEncoding(stderr));
-    stderr = "";
   }
 
   const finalResult = makeResult(stdout, stderr, exitCode);

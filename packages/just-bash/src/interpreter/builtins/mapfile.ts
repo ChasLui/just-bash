@@ -194,5 +194,5 @@ export function handleMapfile(
     ctx.state.groupStdin = "";
   }
 
-  return result("", "", 0);
+  return { ...result("", "", 0), internalStdinConsumed: effectiveStdin.length };
 }

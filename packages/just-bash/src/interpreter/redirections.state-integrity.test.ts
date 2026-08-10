@@ -38,7 +38,7 @@ describe("redirection state integrity", () => {
     await expect(env.readFile("/out1")).rejects.toThrow();
   });
 
-  it("validates every compound redirect before truncating any target", async () => {
+  it("preserves an earlier compound redirect before a later failure", async () => {
     const env = new Bash({ files: { "/first": "preserve\n" } });
     await env.exec("mkdir /directory");
     const result = await env.exec(
@@ -46,6 +46,6 @@ describe("redirection state integrity", () => {
     );
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("Is a directory");
-    expect(await env.readFile("/first")).toBe("preserve\n");
+    expect(await env.readFile("/first")).toBe("");
   });
 });

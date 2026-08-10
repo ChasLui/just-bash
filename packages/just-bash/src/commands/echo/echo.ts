@@ -209,6 +209,7 @@ export const echoCommand: RuntimeCommand = {
           stdout: output,
           stderr: "",
           exitCode: 0,
+          internalStdinConsumed: 0,
         };
       }
     }
@@ -221,6 +222,7 @@ export const echoCommand: RuntimeCommand = {
       stdout: output,
       stderr: "",
       exitCode: 0,
+      internalStdinConsumed: 0,
     };
   },
 };

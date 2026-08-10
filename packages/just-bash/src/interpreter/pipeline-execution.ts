@@ -58,6 +58,7 @@ export async function executePipeline(
   // position where it was. This variable carries that position across
   // stages so the pipeline can hand it back afterwards.
   let sharedStdin = ctx.state.groupStdin;
+  let sharedStdinSourceFd = ctx.state.groupStdinSourceFd;
 
   for (let i = 0; i < node.commands.length; i++) {
     const command = node.commands[i];
@@ -75,6 +76,7 @@ export async function executePipeline(
       // hide groupStdin from them; otherwise a command like `head` that got
       // nothing from `grep` would silently fall back to the shell's stdin.
       ctx.state.groupStdin = isFirst ? sharedStdin : undefined;
+      ctx.state.groupStdinSourceFd = isFirst ? sharedStdinSourceFd : undefined;
     }
 
     // Determine if this command runs in a subshell context
@@ -136,8 +138,10 @@ export async function executePipeline(
         // itself never drains stdin.
         if (isFirst) {
           sharedStdin = ctx.state.groupStdin;
+          sharedStdinSourceFd = ctx.state.groupStdinSourceFd;
         }
         ctx.state.groupStdin = sharedStdin;
+        ctx.state.groupStdinSourceFd = sharedStdinSourceFd;
       }
     }
 

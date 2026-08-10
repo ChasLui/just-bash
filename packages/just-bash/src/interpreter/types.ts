@@ -316,6 +316,8 @@ export interface ProcessState {
 export interface IOState {
   /** Stdin available for commands in compound commands (groups, subshells, while loops with piped input) */
   groupStdin?: string;
+  /** Descriptor that supplied `groupStdin`, when it has a shared position. */
+  groupStdinSourceFd?: number;
   /** File descriptors for process substitution and here-docs */
   fileDescriptors?: Map<number, string>;
   /**
@@ -333,6 +335,8 @@ export interface IOState {
    * by `fd-table.ts`.
    */
   fdAliases?: Map<number, Set<number>>;
+  /** Standard descriptors closed by persistent `exec N>&-` redirections. */
+  closedStandardFds?: Set<number>;
   /** Next available file descriptor for {varname}>file allocation (starts at 10) */
   nextFd?: number;
   /**

@@ -311,6 +311,9 @@ export function handleRead(
       advanceFd(ctx, stdinSourceFd, bytesConsumed);
     } else if (ctx.state.groupStdin !== undefined && !stdin) {
       ctx.state.groupStdin = effectiveStdin.substring(bytesConsumed);
+      if (ctx.state.groupStdinSourceFd !== undefined) {
+        advanceFd(ctx, ctx.state.groupStdinSourceFd, bytesConsumed);
+      }
     }
   };
 

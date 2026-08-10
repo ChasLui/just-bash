@@ -834,6 +834,7 @@ export class Bash {
             stdout: error.stdout,
             stderr: error.stderr,
             exitCode: error.exitCode,
+            internalOutputAccounting: error.internalOutputAccounting,
             env: mapToRecordWithExtras(this.state.env, effectiveOptions.env),
           });
         }
@@ -870,6 +871,7 @@ export class Bash {
             stdout: error.stdout,
             stderr: sanitizeErrorMessage(error.stderr),
             exitCode: ExecutionLimitError.EXIT_CODE,
+            internalOutputAccounting: error.internalOutputAccounting,
             env: mapToRecordWithExtras(this.state.env, effectiveOptions.env),
           });
         }
@@ -927,6 +929,7 @@ export class Bash {
           stdout: error.stdout,
           stderr: sanitizeErrorMessage(error.stderr),
           exitCode: ExecutionLimitError.EXIT_CODE,
+          internalOutputAccounting: error.internalOutputAccounting,
           env: mapToRecordWithExtras(this.state.env, effectiveOptions.env),
         });
       }

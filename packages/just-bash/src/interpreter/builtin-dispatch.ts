@@ -271,32 +271,58 @@ function createRevocableCommandContext(
     }) as T;
   };
 
-  return {
-    context: {
-      ...context,
-      fs: wrapCapability(context.fs),
-      env: wrapCapability(context.env),
-      limits: Object.freeze({ ...context.limits }),
-      exportedEnv: context.exportedEnv
+  const dataDescriptor = (value: unknown): PropertyDescriptor => ({
+    value,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
+
+  const descriptors = Object.getOwnPropertyDescriptors(context);
+  Object.assign(descriptors, {
+    fs: dataDescriptor(wrapCapability(context.fs)),
+    env: dataDescriptor(wrapCapability(context.env)),
+    limits: dataDescriptor(Object.freeze({ ...context.limits })),
+    exportedEnv: dataDescriptor(
+      context.exportedEnv
         ? Object.freeze({ ...context.exportedEnv })
         : undefined,
-      executionScope: context.executionScope
+    ),
+    executionScope: dataDescriptor(
+      context.executionScope
         ? wrapCapability(context.executionScope)
         : undefined,
-      fileDescriptors: context.fileDescriptors
+    ),
+    fileDescriptors: dataDescriptor(
+      context.fileDescriptors
         ? wrapCapability(context.fileDescriptors)
         : undefined,
-      coverage: context.coverage ? wrapCapability(context.coverage) : undefined,
-      assignShellVariable: wrapFunction(context.assignShellVariable),
-      exec: wrapFunction(context.exec),
-      execWithInheritedStdin: wrapFunction(context.execWithInheritedStdin),
-      fetch: wrapFunction(context.fetch),
-      getRegisteredCommands: wrapFunction(context.getRegisteredCommands),
-      sleep: wrapFunction(context.sleep),
-      trace: wrapFunction(context.trace),
-      invokeTool: wrapFunction(context.invokeTool),
-      signal: facadeAbort?.signal,
-    },
+    ),
+    coverage: dataDescriptor(
+      context.coverage ? wrapCapability(context.coverage) : undefined,
+    ),
+    assignShellVariable: dataDescriptor(
+      wrapFunction(context.assignShellVariable),
+    ),
+    exec: dataDescriptor(wrapFunction(context.exec)),
+    execWithInheritedStdin: dataDescriptor(
+      wrapFunction(context.execWithInheritedStdin),
+    ),
+    fetch: dataDescriptor(wrapFunction(context.fetch)),
+    getRegisteredCommands: dataDescriptor(
+      wrapFunction(context.getRegisteredCommands),
+    ),
+    sleep: dataDescriptor(wrapFunction(context.sleep)),
+    trace: dataDescriptor(wrapFunction(context.trace)),
+    invokeTool: dataDescriptor(wrapFunction(context.invokeTool)),
+    signal: dataDescriptor(facadeAbort?.signal),
+  });
+
+  return {
+    context: Object.defineProperties(
+      Object.create(Object.getPrototypeOf(context)),
+      descriptors,
+    ) as RuntimeCommandContext,
     revoke() {
       active = false;
       if (!facadeAbort?.signal.aborted) {
@@ -571,7 +597,17 @@ export async function dispatchBuiltin(
     const [cmd, ...rest] = args;
     // Re-dispatch with the same stdin, so the wrapped command inherits fd-0
     // ownership too (`exec cmd < empty-file` is EOF, not "no redirection").
-    return runCommand(cmd, rest, [], stdin, false, false, -1, stdinRedirected);
+    const result = await runCommand(
+      cmd,
+      rest,
+      [],
+      stdin,
+      false,
+      false,
+      -1,
+      stdinRedirected,
+    );
+    return { ...result, internalProducerOmitsShellPrefix: true };
   }
   if (commandName === "wait") {
     // wait - wait for background jobs (stub: no-op in this context)
@@ -779,6 +815,7 @@ export async function executeExternalCommand(
   const effectiveStdin = unsafeBytesFromLatin1(
     stdin || ctx.state.groupStdin || "",
   );
+  let stdinAccessed = false;
 
   // Build exported environment for commands that need it (printenv, env, etc.)
   // Most builtins need access to the full env to modify state
@@ -841,7 +878,10 @@ export async function executeExternalCommand(
       }
     },
     exportedEnv,
-    stdin: effectiveStdin,
+    get stdin() {
+      stdinAccessed = true;
+      return effectiveStdin;
+    },
     limits: ctx.limits,
     executionScope: cmd.internalIsExtension
       ? createCommandExecutionBudget(ctx.executionScope)
@@ -894,11 +934,16 @@ export async function executeExternalCommand(
         ctx.state.signal,
       );
 
-    if (cmd.trusted) {
-      // Trusted host-extension commands may opt in to unrestricted globals.
-      return await DefenseInDepthBox.runTrustedAsync(runBoundedCommand);
-    }
-    return await runBoundedCommand();
+    const commandResult = cmd.trusted
+      ? // Trusted host-extension commands may opt in to unrestricted globals.
+        await DefenseInDepthBox.runTrustedAsync(runBoundedCommand)
+      : await runBoundedCommand();
+    return {
+      ...commandResult,
+      internalStdinConsumed:
+        commandResult.internalStdinConsumed ??
+        (stdinAccessed ? stdin.length : 0),
+    };
   } catch (error) {
     // ExecutionLimitError must propagate - these are safety limits
     if (error instanceof ExecutionLimitError) {

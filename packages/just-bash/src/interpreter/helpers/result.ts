@@ -17,6 +17,7 @@ export const OK: ExecResult = Object.freeze({
   stdout: "",
   stderr: "",
   exitCode: 0,
+  internalStdinConsumed: 0,
 });
 
 /**
@@ -64,7 +65,12 @@ export function result(
  * @returns ExecResult with exitCode 0 if passed, 1 otherwise
  */
 export function testResult(passed: boolean): ExecResult {
-  return { stdout: "", stderr: "", exitCode: passed ? 0 : 1 };
+  return {
+    stdout: "",
+    stderr: "",
+    exitCode: passed ? 0 : 1,
+    internalStdinConsumed: 0,
+  };
 }
 
 /**

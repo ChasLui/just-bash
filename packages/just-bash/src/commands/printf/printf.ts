@@ -165,6 +165,7 @@ export const printfCommand: RuntimeCommand = {
         stdout: "",
         stderr: "printf: usage: printf format [arguments]\n",
         exitCode: 2,
+        internalStdinConsumed: 0,
       };
     }
 
@@ -186,6 +187,7 @@ export const printfCommand: RuntimeCommand = {
             stdout: "",
             stderr: "printf: -v: option requires an argument\n",
             exitCode: 1,
+            internalStdinConsumed: 0,
           };
         }
         targetVar = args[argIndex + 1];
@@ -199,6 +201,7 @@ export const printfCommand: RuntimeCommand = {
             stdout: "",
             stderr: `printf: \`${targetVar}': not a valid identifier\n`,
             exitCode: 2,
+            internalStdinConsumed: 0,
           };
         }
         argIndex += 2;
@@ -215,6 +218,7 @@ export const printfCommand: RuntimeCommand = {
         stdout: "",
         stderr: "printf: usage: printf format [arguments]\n",
         exitCode: 1,
+        internalStdinConsumed: 0,
       };
     }
 
@@ -303,13 +307,19 @@ export const printfCommand: RuntimeCommand = {
             ctx.env.set(targetVar, output);
           }
         }
-        return { stdout: "", stderr: errorMessage, exitCode: hadError ? 1 : 0 };
+        return {
+          stdout: "",
+          stderr: errorMessage,
+          exitCode: hadError ? 1 : 0,
+          internalStdinConsumed: 0,
+        };
       }
 
       return {
         stdout: output,
         stderr: errorMessage,
         exitCode: hadError ? 1 : 0,
+        internalStdinConsumed: 0,
       };
     } catch (error) {
       if (
@@ -325,6 +335,7 @@ export const printfCommand: RuntimeCommand = {
         stdout: "",
         stderr: `printf: ${getErrorMessage(error)}\n`,
         exitCode: 1,
+        internalStdinConsumed: 0,
       };
     }
   },

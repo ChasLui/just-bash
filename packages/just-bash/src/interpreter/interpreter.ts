@@ -15,19 +15,15 @@ import type {
   CommandNode,
   ConditionalCommandNode,
   GroupNode,
-  HereDocNode,
   PipelineNode,
   ScriptNode,
   SimpleCommandNode,
   StatementNode,
   SubshellNode,
-  WordNode,
 } from "../ast/types.js";
 import {
   decodedTextFromResult,
-  encodeUtf8ToBytes,
   latin1FromBytes,
-  readBytesFrom,
   stdoutAsBytes,
 } from "../encoding.js";
 import { ExecutionOutputAccumulator } from "../execution-output.js";
@@ -84,25 +80,12 @@ import {
   ReturnError,
 } from "./errors.js";
 import { expandWord, expandWordWithGlob } from "./expansion.js";
-import {
-  advanceFd,
-  closeFd,
-  dupFd,
-  FIRST_USER_FD,
-  getFdEntry,
-  readFd,
-  setFdEntry,
-} from "./fd-table.js";
+import { advanceFd } from "./fd-table.js";
 import { executeFunctionDef } from "./functions.js";
 import { failure, OK, result, testResult } from "./helpers/result.js";
 import { isPosixSpecialBuiltin } from "./helpers/shell-constants.js";
 import { isWordLiteralMatch } from "./helpers/word-matching.js";
 import { traceSimpleCommand } from "./helpers/xtrace.js";
-import {
-  effectiveRedirectFd,
-  isNumericFdRedirection,
-  openNumericFds,
-} from "./numeric-fd-redirects.js";
 import { executePipeline as executePipelineHelper } from "./pipeline-execution.js";
 import {
   markProcessSubstitutions,
@@ -110,8 +93,13 @@ import {
 } from "./process-substitution.js";
 import {
   applyRedirections,
-  preOpenOutputRedirects,
-  processFdVariableRedirections,
+  BARE_REDIRECTION_POLICY,
+  createRedirectionTransaction,
+  EXEC_REDIRECTION_POLICY,
+  preparedRedirectionError,
+  type RedirectionTransaction,
+  SIMPLE_REDIRECTION_POLICY,
+  withPreparedRedirections,
 } from "./redirections.js";
 import { processAssignments } from "./simple-command-assignments.js";
 import {
@@ -615,9 +603,13 @@ export class Interpreter {
     node: SimpleCommandNode,
     stdin: string,
   ): Promise<ExecResult> {
+    let transaction: RedirectionTransaction | undefined;
     try {
-      return await this.executeSimpleCommandInner(node, stdin);
+      return await this.executeSimpleCommandInner(node, stdin, (created) => {
+        transaction = created;
+      });
     } catch (error) {
+      transaction?.finish();
       if (error instanceof GlobError) {
         // GlobError from failglob should return exit code 1 with error message
         return failure(error.stderr);
@@ -631,6 +623,7 @@ export class Interpreter {
   private async executeSimpleCommandInner(
     node: SimpleCommandNode,
     stdin: string,
+    onTransaction: (transaction: RedirectionTransaction) => void,
   ): Promise<ExecResult> {
     // Update currentLine for $LINENO
     if (node.line !== undefined) {
@@ -676,7 +669,12 @@ export class Interpreter {
     }
     const tempAssignments = assignmentResult.tempAssignments;
     const xtraceAssignmentOutput = assignmentResult.xtraceOutput;
-
+    const restoreTempAssignments = (): void => {
+      for (const [name, value] of tempAssignments) {
+        if (value === undefined) this.ctx.state.env.delete(name);
+        else this.ctx.state.env.set(name, value);
+      }
+    };
     if (!node.name) {
       // No command name - could be assignment-only or redirect-only (bare redirects)
       // e.g., "x=5" (assignment-only) or "> file" (bare redirect to create empty file)
@@ -684,22 +682,36 @@ export class Interpreter {
       // Handle bare redirections (no command, just redirects like "> file")
       // In bash, this creates/truncates the file and returns success
       if (node.redirections.length > 0) {
-        // Process the redirects - this creates/truncates files as needed
-        const preparedRedirects = await preOpenOutputRedirects(
+        const transaction = createRedirectionTransaction(
           this.ctx,
           node.redirections,
+          BARE_REDIRECTION_POLICY,
         );
-        if (preparedRedirects.error) {
-          return preparedRedirects.error;
+        onTransaction(transaction);
+        const preparedRedirections = await transaction.prepare(stdin);
+        if (preparedRedirections.error) {
+          restoreTempAssignments();
+          if (!preparedRedirections.errorCause) {
+            transaction.finish();
+            return preparedRedirections.error;
+          }
+          try {
+            return preparedRedirectionError(preparedRedirections);
+          } finally {
+            transaction.finish();
+          }
         }
-        // Apply redirections to empty result (for append, read redirects, etc.)
         const baseResult = result("", xtraceAssignmentOutput, 0);
-        return applyRedirections(
+        const redirected = await applyRedirections(
           this.ctx,
           baseResult,
           node.redirections,
-          preparedRedirects.targets,
+          preparedRedirections.targets,
+          preparedRedirections.dupSources,
+          preparedRedirections.standardRoutes,
         );
+        transaction.finish();
+        return redirected;
       }
 
       // Assignment-only command: preserve the exit code from command substitution
@@ -738,162 +750,7 @@ export class Interpreter {
       }
     }
 
-    // Process FD variable redirections ({varname}>file syntax)
-    // This allocates FDs and sets variables before command execution
-    const fdVarError = await processFdVariableRedirections(
-      this.ctx,
-      node.redirections,
-    );
-    if (fdVarError) {
-      for (const [name, value] of tempAssignments) {
-        if (value === undefined) this.ctx.state.env.delete(name);
-        else this.ctx.state.env.set(name, value);
-      }
-      return fdVarError;
-    }
-
-    const restoreTempAssignments = (): void => {
-      for (const [name, value] of tempAssignments) {
-        if (value === undefined) this.ctx.state.env.delete(name);
-        else this.ctx.state.env.set(name, value);
-      }
-    };
-
-    // Open the descriptors this command names by number (`3< file`, `4> log`,
-    // `3<&-`, ...). They must exist before the command runs so `read -u 3`
-    // and `>&4` can see them, and — unless this is `exec` — they are taken
-    // back down once the command's redirections have been delivered.
-    const fdScope = await openNumericFds(this.ctx, node.redirections);
-    if (fdScope.error) {
-      // `exec` keeps the descriptors it managed to open before the failure;
-      // an ordinary command's descriptor changes are all rolled back.
-      if (!isWordLiteralMatch(node.name, ["exec"])) fdScope.restore();
-      restoreTempAssignments();
-      return fdScope.error;
-    }
-
-    // Track source FD for stdin from read-write file descriptors
-    // This allows the read builtin to update the FD's position after reading
-    let stdinSourceFd = -1;
-
-    // Whether one of the redirections below gave this command its own fd 0.
-    // The content alone cannot say: `cmd < empty-file` produces the same empty
-    // string as no redirection at all, and the two mean opposite things —
-    // EOF versus "inherit the shell's stdin".
-    let stdinRedirected = false;
-
-    for (const redir of node.redirections) {
-      // Redirections naming a user descriptor were applied to the fd table
-      // above; they never contribute to this command's stdin.
-      if (isNumericFdRedirection(redir)) continue;
-
-      if (
-        (redir.operator === "<<" || redir.operator === "<<-") &&
-        redir.target.type === "HereDoc"
-      ) {
-        const hereDoc = redir.target as HereDocNode;
-        let content = await expandWord(this.ctx, hereDoc.content);
-        // <<- strips leading tabs from each line
-        if (hereDoc.stripTabs) {
-          content = content
-            .split("\n")
-            .map((line) => line.replace(/^\t+/, ""))
-            .join("\n");
-        }
-        // Heredocs land here as JS Unicode text; the pipeline contract
-        // expects stdin to be a latin1 byte buffer. UTF-8 encode the
-        // text once at the source so byte consumers downstream see real
-        // bytes and binary writes don't truncate codepoints to their
-        // low byte.
-        content = latin1FromBytes(encodeUtf8ToBytes(content));
-        // If this is a non-standard fd (not 0), store in fileDescriptors for -u option
-        const fd = redir.fd ?? 0;
-        if (fd !== 0) {
-          setFdEntry(this.ctx, fd, { kind: "input", content });
-        } else {
-          stdin = content;
-          // A later redirection wins: stdin no longer comes from a descriptor.
-          stdinSourceFd = -1;
-          stdinRedirected = true;
-        }
-        continue;
-      }
-
-      if (redir.operator === "<<<" && redir.target.type === "Word") {
-        // Same byte-encoding step as heredoc — here-strings deliver
-        // JS Unicode text and need to land as bytes.
-        stdin = latin1FromBytes(
-          encodeUtf8ToBytes(
-            `${await expandWord(this.ctx, redir.target as WordNode)}\n`,
-          ),
-        );
-        stdinSourceFd = -1;
-        stdinRedirected = true;
-        continue;
-      }
-
-      if (redir.operator === "<" && redir.target.type === "Word") {
-        try {
-          const target = await expandWord(this.ctx, redir.target as WordNode);
-          const filePath = this.ctx.fs.resolvePath(this.ctx.state.cwd, target);
-          // Read as raw bytes — `<` is a transparent file-to-stdin
-          // pipe and we don't want the smart-utf8 read path turning
-          // valid bytes into U+FFFD replacement chars.
-          stdin = latin1FromBytes(await readBytesFrom(this.ctx.fs, filePath));
-          stdinSourceFd = -1;
-          stdinRedirected = true;
-        } catch {
-          const target = await expandWord(this.ctx, redir.target as WordNode);
-          fdScope.restore();
-          restoreTempAssignments();
-          return failure(`bash: ${target}: No such file or directory\n`);
-        }
-      }
-
-      // `<&N` — read this command's stdin from descriptor N. The content
-      // handed over is whatever N has not been read yet, and `stdinSourceFd`
-      // lets the consumer advance N's shared position.
-      if (redir.operator === "<&" && redir.target.type === "Word") {
-        const target = await expandWord(this.ctx, redir.target as WordNode);
-        // `0<&-` closes stdin for the command: it owns an empty fd 0, which
-        // is EOF rather than a fall-back to the enclosing shell's stdin.
-        if (target === "-") {
-          stdin = "";
-          stdinSourceFd = -1;
-          stdinRedirected = true;
-          continue;
-        }
-        const sourceFd = Number.parseInt(target.replace(/-$/, ""), 10);
-        if (Number.isNaN(sourceFd)) {
-          fdScope.restore();
-          restoreTempAssignments();
-          return failure(`bash: ${target}: ambiguous redirect\n`);
-        }
-        if (sourceFd === 0) continue;
-        // A descriptor saved off stdin (`exec 3<&0`) reads stdin, so
-        // `<&3` leaves this command's stdin exactly as it was.
-        const source = getFdEntry(this.ctx, sourceFd);
-        if (source?.kind === "dup-in" && source.sourceFd === 0) continue;
-        const readable = readFd(this.ctx, sourceFd);
-        if ("error" in readable) {
-          // stdout/stderr are not modelled as readable descriptors, so only
-          // a user descriptor produces bash's diagnostic here.
-          if (sourceFd >= FIRST_USER_FD || readable.error === "write-only") {
-            fdScope.restore();
-            restoreTempAssignments();
-            return failure(`bash: ${sourceFd}: Bad file descriptor\n`);
-          }
-          continue;
-        }
-        stdin = readable.content;
-        stdinSourceFd = sourceFd;
-        // The descriptor is this command's fd 0 now — an exhausted one hands
-        // over "" and that means EOF, not "inherit the shell's stdin".
-        stdinRedirected = true;
-      }
-    }
-
-    const commandName = await expandWord(this.ctx, node.name);
+    let commandName = await expandWord(this.ctx, node.name);
 
     const args: string[] = [];
     const quotedArgs: boolean[] = [];
@@ -969,6 +826,40 @@ export class Interpreter {
       }
     }
 
+    const commandIsOnlyExpansions = node.name.parts.every(
+      (part) =>
+        part.type === "CommandSubstitution" ||
+        part.type === "ParameterExpansion" ||
+        part.type === "ArithmeticExpansion",
+    );
+    if (!commandName && commandIsOnlyExpansions && args.length > 0) {
+      commandName = args.shift() as string;
+      quotedArgs.shift();
+    }
+
+    const transaction = createRedirectionTransaction(
+      this.ctx,
+      node.redirections,
+      commandName === "exec"
+        ? EXEC_REDIRECTION_POLICY
+        : SIMPLE_REDIRECTION_POLICY,
+    );
+    onTransaction(transaction);
+    const preparedRedirections = await transaction.prepare(stdin);
+    if (preparedRedirections.error) {
+      restoreTempAssignments();
+      if (!preparedRedirections.errorCause) {
+        transaction.finish();
+        return preparedRedirections.error;
+      }
+      return preparedRedirectionError(preparedRedirections);
+    }
+    const stdinSourceFd = preparedRedirections.stdinSourceFd;
+    const stdinRedirected = preparedRedirections.stdin !== undefined;
+    if (preparedRedirections.stdin !== undefined) {
+      stdin = preparedRedirections.stdin;
+    }
+
     // Handle empty command name specially
     // If the command word contains ONLY command substitutions/expansions and expands
     // to empty, word-splitting removes the empty result. If there are args, the first
@@ -978,160 +869,20 @@ export class Interpreter {
     // - `true` X runs command X (since `true` outputs nothing)
     // However, a literal empty string (like '') is "command not found".
     if (!commandName) {
-      const isOnlyExpansions = node.name.parts.every(
-        (p) =>
-          p.type === "CommandSubstitution" ||
-          p.type === "ParameterExpansion" ||
-          p.type === "ArithmeticExpansion",
-      );
-      if (isOnlyExpansions) {
-        // Empty result from variable/command substitution - word split removes it
-        // If there are args, the first arg becomes the command name
-        if (args.length > 0) {
-          const newCommandName = args.shift() as string;
-          quotedArgs.shift();
-          try {
-            return await this.runCommand(
-              newCommandName,
-              args,
-              quotedArgs,
-              stdin,
-              false,
-              false,
-              stdinSourceFd,
-              stdinRedirected,
-            );
-          } finally {
-            // This path never reaches the shared teardown below, so the
-            // command-scoped descriptors have to be closed here.
-            fdScope.restore();
-          }
-        }
+      if (commandIsOnlyExpansions) {
         // No args - treat as no-op (status 0)
         // Preserve lastExitCode for command subs like $(exit 42)
-        fdScope.restore();
+        transaction.finish();
         return result("", "", this.ctx.state.lastExitCode);
       }
       // Literal empty command name - command not found
-      fdScope.restore();
+      transaction.finish();
       return failure("bash: : command not found\n", 127);
     }
 
     // Special handling for 'exec' with only redirections (no command to run)
     // In this case, the redirections apply persistently to the shell
     if (commandName === "exec" && (args.length === 0 || args[0] === "--")) {
-      // Process persistent FD redirections
-      // Note: {var}>file redirections are already handled by processFdVariableRedirections
-      // which sets up the FD mapping persistently. We only need to handle explicit fd redirections here.
-      // Descriptors >= 3 were already opened persistently by openNumericFds
-      // (the fdScope above is never restored on this path). What is left is
-      // the standard streams, which `exec` re-points for the whole shell.
-      for (const redir of node.redirections) {
-        if (redir.target.type === "HereDoc") continue;
-
-        // Skip FD variable redirections - already handled by processFdVariableRedirections
-        if (redir.fdVariable) continue;
-        if (isNumericFdRedirection(redir)) continue;
-
-        const target = await expandWord(this.ctx, redir.target as WordNode);
-        const fd = effectiveRedirectFd(redir);
-        if (fd === null) continue;
-
-        switch (redir.operator) {
-          case ">":
-          case ">|": {
-            // Open file for writing (truncate)
-            const filePath = this.ctx.fs.resolvePath(
-              this.ctx.state.cwd,
-              target,
-            );
-            await this.ctx.fs.writeFile(filePath, "", "utf8"); // truncate
-            setFdEntry(this.ctx, fd, {
-              kind: "output",
-              path: filePath,
-              append: false,
-            });
-            break;
-          }
-          case ">>": {
-            // Open file for appending
-            const filePath = this.ctx.fs.resolvePath(
-              this.ctx.state.cwd,
-              target,
-            );
-            setFdEntry(this.ctx, fd, {
-              kind: "output",
-              path: filePath,
-              append: true,
-            });
-            break;
-          }
-          case "<": {
-            // Open file for reading - store its content
-            const filePath = this.ctx.fs.resolvePath(
-              this.ctx.state.cwd,
-              target,
-            );
-            try {
-              const content = await this.ctx.fs.readFile(filePath);
-              setFdEntry(this.ctx, fd, { kind: "input", content });
-            } catch {
-              return failure(`bash: ${target}: No such file or directory\n`);
-            }
-            break;
-          }
-          case "<>": {
-            // Open file for read/write; the entry carries its own position
-            const filePath = this.ctx.fs.resolvePath(
-              this.ctx.state.cwd,
-              target,
-            );
-            let content = "";
-            try {
-              content = await this.ctx.fs.readFile(filePath);
-            } catch {
-              // File doesn't exist - create empty
-              await this.ctx.fs.writeFile(filePath, "", "utf8");
-            }
-            setFdEntry(this.ctx, fd, {
-              kind: "readwrite",
-              path: filePath,
-              position: 0,
-              content,
-            });
-            break;
-          }
-          case ">&":
-          case "<&": {
-            const isInput = redir.operator === "<&";
-            // Close the FD
-            if (target === "-") {
-              closeFd(this.ctx, fd);
-              break;
-            }
-            // Move: N>&M- duplicates M onto N then closes M
-            const isMove = target.endsWith("-");
-            const sourceText = isMove ? target.slice(0, -1) : target;
-            const sourceFd = Number.parseInt(sourceText, 10);
-            if (Number.isNaN(sourceFd)) break;
-            if (dupFd(this.ctx, fd, sourceFd)) {
-              // Duplicated an open descriptor.
-            } else if (sourceFd >= FIRST_USER_FD) {
-              return failure(`bash: ${sourceFd}: Bad file descriptor\n`);
-            } else {
-              setFdEntry(
-                this.ctx,
-                fd,
-                isInput
-                  ? { kind: "dup-in", sourceFd }
-                  : { kind: "dup-out", sourceFd },
-              );
-            }
-            if (isMove) closeFd(this.ctx, sourceFd);
-            break;
-          }
-        }
-      }
       // In bash, "exec" with only redirections does NOT persist prefix assignments
       // This is the "special case of the special case" - unlike other special builtins
       // (like ":"), exec without a command restores temp assignments
@@ -1145,6 +896,7 @@ export class Interpreter {
           this.ctx.state.tempExportedVars.delete(name);
         }
       }
+      transaction.finish();
       return OK;
     }
 
@@ -1187,17 +939,14 @@ export class Interpreter {
         controlFlowError = error;
         cmdResult = OK; // break/continue have exit status 0
       } else {
-        fdScope.restore();
         throw error;
       }
     }
 
-    // A command fed from `<&N` has drained that descriptor: reading is
-    // consuming, so the next reader of N continues after what this command
-    // took. `read` is the exception — it reports exactly how far it got and
-    // advances N itself (see the read builtin's consumeInput).
+    // Commands without stdin access leave descriptor input untouched. `read`
+    // advances its source exactly in consumeInput.
     if (stdinSourceFd >= 0 && commandName !== "read") {
-      advanceFd(this.ctx, stdinSourceFd, stdin.length);
+      advanceFd(this.ctx, stdinSourceFd, cmdResult.internalStdinConsumed ?? 0);
     }
 
     // Prepend xtrace output and any assignment warnings to stderr
@@ -1215,9 +964,13 @@ export class Interpreter {
       this.ctx,
       cmdResult,
       node.redirections,
-      fdScope.targets.size > 0 ? fdScope.targets : undefined,
+      preparedRedirections.targets,
+      preparedRedirections.dupSources,
+      preparedRedirections.standardRoutes,
+      cmdResult.internalProducerCommand ?? commandName,
+      cmdResult.internalProducerOmitsShellPrefix,
     );
-    fdScope.restore();
+    transaction.finish();
 
     // If we caught a break/continue error, re-throw it after applying redirections
     if (controlFlowError) {
@@ -1327,18 +1080,20 @@ export class Interpreter {
       stdinRedirected,
     );
 
-    if (builtinResult !== null) {
-      return builtinResult;
-    }
+    if (builtinResult !== null)
+      return builtinResult.internalProducerCommand === undefined
+        ? { ...builtinResult, internalProducerCommand: commandName }
+        : builtinResult;
 
     // Handle external command
-    return executeExternalCommand(
+    const externalResult = await executeExternalCommand(
       dispatchCtx,
       commandName,
       args,
       stdin,
       useDefaultPath,
     );
+    return { ...externalResult, internalProducerCommand: commandName };
   }
 
   // Alias expansion state
@@ -1392,50 +1147,32 @@ export class Interpreter {
       this.ctx.state.currentLine = node.line;
     }
 
-    // Pre-open output redirects to truncate files BEFORE evaluating expression
-    // This matches bash behavior where redirect files are opened before
-    // any command substitutions in the arithmetic expression are evaluated
-    const preparedRedirects = await preOpenOutputRedirects(
+    return withPreparedRedirections(
       this.ctx,
       node.redirections,
+      "",
+      async () => {
+        try {
+          const arithResult = await evaluateArithmetic(
+            this.ctx,
+            node.expression.expression,
+          );
+          let bodyResult = testResult(arithResult !== 0);
+          if (this.ctx.state.expansionStderr) {
+            bodyResult = {
+              ...bodyResult,
+              stderr: this.ctx.state.expansionStderr + bodyResult.stderr,
+            };
+            this.ctx.state.expansionStderr = "";
+          }
+          return bodyResult;
+        } catch (error) {
+          return failure(
+            `bash: arithmetic expression: ${(error as Error).message}\n`,
+          );
+        }
+      },
     );
-    if (preparedRedirects.error) {
-      return preparedRedirects.error;
-    }
-
-    try {
-      const arithResult = await evaluateArithmetic(
-        this.ctx,
-        node.expression.expression,
-      );
-      // Apply output redirections
-      let bodyResult = testResult(arithResult !== 0);
-      // Include any stderr from expansion (e.g., command substitution stderr)
-      if (this.ctx.state.expansionStderr) {
-        bodyResult = {
-          ...bodyResult,
-          stderr: this.ctx.state.expansionStderr + bodyResult.stderr,
-        };
-        this.ctx.state.expansionStderr = "";
-      }
-      return applyRedirections(
-        this.ctx,
-        bodyResult,
-        node.redirections,
-        preparedRedirects.targets,
-      );
-    } catch (error) {
-      // Apply output redirections before returning
-      const bodyResult = failure(
-        `bash: arithmetic expression: ${(error as Error).message}\n`,
-      );
-      return applyRedirections(
-        this.ctx,
-        bodyResult,
-        node.redirections,
-        preparedRedirects.targets,
-      );
-    }
   }
 
   private async executeConditionalCommand(
@@ -1446,50 +1183,33 @@ export class Interpreter {
       this.ctx.state.currentLine = node.line;
     }
 
-    // Pre-open output redirects to truncate files BEFORE evaluating expression
-    // This matches bash behavior where redirect files are opened before
-    // any command substitutions in the conditional expression are evaluated
-    const preparedRedirects = await preOpenOutputRedirects(
+    return withPreparedRedirections(
       this.ctx,
       node.redirections,
+      "",
+      async () => {
+        try {
+          const condResult = await evaluateConditional(
+            this.ctx,
+            node.expression,
+          );
+          let bodyResult = testResult(condResult);
+          if (this.ctx.state.expansionStderr) {
+            bodyResult = {
+              ...bodyResult,
+              stderr: this.ctx.state.expansionStderr + bodyResult.stderr,
+            };
+            this.ctx.state.expansionStderr = "";
+          }
+          return bodyResult;
+        } catch (error) {
+          const exitCode = error instanceof ArithmeticError ? 1 : 2;
+          return failure(
+            `bash: conditional expression: ${(error as Error).message}\n`,
+            exitCode,
+          );
+        }
+      },
     );
-    if (preparedRedirects.error) {
-      return preparedRedirects.error;
-    }
-
-    try {
-      const condResult = await evaluateConditional(this.ctx, node.expression);
-      // Apply output redirections
-      let bodyResult = testResult(condResult);
-      // Include any stderr from expansion (e.g., bad array subscript warnings)
-      if (this.ctx.state.expansionStderr) {
-        bodyResult = {
-          ...bodyResult,
-          stderr: this.ctx.state.expansionStderr + bodyResult.stderr,
-        };
-        this.ctx.state.expansionStderr = "";
-      }
-      return applyRedirections(
-        this.ctx,
-        bodyResult,
-        node.redirections,
-        preparedRedirects.targets,
-      );
-    } catch (error) {
-      // Apply output redirections before returning
-      // ArithmeticError (e.g., division by zero) returns exit code 1
-      // Other errors (e.g., invalid regex) return exit code 2
-      const exitCode = error instanceof ArithmeticError ? 1 : 2;
-      const bodyResult = failure(
-        `bash: conditional expression: ${(error as Error).message}\n`,
-        exitCode,
-      );
-      return applyRedirections(
-        this.ctx,
-        bodyResult,
-        node.redirections,
-        preparedRedirects.targets,
-      );
-    }
   }
 }
