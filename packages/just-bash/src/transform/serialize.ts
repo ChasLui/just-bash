@@ -375,6 +375,9 @@ function serializeRedirection(node: RedirectionNode): string {
 
   if (node.operator === "<<" || node.operator === "<<-") {
     const heredoc = node.target as HereDocNode;
+    if (heredoc.terminated === false) {
+      throw new Error("Cannot serialize an unterminated here-document");
+    }
     const delimStr = heredoc.quoted
       ? `'${heredoc.delimiter}'`
       : heredoc.delimiter;

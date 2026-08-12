@@ -421,6 +421,33 @@ describe("serialize", () => {
     it("heredoc with tabs", () => roundTrip("cat <<EOF\n\ttabbed\nEOF"));
     it("heredoc fed to command", () =>
       roundTrip("grep pattern <<EOF\nfoo pattern bar\nEOF"));
+    it("rejects unterminated heredocs", () => {
+      for (const source of ["cat <<EOF\nbody", "cat <<EOF", "cat <<A <<B"]) {
+        expect(() => serialize(parse(source))).toThrow(
+          "Cannot serialize an unterminated here-document",
+        );
+      }
+    });
+    it("recognizes unquoted continuations before checking heredoc delimiters", () => {
+      expect(() => serialize(parse("cat <<EOF\nEO\\\nF"))).not.toThrow();
+      expect(() => serialize(parse("cat <<EOF\nbody\\\\\nEOF"))).not.toThrow();
+      expect(() => serialize(parse("cat <<EOF\nbody\\\nEOF"))).toThrow(
+        "Cannot serialize an unterminated here-document",
+      );
+      expect(() => serialize(parse("cat <<-EOF\n\tEO\\\n\tF"))).toThrow(
+        "Cannot serialize an unterminated here-document",
+      );
+    });
+    it("legacy heredoc without termination evidence", () => {
+      const source = "cat <<EOF\nbody\nEOF";
+      const ast = parse(source);
+      const command = ast.statements[0].pipelines[0].commands[0];
+      if (command.type !== "SimpleCommand") throw new Error("expected command");
+      const target = command.redirections[0].target;
+      if (target.type !== "HereDoc") throw new Error("expected heredoc");
+      delete target.terminated;
+      expect(serialize(ast)).toBe(source);
+    });
   });
 
   describe("complex scripts", () => {

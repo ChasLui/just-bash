@@ -88,6 +88,60 @@ EOF`);
     expect(result.exitCode).toBe(0);
   });
 
+  it("should complete an unterminated final body line", async () => {
+    const env = new Bash();
+    const result = await env.exec("cat <<EOF\nbody");
+
+    expect(result.stdout).toBe("body\n");
+    expect(result.stderr).toBe("");
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("should execute an unterminated empty heredoc", async () => {
+    const env = new Bash();
+    const result = await env.exec("cat <<EOF");
+
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("");
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("should remove an unquoted trailing backslash continuation", async () => {
+    const env = new Bash();
+    const result = await env.exec("cat <<EOF\nbody\\");
+
+    expect(result.stdout).toBe("body");
+    expect(result.stderr).toBe("");
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("should preserve a quoted trailing backslash", async () => {
+    const env = new Bash();
+    const result = await env.exec("cat <<'EOF'\nbody\\");
+
+    expect(result.stdout).toBe("body\\\n");
+    expect(result.stderr).toBe("");
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("should preserve a delimiter after an even number of backslashes", async () => {
+    const env = new Bash();
+    const result = await env.exec("cat <<EOF\nbody\\\\\nEOF");
+
+    expect(result.stdout).toBe("body\\\n");
+    expect(result.stderr).toBe("");
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("should preserve tabs within an unquoted continuation", async () => {
+    const env = new Bash();
+    const result = await env.exec("cat <<-EOF\n\tEO\\\n\tF");
+
+    expect(result.stdout).toBe("EO\tF\n");
+    expect(result.stderr).toBe("");
+    expect(result.exitCode).toBe(0);
+  });
+
   it("should work in pipes", async () => {
     const env = new Bash();
     const result = await env.exec(`cat <<EOF | grep hello

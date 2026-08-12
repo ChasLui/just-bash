@@ -292,6 +292,8 @@ export interface HereDocNode extends ASTNode {
   stripTabs: boolean;
   /** Quoted delimiter means no expansion */
   quoted: boolean;
+  /** Whether parsing consumed the closing delimiter. Undefined for legacy ASTs. */
+  terminated?: boolean;
 }
 
 // =============================================================================
@@ -1011,8 +1013,19 @@ export const AST = {
     content: WordNode,
     stripTabs = false,
     quoted = false,
+    terminated?: boolean,
   ): HereDocNode {
-    return { type: "HereDoc", delimiter, content, stripTabs, quoted };
+    const node: HereDocNode = {
+      type: "HereDoc",
+      delimiter,
+      content,
+      stripTabs,
+      quoted,
+    };
+    if (terminated !== undefined) {
+      node.terminated = terminated;
+    }
+    return node;
   },
 
   ifNode(

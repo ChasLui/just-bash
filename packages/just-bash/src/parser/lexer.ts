@@ -113,6 +113,8 @@ export interface Token {
   singleQuoted?: boolean;
   /** Quote-removed value for a here-document delimiter token. */
   heredocDelimiter?: string;
+  /** Whether a here-document content token ended at its delimiter. */
+  heredocTerminated?: boolean;
 }
 
 /**
@@ -300,6 +302,7 @@ export class Lexer {
   private pendingHeredocs: {
     delimiter: string;
     stripTabs: boolean;
+    quoted: boolean;
   }[] = [];
   private pendingHeredocDelimiterMode: boolean | undefined;
   // Track depth inside (( )) for C-style for loops and arithmetic commands
@@ -341,6 +344,10 @@ export class Lexer {
       if (token) {
         tokens.push(token);
       }
+    }
+
+    if (pendingHeredocs.length > 0) {
+      this.readHeredocContent();
     }
 
     // Add EOF token
@@ -1958,21 +1965,52 @@ export class Lexer {
       const startLine = this.line;
       const startColumn = this.column;
       let content = "";
+      let terminated = false;
 
       // Read until we find the delimiter on its own line
       while (this.pos < this.input.length) {
         let line = "";
+        let continuationContent = "";
+        let lineToCheck = "";
 
-        // Read one line
-        while (this.pos < this.input.length && this.input[this.pos] !== "\n") {
-          line += this.input[this.pos];
+        // Bash removes unquoted backslash-newline continuations before matching a delimiter.
+        while (true) {
+          line = "";
+          while (
+            this.pos < this.input.length &&
+            this.input[this.pos] !== "\n"
+          ) {
+            line += this.input[this.pos];
+            this.pos++;
+            this.column++;
+          }
+
+          let trailingBackslashes = 0;
+          for (let index = line.length - 1; line[index] === "\\"; index -= 1) {
+            trailingBackslashes += 1;
+          }
+          lineToCheck += line;
+          if (
+            heredoc.quoted ||
+            trailingBackslashes % 2 === 0 ||
+            this.pos + 1 >= this.input.length
+          ) {
+            break;
+          }
+
+          lineToCheck = lineToCheck.slice(0, -1);
+          continuationContent += `${line}\n`;
           this.pos++;
-          this.column++;
+          this.line++;
+          this.column = 1;
         }
 
         // Check for delimiter
-        const lineToCheck = heredoc.stripTabs ? line.replace(/^\t+/, "") : line;
-        if (lineToCheck === heredoc.delimiter) {
+        const delimiterLine = heredoc.stripTabs
+          ? lineToCheck.replace(/^\t+/, "")
+          : lineToCheck;
+        if (delimiterLine === heredoc.delimiter) {
+          terminated = true;
           // Consume the newline
           if (this.pos < this.input.length && this.input[this.pos] === "\n") {
             this.pos++;
@@ -1982,7 +2020,17 @@ export class Lexer {
           break;
         }
 
+        content += continuationContent;
         content += line;
+        if (this.pos < this.input.length && this.input[this.pos] === "\n") {
+          content += "\n";
+          this.pos++;
+          this.line++;
+          this.column = 1;
+        } else if (line.length > 0) {
+          // Bash completes a partial final heredoc line before executing it.
+          content += "\n";
+        }
         // Check heredoc size limit to prevent memory exhaustion
         if (content.length > this.maxHeredocSize) {
           throw new LexerError(
@@ -1990,12 +2038,6 @@ export class Lexer {
             startLine,
             startColumn,
           );
-        }
-        if (this.pos < this.input.length && this.input[this.pos] === "\n") {
-          content += "\n";
-          this.pos++;
-          this.line++;
-          this.column = 1;
         }
       }
 
@@ -2006,6 +2048,7 @@ export class Lexer {
         end: this.pos,
         line: startLine,
         column: startColumn,
+        heredocTerminated: terminated,
       });
     }
   }
@@ -2057,7 +2100,7 @@ export class Lexer {
     this.pos = endPos;
     this.line = currentLine;
     this.column = currentColumn;
-    this.pendingHeredocs.push({ delimiter, stripTabs });
+    this.pendingHeredocs.push({ delimiter, stripTabs, quoted });
 
     return {
       type: TokenType.WORD,

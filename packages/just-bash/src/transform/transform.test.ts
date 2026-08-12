@@ -18,6 +18,22 @@ describe("transform", () => {
     expect(() => bash.transform("echo ok")).not.toThrow();
   });
 
+  it("executes EOF-terminated heredocs but rejects them from transform APIs", async () => {
+    const script = "cat <<EOF\nbody";
+    const bash = new Bash();
+    const result = await bash.exec(script);
+
+    expect(result.stdout).toBe("body\n");
+    expect(result.stderr).toBe("");
+    expect(result.exitCode).toBe(0);
+    expect(() => bash.transform(script)).toThrow(
+      "Cannot serialize an unterminated here-document",
+    );
+    expect(() => new BashTransformPipeline().transform(script)).toThrow(
+      "Cannot serialize an unterminated here-document",
+    );
+  });
+
   describe("no plugins", () => {
     it("returns original script unchanged", () => {
       const bash = new Bash();

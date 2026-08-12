@@ -949,7 +949,9 @@ export function parseWordParts(
         ? "*?[]\\".includes(next)
         : "*?[]\\(){}.^+".includes(next);
       if (isEscapable) {
-        literal += next;
+        if (next !== "\n") {
+          literal += next;
+        }
       } else if (isGlobMetaOrBackslash) {
         // Create an Escaped node for glob metacharacters and backslash
         flushLiteral();
