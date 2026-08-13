@@ -242,6 +242,53 @@ await env.exec('echo "hello" > file.txt'); // writes to real filesystem
 
 Keep `ReadWriteFs` pointed at a workspace directory, not at the installed `just-bash` package or any other trusted runtime code. Guest-writable roots should stay separate from trusted code.
 
+`ReadWriteFs` uses normal in-place filesystem operations for private regular
+files. For multiply-linked regular files, it isolates append and metadata
+changes by copying the file and replacing only the sandbox directory entry, so
+a host-created hard link cannot carry those changes beyond the configured root.
+Implicit copies are limited by `maxCopyOnWriteSize` (100 MB by default; set it
+to `0` to disable the limit). Overwrite does not need to copy existing content.
+Explicit `cp` copies can be limited with the opt-in `maxCopySize` option
+(unlimited by default). The portable copy path may materialize sparse-file
+holes, so embeddings that require a disk-allocation bound should configure
+`maxCopySize`.
+
+Shared-inode isolation has a few deliberate limitations:
+
+- Append, `chmod`, and `utimes` on a multiply-linked regular file require read
+  access to the file and write access to its parent directory. They fail with
+  `EFBIG` when the file exceeds `maxCopyOnWriteSize`.
+- Copies use `O_NOATIME` when the Node.js runtime exposes it and retry with
+  normal read semantics if the kernel returns `EPERM`. Runtimes and platforms
+  without `O_NOATIME` may update access-time metadata visible through another
+  hard link.
+- Do not mutate a `ReadWriteFs` root concurrently through direct host filesystem
+  APIs. Node.js does not expose the descriptor-relative operations needed to
+  make pathname validation atomic against an external actor. A concurrent host
+  append to a multiply-linked file may be lost when the isolated entry is
+  replaced.
+- Mutations in overlapping `ReadWriteFs` roots are serialized within the
+  process. Unrelated roots proceed independently. The queue is not cancellable
+  or bounded, so a large mutation can delay later operations in overlapping
+  roots even if the requesting script is subsequently aborted.
+- Content writes and appends to FIFOs, sockets, devices, and other special files
+  are rejected. This avoids indefinitely occupying an overlapping-root mutation
+  slot on a blocking special-file open. Metadata operations remain supported
+  for single-link special files; multiply-linked special files are rejected
+  because they cannot be isolated without changing their file type.
+- Private-file and single-link special-file metadata operations use pathname
+  APIs to preserve normal host permission semantics. They are not atomic
+  against a trusted host actor concurrently replacing that pathname with a
+  symlink. With `allowSymlinks: false`, symlinks present during normal path
+  validation are still rejected.
+- Copying a symlink preserves whether its guest target is absolute or relative.
+  Only symlinks whose resolved targets remain inside the root are copied.
+- Regular-file copies replace the destination entry to prevent writes through
+  hard links. Existing destinations must still be writable, and their parent
+  directory must be writable so the isolated entry can be committed. Thus a
+  writable destination in a non-writable directory cannot be copied over.
+  Copying over a FIFO, socket, device, or other special entry is rejected.
+
 **MountableFs** - Mount multiple filesystems at different paths. Combines read-only and read-write filesystems into a unified namespace:
 
 ```typescript

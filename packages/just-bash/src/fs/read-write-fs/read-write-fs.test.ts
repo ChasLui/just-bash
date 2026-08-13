@@ -115,6 +115,24 @@ describe("ReadWriteFs", () => {
       );
     });
 
+    it("should overwrite a private writable file without replacing its directory entry", async () => {
+      const dirPath = path.join(tempDir, "non-writable-dir");
+      const filePath = path.join(dirPath, "writable.txt");
+      fs.mkdirSync(dirPath);
+      fs.writeFileSync(filePath, "original");
+      fs.chmodSync(filePath, 0o666);
+      fs.chmodSync(dirPath, 0o555);
+      const rwfs = new ReadWriteFs({ root: tempDir });
+
+      try {
+        await rwfs.writeFile("/non-writable-dir/writable.txt", "modified");
+
+        expect(fs.readFileSync(filePath, "utf8")).toBe("modified");
+      } finally {
+        fs.chmodSync(dirPath, 0o755);
+      }
+    });
+
     it("should write binary content", async () => {
       const rwfs = new ReadWriteFs({ root: tempDir, allowSymlinks: true });
       const data = new Uint8Array([0x00, 0x01, 0x02, 0xff]);
@@ -378,6 +396,30 @@ describe("ReadWriteFs", () => {
       const rwfs = new ReadWriteFs({ root: tempDir, allowSymlinks: true });
       await expect(rwfs.chmod("/nonexistent", 0o755)).rejects.toThrow("ENOENT");
     });
+
+    it("should preserve special mode bits through replacement", async () => {
+      const filePath = path.join(tempDir, "special-mode.txt");
+      fs.writeFileSync(filePath, "content");
+      const rwfs = new ReadWriteFs({ root: tempDir });
+
+      await rwfs.chmod("/special-mode.txt", 0o4755);
+
+      expect(fs.statSync(filePath).mode & 0o7777).toBe(0o4755);
+    });
+
+    it("should allow metadata operations above maxFileReadSize", async () => {
+      const filePath = path.join(tempDir, "large-metadata.txt");
+      fs.writeFileSync(filePath, "content larger than four bytes");
+      const changed = new Date("2020-05-01T00:00:00.000Z");
+      const rwfs = new ReadWriteFs({ root: tempDir, maxFileReadSize: 4 });
+
+      await rwfs.chmod("/large-metadata.txt", 0o700);
+      await rwfs.utimes("/large-metadata.txt", changed, changed);
+
+      const stat = fs.statSync(filePath);
+      expect(stat.mode & 0o777).toBe(0o700);
+      expect(stat.mtimeMs).toBe(changed.getTime());
+    });
   });
 
   describe("symlink", () => {
@@ -401,6 +443,20 @@ describe("ReadWriteFs", () => {
 
       await expect(rwfs.symlink("target", "/existing")).rejects.toThrow(
         "EEXIST",
+      );
+    });
+
+    it("should write through an allowed dangling symlink within the root", async () => {
+      fs.symlinkSync("target.txt", path.join(tempDir, "link.txt"));
+      const rwfs = new ReadWriteFs({ root: tempDir, allowSymlinks: true });
+
+      await rwfs.writeFile("/link.txt", "created");
+
+      expect(fs.readlinkSync(path.join(tempDir, "link.txt"))).toBe(
+        "target.txt",
+      );
+      expect(fs.readFileSync(path.join(tempDir, "target.txt"), "utf8")).toBe(
+        "created",
       );
     });
   });

@@ -11,6 +11,7 @@
  * New methods must use these gates — never access the real FS directly.
  */
 
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as nodePath from "node:path";
 import { type ByteString, unsafeBytesFromLatin1 } from "../../encoding.js";
@@ -42,7 +43,12 @@ import {
 } from "../real-fs-utils.js";
 
 /** Error patterns that are safe to pass through (contain virtual paths, not real ones). */
-const RW_PASSTHROUGH_ERRORS = ["EACCES", "escaping sandbox", "EFBIG"] as const;
+const RW_PASSTHROUGH_ERRORS = [
+  "EACCES",
+  "escaping sandbox",
+  "EFBIG",
+  "ENOTSUP",
+] as const;
 
 export interface ReadWriteFsOptions {
   /**
@@ -59,6 +65,19 @@ export interface ReadWriteFsOptions {
   maxFileReadSize?: number;
 
   /**
+   * Maximum file size in bytes that metadata operations and append may copy
+   * when isolating a multiply-linked regular file. Defaults to 100MB.
+   * Set to 0 to disable this limit.
+   */
+  maxCopyOnWriteSize?: number;
+
+  /**
+   * Maximum regular file size in bytes that cp may copy. Defaults to 0
+   * (unlimited) for compatibility with normal filesystem copy behavior.
+   */
+  maxCopySize?: number;
+
+  /**
    * Whether to allow following and creating symlinks.
    * When false (default), any path traversing a symlink is rejected
    * and symlink() throws EPERM.
@@ -67,15 +86,23 @@ export interface ReadWriteFsOptions {
 }
 
 export class ReadWriteFs implements IFileSystem {
+  private static activeMutationRoots = new Set<string>();
+  private static pendingMutations: Array<{
+    root: string;
+    start: () => void;
+  }> = [];
   private readonly root: string;
   private readonly canonicalRoot: string;
   private readonly maxFileReadSize: number;
+  private readonly maxCopyOnWriteSize: number;
+  private readonly maxCopySize: number;
   private readonly allowSymlinks: boolean;
-  private transactionId = 0;
 
   constructor(options: ReadWriteFsOptions) {
     this.root = nodePath.resolve(options.root);
     this.maxFileReadSize = options.maxFileReadSize ?? 10485760;
+    this.maxCopyOnWriteSize = options.maxCopyOnWriteSize ?? 104857600;
+    this.maxCopySize = options.maxCopySize ?? 0;
     this.allowSymlinks = options.allowSymlinks ?? false;
 
     // Verify root exists and is a directory
@@ -189,6 +216,16 @@ export class ReadWriteFs implements IFileSystem {
     content: FileContent,
     options?: WriteFileOptions | BufferEncoding,
   ): Promise<void> {
+    await this.withFilesystemMutation(() =>
+      this.writeFileUnlocked(path, content, options),
+    );
+  }
+
+  private async writeFileUnlocked(
+    path: string,
+    content: FileContent,
+    options?: WriteFileOptions | BufferEncoding,
+  ): Promise<void> {
     validatePath(path, "write");
     const realPath = this.toRealPath(path);
     let canonical = this.resolveAndValidate(realPath, path);
@@ -203,19 +240,34 @@ export class ReadWriteFs implements IFileSystem {
       // replace a parent directory with a symlink between the initial
       // validation and mkdir.
       canonical = this.resolveAndValidate(realPath, path);
-      // When symlinks disabled, use O_NOFOLLOW to prevent symlink-swap
       const noFollow = this.allowSymlinks ? 0 : fs.constants.O_NOFOLLOW;
-      const flags =
-        fs.constants.O_WRONLY |
-        fs.constants.O_CREAT |
-        fs.constants.O_TRUNC |
-        noFollow;
-      const fh = await fs.promises.open(canonical, flags, 0o666);
+      let existingStat: fs.Stats | null = null;
       try {
-        await fh.writeFile(buffer);
-      } finally {
-        await fh.close();
+        const pathStat = await fs.promises.lstat(canonical);
+        if (!pathStat.isFile() && !pathStat.isDirectory()) {
+          throw new Error(`EACCES: cannot write special file '${path}'`);
+        }
+        const fh = await fs.promises.open(
+          canonical,
+          fs.constants.O_WRONLY | fs.constants.O_NONBLOCK | noFollow,
+        );
+        try {
+          existingStat = await fh.stat();
+          if (!existingStat.isFile()) {
+            throw new Error(`EACCES: cannot write special file '${path}'`);
+          }
+          if (existingStat.nlink <= 1) {
+            await fh.truncate(0);
+            await fh.writeFile(buffer);
+            return;
+          }
+        } finally {
+          await fh.close();
+        }
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
       }
+      await this.replaceFile(canonical, buffer, existingStat);
     } catch (e) {
       const err = e as NodeJS.ErrnoException;
       if (err.code === "ELOOP") {
@@ -230,30 +282,81 @@ export class ReadWriteFs implements IFileSystem {
     content: FileContent,
     options?: WriteFileOptions | BufferEncoding,
   ): Promise<void> {
+    await this.withFilesystemMutation(() =>
+      this.appendFileUnlocked(path, content, options),
+    );
+  }
+
+  private async appendFileUnlocked(
+    path: string,
+    content: FileContent,
+    options?: WriteFileOptions | BufferEncoding,
+  ): Promise<void> {
     validatePath(path, "append");
     const realPath = this.toRealPath(path);
-    let canonical = this.resolveAndValidate(realPath, path);
     const encoding = getEncoding(options);
     const buffer = toBuffer(content, encoding);
-
+    let canonical = this.resolveAndValidate(realPath, path);
     // Ensure parent directory exists
     const dir = nodePath.dirname(canonical);
     try {
       await fs.promises.mkdir(dir, { recursive: true });
       // Re-validate after mkdir to catch TOCTOU parent-swap attacks
       canonical = this.resolveAndValidate(realPath, path);
-      // When symlinks disabled, use O_NOFOLLOW to prevent symlink-swap
       const noFollow = this.allowSymlinks ? 0 : fs.constants.O_NOFOLLOW;
-      const flags =
-        fs.constants.O_WRONLY |
-        fs.constants.O_CREAT |
-        fs.constants.O_APPEND |
-        noFollow;
-      const fh = await fs.promises.open(canonical, flags, 0o666);
+      let existingStat: fs.Stats | null = null;
       try {
-        await fh.writeFile(buffer);
+        const pathStat = await fs.promises.lstat(canonical);
+        if (!pathStat.isFile() && !pathStat.isDirectory()) {
+          throw new Error(`EACCES: cannot append special file '${path}'`);
+        }
+        const permissionHandle = await fs.promises.open(
+          canonical,
+          fs.constants.O_WRONLY |
+            fs.constants.O_APPEND |
+            fs.constants.O_NONBLOCK |
+            noFollow,
+        );
+        try {
+          existingStat = await permissionHandle.stat();
+          if (!existingStat.isFile()) {
+            throw new Error(`EACCES: cannot append special file '${path}'`);
+          }
+          if (existingStat.nlink <= 1) {
+            await permissionHandle.writeFile(buffer);
+            return;
+          }
+        } finally {
+          await permissionHandle.close();
+        }
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+      }
+
+      if (!existingStat) {
+        await this.replaceFile(canonical, buffer, null);
+        return;
+      }
+      this.assertCopyOnWriteSize(existingStat.size, "append", path);
+      // Copy through a no-atime handle where the platform supports it. The
+      // copy is limited to the size snapshot above, so concurrent growth
+      // cannot make this loop unbounded.
+      const source = await this.openCopySource(canonical);
+      try {
+        const stat = await source.stat();
+        if (
+          !stat.isFile() ||
+          stat.dev !== existingStat.dev ||
+          stat.ino !== existingStat.ino
+        ) {
+          throw new Error(`EACCES: file identity changed, append '${path}'`);
+        }
+        await this.replaceFile(canonical, buffer, stat, {
+          handle: source,
+          size: existingStat.size,
+        });
       } finally {
-        await fh.close();
+        await source.close();
       }
     } catch (e) {
       const err = e as NodeJS.ErrnoException;
@@ -261,6 +364,204 @@ export class ReadWriteFs implements IFileSystem {
         throw new Error(`EACCES: permission denied, '${path}' is a symlink`);
       }
       this.sanitizeError(e, path, "append");
+    }
+  }
+
+  private async withFilesystemMutation<T>(
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      ReadWriteFs.pendingMutations.push({
+        root: this.canonicalRoot,
+        start: () => {
+          ReadWriteFs.activeMutationRoots.add(this.canonicalRoot);
+          void operation()
+            .then(resolve, reject)
+            .finally(() => {
+              ReadWriteFs.activeMutationRoots.delete(this.canonicalRoot);
+              ReadWriteFs.drainMutationQueue();
+            });
+        },
+      });
+      ReadWriteFs.drainMutationQueue();
+    });
+  }
+
+  private static drainMutationQueue(): void {
+    for (let index = 0; index < ReadWriteFs.pendingMutations.length; ) {
+      const pending = ReadWriteFs.pendingMutations[index];
+      const overlapsActiveRoot = [...ReadWriteFs.activeMutationRoots].some(
+        (activeRoot) =>
+          isPathWithinRoot(pending.root, activeRoot) ||
+          isPathWithinRoot(activeRoot, pending.root),
+      );
+      if (overlapsActiveRoot) {
+        index++;
+        continue;
+      }
+      ReadWriteFs.pendingMutations.splice(index, 1);
+      pending.start();
+    }
+  }
+
+  private assertCopyOnWriteSize(
+    size: number,
+    operation: string,
+    virtualPath: string,
+  ): void {
+    if (this.maxCopyOnWriteSize > 0 && size > this.maxCopyOnWriteSize) {
+      throw new Error(
+        `EFBIG: file too large for copy-on-write ${operation} '${virtualPath}' (${size} bytes, max ${this.maxCopyOnWriteSize})`,
+      );
+    }
+  }
+
+  private assertCopySize(stat: fs.Stats, virtualPath: string): void {
+    if (this.maxCopySize > 0 && stat.size > this.maxCopySize) {
+      throw new Error(
+        `EFBIG: file too large to copy '${virtualPath}' (${stat.size} bytes, max ${this.maxCopySize})`,
+      );
+    }
+  }
+
+  private randomTransactionToken(): string {
+    return randomBytes(16).toString("hex");
+  }
+
+  /** Open a bounded copy source, avoiding atime updates where permitted. */
+  private async openCopySource(
+    canonical: string,
+  ): Promise<fs.promises.FileHandle> {
+    const noFollow = this.allowSymlinks ? 0 : fs.constants.O_NOFOLLOW;
+    const flags = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | noFollow;
+    const noAtime = (
+      fs.constants as typeof fs.constants & { O_NOATIME?: number }
+    ).O_NOATIME;
+    if (process.platform !== "linux" || noAtime === undefined) {
+      return fs.promises.open(canonical, flags);
+    }
+
+    // O_NOATIME can be exposed by a Node runtime, but the kernel rejects it
+    // with EPERM when the process does not own the inode and lacks CAP_FOWNER.
+    // In that case preserve normal readable-file behavior.
+    try {
+      return await fs.promises.open(canonical, flags | noAtime);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EPERM") throw e;
+      return fs.promises.open(canonical, flags);
+    }
+  }
+
+  /**
+   * Commit file contents by replacing a directory entry, never by mutating
+   * its existing inode. This prevents writes through host-planted hard links
+   * from changing files outside the sandbox.
+   */
+  private async replaceFile(
+    canonical: string,
+    content: Uint8Array,
+    existingStat: Pick<fs.Stats, "mode" | "atime" | "mtime"> | null,
+    source?: { handle: fs.promises.FileHandle; size: number },
+    times?: { atime: Date; mtime: Date },
+    preserveSpecialModeBits = false,
+  ): Promise<void> {
+    const dir = nodePath.dirname(canonical);
+    let tempPath = "";
+    let fh: fs.promises.FileHandle | null = null;
+    const createMode = existingStat === null ? 0o666 : 0o600;
+    for (let attempts = 0; attempts < 16; attempts++) {
+      tempPath = nodePath.join(
+        dir,
+        `.just-bash-write-${this.randomTransactionToken()}`,
+      );
+      try {
+        fh = await fs.promises.open(
+          tempPath,
+          fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+          createMode,
+        );
+        break;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      }
+    }
+    if (!fh) throw new Error(`EEXIST: replacement write '${canonical}'`);
+    const tempHandle = fh;
+    const tempIdentity = await tempHandle.stat();
+    let committed = false;
+
+    try {
+      try {
+        let position = 0;
+        const writeAt = async (data: Uint8Array): Promise<void> => {
+          let offset = 0;
+          while (offset < data.byteLength) {
+            const { bytesWritten } = await tempHandle.write(
+              data,
+              offset,
+              data.byteLength - offset,
+              position + offset,
+            );
+            if (bytesWritten === 0) {
+              throw new Error("EIO: replacement write made no progress");
+            }
+            offset += bytesWritten;
+          }
+          position += offset;
+        };
+        if (source) {
+          const chunk = Buffer.allocUnsafe(64 * 1024);
+          let sourcePosition = 0;
+          let remaining = source.size;
+          while (remaining > 0) {
+            const bytesToRead = Math.min(chunk.length, remaining);
+            const { bytesRead } = await source.handle.read(
+              chunk,
+              0,
+              bytesToRead,
+              sourcePosition,
+            );
+            if (bytesRead === 0) break;
+            await writeAt(chunk.subarray(0, bytesRead));
+            sourcePosition += bytesRead;
+            remaining -= bytesRead;
+          }
+        }
+        await writeAt(content);
+        if (existingStat !== null) {
+          await tempHandle.chmod(
+            existingStat.mode & (preserveSpecialModeBits ? 0o7777 : 0o777),
+          );
+        }
+        if (times) {
+          await tempHandle.utimes(times.atime, times.mtime);
+        } else if (existingStat !== null) {
+          const tempStat = await tempHandle.stat();
+          await tempHandle.utimes(existingStat.atime, tempStat.mtime);
+        }
+      } finally {
+        await tempHandle.close();
+        fh = null;
+      }
+
+      // Fail closed if another same-user actor replaced the staging entry
+      // while its file handle was open. rename() itself is entry-oriented, but
+      // committing an attacker-substituted entry would violate write intent.
+      const stagedIdentity = await fs.promises.lstat(tempPath);
+      if (
+        !stagedIdentity.isFile() ||
+        stagedIdentity.dev !== tempIdentity.dev ||
+        stagedIdentity.ino !== tempIdentity.ino
+      ) {
+        throw new Error("EACCES: replacement staging entry changed");
+      }
+      await fs.promises.rename(tempPath, canonical);
+      committed = true;
+    } finally {
+      if (fh) await fh.close().catch(() => {});
+      if (!committed) {
+        await fs.promises.rm(tempPath, { force: true }).catch(() => {});
+      }
     }
   }
 
@@ -338,9 +639,21 @@ export class ReadWriteFs implements IFileSystem {
   }
 
   async mkdir(path: string, options?: MkdirOptions): Promise<void> {
+    await this.withFilesystemMutation(() => this.mkdirUnlocked(path, options));
+  }
+
+  private async mkdirUnlocked(
+    path: string,
+    options?: MkdirOptions,
+  ): Promise<void> {
     validatePath(path, "mkdir");
     const realPath = this.toRealPath(path);
-    const canonical = this.resolveAndValidate(realPath, path);
+    // mkdir creates the final directory entry. Validate its parent without
+    // following a dangling symlink already occupying the requested name.
+    const canonical =
+      realPath === this.root
+        ? this.resolveAndValidate(realPath, path)
+        : this.validateParent(realPath, path);
 
     try {
       await fs.promises.mkdir(canonical, { recursive: options?.recursive });
@@ -401,6 +714,10 @@ export class ReadWriteFs implements IFileSystem {
   }
 
   async rm(path: string, options?: RmOptions): Promise<void> {
+    await this.withFilesystemMutation(() => this.rmUnlocked(path, options));
+  }
+
+  private async rmUnlocked(path: string, options?: RmOptions): Promise<void> {
     validatePath(path, "rm");
     const realPath = this.toRealPath(path);
     // Deletion is entry-oriented: authorize the parent, but do not resolve the
@@ -431,11 +748,23 @@ export class ReadWriteFs implements IFileSystem {
   }
 
   async cp(src: string, dest: string, options?: CpOptions): Promise<void> {
+    await this.withFilesystemMutation(() =>
+      this.cpUnlocked(src, dest, options),
+    );
+  }
+
+  private async cpUnlocked(
+    src: string,
+    dest: string,
+    options?: CpOptions,
+  ): Promise<void> {
     validatePath(src, "cp");
     validatePath(dest, "cp");
     const srcReal = this.toRealPath(src);
     const destReal = this.toRealPath(dest);
-    const srcCanonical = this.resolveAndValidate(srcReal, src);
+    // cp operates on the source directory entry itself, including when it is
+    // a symlink. Validate its parent without resolving the final component.
+    const srcCanonical = this.validateParent(srcReal, src);
     const destCanonical = this.resolveAndValidate(destReal, dest);
     let srcStat: fs.Stats;
     try {
@@ -453,6 +782,34 @@ export class ReadWriteFs implements IFileSystem {
     ) {
       throw new Error(`EINVAL: cannot copy '${src}' into itself, '${dest}'`);
     }
+    if (!srcStat.isDirectory()) {
+      try {
+        const destEntry = this.validateParent(destReal, dest);
+        const destEntryStat = await fs.promises.lstat(destEntry);
+        if (
+          srcStat.dev === destEntryStat.dev &&
+          srcStat.ino === destEntryStat.ino
+        ) {
+          throw new Error(
+            `EINVAL: cannot copy '${src}' onto itself, '${dest}'`,
+          );
+        }
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+      }
+    }
+    if (srcStat.isFile()) {
+      try {
+        const destStat = await fs.promises.stat(destCanonical);
+        if (srcStat.dev === destStat.dev && srcStat.ino === destStat.ino) {
+          throw new Error(
+            `EINVAL: cannot copy '${src}' onto itself, '${dest}'`,
+          );
+        }
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+      }
+    }
 
     try {
       await this.preflightCopyTree(srcCanonical, src);
@@ -460,44 +817,28 @@ export class ReadWriteFs implements IFileSystem {
       this.sanitizeError(e, src, "cp");
     }
 
+    // Match fs.cp's behavior for a missing destination hierarchy. Validate
+    // again after creating it so the path used for replacement reflects the
+    // directory entries that now exist.
+    if (srcStat.isFile() || srcStat.isSymbolicLink()) {
+      try {
+        await fs.promises.mkdir(nodePath.dirname(destCanonical), {
+          recursive: true,
+        });
+        this.resolveAndValidate(destReal, dest);
+      } catch (e) {
+        this.sanitizeError(e, dest, "cp");
+      }
+    }
+
     try {
-      await fs.promises.cp(srcCanonical, destCanonical, {
-        recursive: options?.recursive ?? false,
-        // Validate each entry during recursive copy to prevent:
-        // 1. Following symlinks that point outside the sandbox
-        // 2. Creating raw symlinks that bypass target transformation
-        filter: async (source: string) => {
-          try {
-            const stat = fs.lstatSync(source);
-            if (stat.isSymbolicLink()) {
-              // Validate the symlink's resolved target stays within sandbox
-              const resolved = await fs.promises
-                .realpath(source)
-                .catch(() => null);
-              if (
-                resolved === null ||
-                !isPathWithinRoot(resolved, this.canonicalRoot)
-              ) {
-                throw new Error(
-                  `EACCES: permission denied, cp '${src}' contains an unsafe symlink`,
-                );
-              }
-              return true;
-            }
-            return true;
-          } catch (filterErr) {
-            if (
-              (filterErr as Error).message?.includes("EACCES") ||
-              (filterErr as Error).message?.includes("unsafe symlink")
-            ) {
-              throw filterErr;
-            }
-            // Never silently omit a source entry: that would turn cp and the
-            // EXDEV mv fallback into successful-looking partial operations.
-            throw new Error(`EIO: cp '${src}' could not validate source tree`);
-          }
-        },
-      });
+      await this.copyTreeEntry(
+        srcCanonical,
+        destReal,
+        src,
+        dest,
+        options?.recursive ?? false,
+      );
     } catch (e) {
       const err = e as NodeJS.ErrnoException;
       if (err.code === "ENOENT") {
@@ -508,6 +849,210 @@ export class ReadWriteFs implements IFileSystem {
       }
       this.sanitizeError(e, src, "cp");
     }
+  }
+
+  private async copyTreeEntry(
+    source: string,
+    destinationReal: string,
+    virtualSource: string,
+    virtualDestination: string,
+    recursive: boolean,
+  ): Promise<void> {
+    const stat = await fs.promises.lstat(source);
+    if (stat.isFile()) {
+      this.assertCopySize(stat, virtualSource);
+      const destination = this.resolveAndValidate(
+        destinationReal,
+        virtualDestination,
+      );
+      const destinationStat = await this.assertCopyDestinationWritable(
+        destination,
+        virtualDestination,
+      );
+      const sourceHandle = await this.openCopySource(source);
+      try {
+        const sourceStat = await sourceHandle.stat();
+        if (
+          !sourceStat.isFile() ||
+          sourceStat.dev !== stat.dev ||
+          sourceStat.ino !== stat.ino
+        ) {
+          throw new Error(
+            `EACCES: file identity changed, cp '${virtualSource}'`,
+          );
+        }
+        await this.replaceFile(
+          destination,
+          new Uint8Array(0),
+          destinationStat ?? stat,
+          { handle: sourceHandle, size: stat.size },
+        );
+      } finally {
+        await sourceHandle.close();
+      }
+      return;
+    }
+    if (stat.isSymbolicLink()) {
+      if (!this.allowSymlinks) {
+        throw new Error(
+          `EACCES: permission denied, cp '${virtualSource}' contains a symlink`,
+        );
+      }
+      const rawTarget = await fs.promises.readlink(source);
+      const target = nodePath.isAbsolute(rawTarget)
+        ? await this.toVirtualAbsoluteSymlinkTarget(rawTarget, virtualSource)
+        : rawTarget;
+      await this.replaceSymlink(destinationReal, virtualDestination, target);
+      return;
+    }
+    if (stat.isDirectory()) {
+      if (!recursive) {
+        throw new Error(`EISDIR: is a directory, cp '${virtualSource}'`);
+      }
+      let destination = this.resolveAndValidate(
+        destinationReal,
+        virtualDestination,
+      );
+      await fs.promises.mkdir(destination, { recursive: true });
+      // A pre-existing child symlink, or a parent swap during mkdir, must not
+      // redirect subsequent recursive entries outside the sandbox.
+      destination = this.resolveAndValidate(
+        destinationReal,
+        virtualDestination,
+      );
+      for (const entry of await fs.promises.readdir(source)) {
+        await this.copyTreeEntry(
+          nodePath.join(source, entry),
+          nodePath.join(destinationReal, entry),
+          nodePath.join(virtualSource, entry),
+          nodePath.join(virtualDestination, entry),
+          true,
+        );
+      }
+      await fs.promises.chmod(destination, stat.mode & 0o7777);
+      return;
+    }
+    throw new Error(`EINVAL: unsupported file type, cp '${virtualSource}'`);
+  }
+
+  private async assertCopyDestinationWritable(
+    destination: string,
+    virtualDestination: string,
+  ): Promise<fs.Stats | null> {
+    let entryStat: fs.Stats;
+    try {
+      entryStat = await fs.promises.lstat(destination);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw e;
+    }
+    if (!entryStat.isFile()) {
+      if (entryStat.isDirectory()) return entryStat;
+      throw new Error(
+        `EACCES: cannot copy over special file '${virtualDestination}'`,
+      );
+    }
+
+    const noFollow = this.allowSymlinks ? 0 : fs.constants.O_NOFOLLOW;
+    const handle = await fs.promises.open(
+      destination,
+      fs.constants.O_WRONLY | fs.constants.O_NONBLOCK | noFollow,
+    );
+    try {
+      const openedStat = await handle.stat();
+      if (
+        !openedStat.isFile() ||
+        openedStat.dev !== entryStat.dev ||
+        openedStat.ino !== entryStat.ino
+      ) {
+        throw new Error(
+          `EACCES: destination changed, cp '${virtualDestination}'`,
+        );
+      }
+    } finally {
+      await handle.close();
+    }
+    return entryStat;
+  }
+
+  private async replaceSymlink(
+    destinationReal: string,
+    virtualDestination: string,
+    target: string,
+  ): Promise<void> {
+    const destination = this.validateParent(
+      destinationReal,
+      virtualDestination,
+    );
+    const virtualDir = nodePath.dirname(normalizePath(virtualDestination));
+    let tempVirtual = "";
+    let tempReal = "";
+    let tempCanonical = "";
+    let tempIdentity: fs.Stats | null = null;
+
+    for (let attempts = 0; attempts < 16; attempts++) {
+      const tempName = `.just-bash-copy-link-${this.randomTransactionToken()}`;
+      tempVirtual =
+        virtualDir === "/" ? `/${tempName}` : `${virtualDir}/${tempName}`;
+      tempReal = this.toRealPath(tempVirtual);
+      try {
+        await this.symlinkUnlocked(target, tempVirtual);
+        tempCanonical = this.validateParent(tempReal, tempVirtual);
+        tempIdentity = await fs.promises.lstat(tempCanonical);
+        break;
+      } catch (e) {
+        const err = e as NodeJS.ErrnoException;
+        if (err.code !== "EEXIST" && !err.message.startsWith("EEXIST:")) {
+          throw e;
+        }
+      }
+    }
+    if (!tempIdentity) {
+      throw new Error(`EEXIST: replacement symlink '${virtualDestination}'`);
+    }
+
+    let committed = false;
+    try {
+      const stagedIdentity = await fs.promises.lstat(tempCanonical);
+      if (
+        !stagedIdentity.isSymbolicLink() ||
+        stagedIdentity.dev !== tempIdentity.dev ||
+        stagedIdentity.ino !== tempIdentity.ino
+      ) {
+        throw new Error("EACCES: replacement symlink entry changed");
+      }
+      await fs.promises.rename(tempCanonical, destination);
+      committed = true;
+    } finally {
+      if (!committed && tempCanonical) {
+        await fs.promises.rm(tempCanonical, { force: true }).catch(() => {});
+      }
+    }
+  }
+
+  private async toVirtualAbsoluteSymlinkTarget(
+    rawTarget: string,
+    virtualSource: string,
+  ): Promise<string> {
+    const resolvedTarget = nodePath.resolve(rawTarget);
+    const canonicalTarget = await fs.promises.realpath(resolvedTarget);
+    const canonicalTargetParent = await fs.promises.realpath(
+      nodePath.dirname(resolvedTarget),
+    );
+    const preservedTarget = nodePath.join(
+      canonicalTargetParent,
+      nodePath.basename(resolvedTarget),
+    );
+    if (
+      !isPathWithinRoot(canonicalTarget, this.canonicalRoot) ||
+      !isPathWithinRoot(preservedTarget, this.canonicalRoot)
+    ) {
+      throw new Error(
+        `EACCES: permission denied, cp '${virtualSource}' contains an unsafe symlink`,
+      );
+    }
+    const relative = preservedTarget.slice(this.canonicalRoot.length);
+    return relative || "/";
   }
 
   private async preflightCopyTree(
@@ -541,7 +1086,7 @@ export class ReadWriteFs implements IFileSystem {
       for (const entry of entries) {
         await this.preflightCopyTree(
           nodePath.join(source, entry),
-          virtualSource,
+          nodePath.join(virtualSource, entry),
           visited,
         );
       }
@@ -551,6 +1096,10 @@ export class ReadWriteFs implements IFileSystem {
   }
 
   async mv(src: string, dest: string): Promise<void> {
+    await this.withFilesystemMutation(() => this.mvUnlocked(src, dest));
+  }
+
+  private async mvUnlocked(src: string, dest: string): Promise<void> {
     validatePath(src, "mv");
     validatePath(dest, "mv");
     const srcReal = this.toRealPath(src);
@@ -694,11 +1243,10 @@ export class ReadWriteFs implements IFileSystem {
     purpose: "stage" | "backup" | "source",
   ): Promise<string> {
     const parent = nodePath.posix.dirname(path);
-    for (let attempts = 0; attempts < 100; attempts++) {
-      const id = this.transactionId++;
+    for (let attempts = 0; attempts < 16; attempts++) {
       const candidate = nodePath.posix.join(
         parent,
-        `.just-bash-mv-${purpose}-${id}`,
+        `.just-bash-mv-${purpose}-${this.randomTransactionToken()}`,
       );
       if (!(await this.exists(candidate))) return candidate;
     }
@@ -748,8 +1296,12 @@ export class ReadWriteFs implements IFileSystem {
     try {
       // cp performs the complete traversal and symlink policy checks before any
       // visible destination name is changed.
-      await this.cp(src, stage, { recursive: true });
-      if (this.findEscapingSymlinks(stageReal).length > 0) {
+      await this.cpUnlocked(src, stage, { recursive: true });
+      const stagedStat = await fs.promises.lstat(stageReal);
+      if (
+        stagedStat.isDirectory() &&
+        this.findEscapingSymlinks(stageReal).length > 0
+      ) {
         throw new Error(
           `EACCES: permission denied, mv '${src}' -> '${dest}' would create symlinks escaping sandbox`,
         );
@@ -866,23 +1418,54 @@ export class ReadWriteFs implements IFileSystem {
   }
 
   async chmod(path: string, mode: number): Promise<void> {
+    await this.withFilesystemMutation(() => this.chmodUnlocked(path, mode));
+  }
+
+  private async chmodUnlocked(path: string, mode: number): Promise<void> {
     validatePath(path, "chmod");
     const realPath = this.toRealPath(path);
     const canonical = this.resolveAndValidate(realPath, path);
 
     try {
-      // Use open(O_NOFOLLOW) + fh.chmod() to close a TOCTOU gap: if the
-      // file at `canonical` is replaced with a symlink between
-      // resolveAndValidate() and this call, O_NOFOLLOW makes it fail with
-      // ELOOP instead of following it.
-      const flags = this.allowSymlinks
-        ? fs.constants.O_RDONLY
-        : fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW;
-      const fh = await fs.promises.open(canonical, flags);
+      const initialStat = await fs.promises.lstat(canonical);
+      // Copy-on-write is meaningful only for regular files. Opening a FIFO
+      // for reading can block indefinitely, and replacing any special inode
+      // would silently change its file type.
+      if (!initialStat.isFile()) {
+        if (!initialStat.isDirectory() && initialStat.nlink > 1) {
+          throw new Error(
+            `EACCES: cannot chmod multiply-linked special file '${path}'`,
+          );
+        }
+        // Path-based metadata calls preserve directory and special-file
+        // permission semantics. They are not atomic against direct host path
+        // replacement, which is outside ReadWriteFs's trusted-host boundary.
+        await fs.promises.chmod(canonical, mode);
+        return;
+      }
+      if (initialStat.nlink <= 1) {
+        // See the trusted-host concurrency limitation documented above.
+        await fs.promises.chmod(canonical, mode);
+        return;
+      }
+      this.assertCopyOnWriteSize(initialStat.size, "chmod", path);
+
+      const source = await this.openCopySource(canonical);
       try {
-        await fh.chmod(mode);
+        const stat = await source.stat();
+        if (!stat.isFile()) {
+          throw new Error(`EACCES: file type changed, chmod '${path}'`);
+        }
+        await this.replaceFile(
+          canonical,
+          new Uint8Array(0),
+          { mode, atime: stat.atime, mtime: stat.mtime },
+          { handle: source, size: stat.size },
+          { atime: stat.atime, mtime: stat.mtime },
+          true,
+        );
       } finally {
-        await fh.close();
+        await source.close();
       }
     } catch (e) {
       const err = e as NodeJS.ErrnoException;
@@ -890,7 +1473,6 @@ export class ReadWriteFs implements IFileSystem {
         throw new Error(`ENOENT: no such file or directory, chmod '${path}'`);
       }
       if (err.code === "ELOOP") {
-        // O_NOFOLLOW caught a symlink swap (TOCTOU defense)
         throw new Error(`EACCES: permission denied, '${path}' is a symlink`);
       }
       this.sanitizeError(e, path, "chmod");
@@ -898,6 +1480,15 @@ export class ReadWriteFs implements IFileSystem {
   }
 
   async symlink(target: string, linkPath: string): Promise<void> {
+    await this.withFilesystemMutation(() =>
+      this.symlinkUnlocked(target, linkPath),
+    );
+  }
+
+  private async symlinkUnlocked(
+    target: string,
+    linkPath: string,
+  ): Promise<void> {
     if (!this.allowSymlinks) {
       throw new Error(`EPERM: operation not permitted, symlink '${linkPath}'`);
     }
@@ -942,6 +1533,15 @@ export class ReadWriteFs implements IFileSystem {
   }
 
   async link(existingPath: string, newPath: string): Promise<void> {
+    await this.withFilesystemMutation(() =>
+      this.linkUnlocked(existingPath, newPath),
+    );
+  }
+
+  private async linkUnlocked(
+    existingPath: string,
+    newPath: string,
+  ): Promise<void> {
     validatePath(existingPath, "link");
     validatePath(newPath, "link");
     const realExisting = this.toRealPath(existingPath);
@@ -950,7 +1550,12 @@ export class ReadWriteFs implements IFileSystem {
       realExisting,
       existingPath,
     );
-    const canonicalNew = this.resolveAndValidate(realNew, newPath);
+    // link creates the final directory entry and must not follow a dangling
+    // symlink already occupying that name.
+    const canonicalNew =
+      realNew === this.root
+        ? this.resolveAndValidate(realNew, newPath)
+        : this.validateParent(realNew, newPath);
 
     try {
       await fs.promises.link(canonicalExisting, canonicalNew);
@@ -1084,23 +1689,57 @@ export class ReadWriteFs implements IFileSystem {
    * @param mtime - Modification time
    */
   async utimes(path: string, atime: Date, mtime: Date): Promise<void> {
+    await this.withFilesystemMutation(() =>
+      this.utimesUnlocked(path, atime, mtime),
+    );
+  }
+
+  private async utimesUnlocked(
+    path: string,
+    atime: Date,
+    mtime: Date,
+  ): Promise<void> {
     validatePath(path, "utimes");
     const realPath = this.toRealPath(path);
     const canonical = this.resolveAndValidate(realPath, path);
 
     try {
-      // Use open(O_NOFOLLOW) + fh.utimes() to close a TOCTOU gap: if the
-      // file at `canonical` is replaced with a symlink between
-      // resolveAndValidate() and this call, O_NOFOLLOW makes it fail with
-      // ELOOP instead of following it.
-      const flags = this.allowSymlinks
-        ? fs.constants.O_RDONLY
-        : fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW;
-      const fh = await fs.promises.open(canonical, flags);
+      const initialStat = await fs.promises.lstat(canonical);
+      if (!initialStat.isFile()) {
+        if (!initialStat.isDirectory() && initialStat.nlink > 1) {
+          throw new Error(
+            `EACCES: cannot change times on multiply-linked special file '${path}'`,
+          );
+        }
+        // Path-based metadata calls preserve directory and special-file
+        // permission semantics. They are not atomic against direct host path
+        // replacement, which is outside ReadWriteFs's trusted-host boundary.
+        await fs.promises.utimes(canonical, atime, mtime);
+        return;
+      }
+      if (initialStat.nlink <= 1) {
+        // See the trusted-host concurrency limitation documented above.
+        await fs.promises.utimes(canonical, atime, mtime);
+        return;
+      }
+      this.assertCopyOnWriteSize(initialStat.size, "utimes", path);
+
+      const source = await this.openCopySource(canonical);
       try {
-        await fh.utimes(atime, mtime);
+        const stat = await source.stat();
+        if (!stat.isFile()) {
+          throw new Error(`EACCES: file type changed, utimes '${path}'`);
+        }
+        await this.replaceFile(
+          canonical,
+          new Uint8Array(0),
+          stat,
+          { handle: source, size: stat.size },
+          { atime, mtime },
+          true,
+        );
       } finally {
-        await fh.close();
+        await source.close();
       }
     } catch (e) {
       const err = e as NodeJS.ErrnoException;
@@ -1108,7 +1747,6 @@ export class ReadWriteFs implements IFileSystem {
         throw new Error(`ENOENT: no such file or directory, utimes '${path}'`);
       }
       if (err.code === "ELOOP") {
-        // O_NOFOLLOW caught a symlink swap (TOCTOU defense)
         throw new Error(`EACCES: permission denied, '${path}' is a symlink`);
       }
       this.sanitizeError(e, path, "utimes");
