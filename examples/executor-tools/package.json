@@ -10,12 +10,12 @@
     "start:multi-api": "npx tsx multi-api-agent.ts"
   },
   "dependencies": {
-    "just-bash": "workspace:*",
+    "@executor-js/plugin-graphql": "^0.2.1",
+    "@executor-js/plugin-mcp": "^0.2.1",
+    "@executor-js/plugin-openapi": "^0.2.1",
+    "@executor-js/sdk": "^0.2.1",
     "@just-bash/executor": "workspace:*",
-    "@executor-js/sdk": "^0.2.0",
-    "@executor-js/plugin-graphql": "^0.2.0",
-    "@executor-js/plugin-mcp": "^0.2.0",
-    "@executor-js/plugin-openapi": "^0.2.0"
+    "just-bash": "workspace:*"
   },
   "private": true
 }
