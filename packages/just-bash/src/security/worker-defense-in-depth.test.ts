@@ -88,6 +88,7 @@ describe("WorkerDefenseInDepth", () => {
 
         defense.deactivate();
         expect(error).toBeInstanceOf(WorkerSecurityViolationError);
+        expect(error?.message).not.toContain("excludeViolationTypes");
       });
 
       it("should block Function() call without new", () => {
@@ -910,6 +911,15 @@ describe("WorkerDefenseInDepth", () => {
   });
 
   describe("excludeViolationTypes", () => {
+    it("should reject non-excludable constructor protections", () => {
+      expect(
+        () =>
+          new WorkerDefenseInDepth({
+            excludeViolationTypes: ["function_constructor"],
+          }),
+      ).toThrow(/non-excludable "function_constructor" protection/);
+    });
+
     it("should allow excluded violation types to work normally", () => {
       defense = new WorkerDefenseInDepth({
         excludeViolationTypes: ["proxy"],
@@ -1033,25 +1043,6 @@ describe("WorkerDefenseInDepth", () => {
       expect(violations.some((v) => v.type === "function_constructor")).toBe(
         true,
       );
-    });
-
-    it("should exclude function_constructor when specified", () => {
-      defense = new WorkerDefenseInDepth({
-        excludeViolationTypes: ["function_constructor"],
-      });
-
-      let result: unknown;
-      let error: Error | undefined;
-      try {
-        const fn = new Function("return 42");
-        result = fn();
-      } catch (e) {
-        error = e as Error;
-      }
-
-      defense.deactivate();
-      expect(error).toBeUndefined();
-      expect(result).toBe(42);
     });
 
     it("should exclude WebAssembly when specified", () => {

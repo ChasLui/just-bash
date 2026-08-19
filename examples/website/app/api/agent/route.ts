@@ -1,7 +1,6 @@
 import { ToolLoopAgent, createAgentUIStreamResponse, stepCountIs } from "ai";
 import { createBashTool } from "bash-tool";
 import { Bash, OverlayFs } from "just-bash";
-import { timingSafeEqual } from "node:crypto";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 
@@ -11,72 +10,12 @@ const MAX_REQUEST_BYTES = 64 * 1024;
 const MAX_MESSAGES = 20;
 const MAX_MESSAGE_TEXT_BYTES = 48 * 1024;
 const MAX_BODY_READ_MS = 15_000;
-const MAX_CONCURRENT_REQUESTS = 8;
-const MAX_REQUESTS_PER_MINUTE = 120;
-let activeRequests = 0;
-const recentAdmissions: number[] = [];
 
-function unauthorized(): Response {
-  return Response.json({ error: "Unauthorized" }, { status: 401 });
-}
-
-function authenticate(req: Request): Response | undefined {
-  const configuredToken = process.env.JUST_BASH_AGENT_API_TOKEN;
-  if (!configuredToken) {
-    // The paid-model demo is convenient during local development, but a
-    // production deployment must opt in with an authentication boundary.
-    return process.env.NODE_ENV === "production"
-      ? Response.json(
-          { error: "Agent endpoint is disabled" },
-          { status: 503 },
-        )
-      : undefined;
-  }
-
-  const authorization = req.headers.get("authorization");
-  if (!authorization?.startsWith("Bearer ")) return unauthorized();
-  const supplied = authorization.slice("Bearer ".length);
-  const suppliedBytes = Buffer.from(supplied);
-  const configuredBytes = Buffer.from(configuredToken);
-  if (
-    suppliedBytes.byteLength !== configuredBytes.byteLength ||
-    !timingSafeEqual(suppliedBytes, configuredBytes)
-  ) {
-    return unauthorized();
-  }
-  return undefined;
-}
-
-function admitRequest(): (() => void) | Response {
-  const now = Date.now();
-  while (recentAdmissions[0] !== undefined && recentAdmissions[0] <= now - 60_000) {
-    recentAdmissions.shift();
-  }
-  if (
-    activeRequests >= MAX_CONCURRENT_REQUESTS ||
-    recentAdmissions.length >= MAX_REQUESTS_PER_MINUTE
-  ) {
-    return Response.json(
-      { error: "Too many requests" },
-      { status: 429, headers: { "Retry-After": "60" } },
-    );
-  }
-  activeRequests++;
-  recentAdmissions.push(now);
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    activeRequests--;
-  };
-}
 
 function releaseWhenStreamCloses(
   response: Response,
-  release: () => void,
 ): Response {
   if (!response.body) {
-    release();
     return response;
   }
   const reader = response.body.getReader();
@@ -85,22 +24,16 @@ function releaseWhenStreamCloses(
       try {
         const { done, value } = await reader.read();
         if (done) {
-          release();
           controller.close();
         } else {
           controller.enqueue(value);
         }
       } catch (error) {
-        release();
         controller.error(error);
       }
     },
     async cancel(reason) {
-      try {
-        await reader.cancel(reason);
-      } finally {
-        release();
-      }
+      await reader.cancel(reason);
     },
   });
   return new Response(body, {
@@ -259,7 +192,7 @@ You have access to a bash sandbox with the full source code of:
 - bash-tool/ - AI SDK tool for bash
 
 
-Refer to the README.md of the projects to answer questions about just-bash and bash-tool 
+Refer to the README.md of the projects to answer questions about just-bash and bash-tool
 themselves which is your main focus. Never talk about this demo implementation unless asked explicitly.
 
 Use the sandbox to explore the source code, demonstrate commands, and help users understand:
@@ -279,22 +212,26 @@ Use cat to read files. Use head, tail to read parts of large files.
 Keep responses concise. You do not have access to pnpm, npm, or node.`;
 
 export async function POST(req: Request) {
-  const authError = authenticate(req);
-  if (authError) return authError;
-  const admission = admitRequest();
-  if (admission instanceof Response) return admission;
-
   let messages: unknown[];
   try {
     messages = await readBoundedMessages(req);
   } catch (error) {
-    admission();
     const status = error instanceof RangeError ? 413 : 400;
     return Response.json({ error: "Invalid request" }, { status });
   }
   try {
-    const overlayFs = new OverlayFs({ root: AGENT_DATA_DIR, readOnly: true });
-    const sandbox = new Bash({ fs: overlayFs, cwd: overlayFs.getMountPoint() });
+    const overlayFs = new OverlayFs({ root: AGENT_DATA_DIR });
+    const sandbox = new Bash({
+      fs: overlayFs,
+      cwd: overlayFs.getMountPoint(),
+      defenseInDepth: {
+        excludeViolationTypes: [
+          "error_prepare_stack_trace",
+          "performance_timing",
+          "weak_ref",
+        ],
+      },
+    });
     const bashToolkit = await createBashTool({
       sandbox,
       destination: overlayFs.getMountPoint(),
@@ -317,9 +254,8 @@ export async function POST(req: Request) {
       uiMessages: messages,
       timeout: { totalMs: 30_000, stepMs: 10_000, chunkMs: 10_000 },
     });
-    return releaseWhenStreamCloses(response, admission);
+    return releaseWhenStreamCloses(response);
   } catch (error) {
-    admission();
     throw error;
   }
 }

@@ -46,6 +46,7 @@ export interface DefenseInDepthConfig {
    * Violation types to exclude from blocking.
    * Use this when certain globals are required for legitimate purposes
    * (e.g., WebAssembly for sql.js in sqlite3 worker).
+   * Constructor-execution protections are non-excludable.
    */
   excludeViolationTypes?: SecurityViolationType[];
 }

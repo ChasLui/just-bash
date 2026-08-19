@@ -59,6 +59,14 @@ export interface BlockedGlobal {
   allowedKeys?: Set<string>;
 }
 
+let blockedGlobalViolationTypes: ReadonlySet<SecurityViolationType> | undefined;
+
+export function getBlockedGlobalViolationTypes(): ReadonlySet<SecurityViolationType> {
+  if (!blockedGlobalViolationTypes) getBlockedGlobals();
+  // biome-ignore lint/style/noNonNullAssertion: getBlockedGlobals initializes the cache
+  return blockedGlobalViolationTypes!;
+}
+
 /**
  * Get the list of globals to block during script execution.
  *
@@ -127,6 +135,7 @@ export function getBlockedGlobals(): BlockedGlobal[] {
         "NODE_DEBUG",
         "NODE_DEBUG_NATIVE",
         "NODE_COMPILE_CACHE",
+        "NODE_ENV",
         "WATCH_REPORT_DEPENDENCIES",
         // Dependencies
         "FORCE_COLOR", // chalk/supports-color
@@ -586,13 +595,17 @@ export function getBlockedGlobals(): BlockedGlobal[] {
   }
 
   // Filter out globals that don't exist in the current environment
-  return globals.filter((g) => {
+  const availableGlobals = globals.filter((g) => {
     try {
       return (g.target as Record<string, unknown>)[g.prop] !== undefined;
     } catch {
       return false;
     }
   });
+  blockedGlobalViolationTypes ??= new Set(
+    availableGlobals.map(({ violationType }) => violationType),
+  );
+  return availableGlobals;
 }
 
 // Note: We don't protect Object.prototype.constructor because:

@@ -43,19 +43,31 @@
  * is not needed (and would require require('node:module') which is blocked).
  */
 
-import { type BlockedGlobal, getBlockedGlobals } from "./blocked-globals.js";
+import {
+  type BlockedGlobal,
+  getBlockedGlobals,
+  getBlockedGlobalViolationTypes,
+} from "./blocked-globals.js";
+import { getSafeTimestamp } from "./safe-timestamp.js";
 import type {
   DefenseInDepthConfig,
   SecurityViolation,
   SecurityViolationType,
 } from "./types.js";
+import {
+  assertExcludableViolationTypes,
+  formatViolationErrorMessage,
+} from "./violation-error-message.js";
 
-/**
- * Suffix added to all security violation messages.
- */
-const DEFENSE_IN_DEPTH_NOTICE =
-  "\n\nThis is a defense-in-depth measure and indicates a bug in just-bash. " +
-  "Please report this at security@vercel.com";
+const WORKER_SPECIAL_EXCLUDABLE_VIOLATION_TYPES =
+  new Set<SecurityViolationType>([
+    "error_prepare_stack_trace" as const,
+    "module_load" as const,
+    "module_resolve_filename" as const,
+    "process_main_module" as const,
+    "process_exec_path" as const,
+    "process_connected" as const,
+  ]);
 
 /**
  * Error thrown when a security violation is detected.
@@ -65,7 +77,14 @@ export class WorkerSecurityViolationError extends Error {
     message: string,
     public readonly violation: SecurityViolation,
   ) {
-    super(message + DEFENSE_IN_DEPTH_NOTICE);
+    super(
+      formatViolationErrorMessage(
+        message,
+        violation.type,
+        WORKER_SPECIAL_EXCLUDABLE_VIOLATION_TYPES.has(violation.type) ||
+          getBlockedGlobalViolationTypes().has(violation.type),
+      ),
+    );
     this.name = "WorkerSecurityViolationError";
   }
 }
@@ -175,6 +194,8 @@ export class WorkerDefenseInDepth {
    * @param config - Configuration for the defense layer
    */
   constructor(config: DefenseInDepthConfig) {
+    assertExcludableViolationTypes(config.excludeViolationTypes);
+
     // Capture original Proxy BEFORE any patching occurs
     // This ensures we can create blocking proxies even after patching
     this.originalProxy = Proxy;
@@ -275,7 +296,7 @@ export class WorkerDefenseInDepth {
     message: string,
   ): SecurityViolation {
     const violation: SecurityViolation = {
-      timestamp: Date.now(),
+      timestamp: getSafeTimestamp(),
       type,
       message,
       path,

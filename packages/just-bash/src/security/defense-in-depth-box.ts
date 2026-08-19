@@ -32,7 +32,12 @@
 
 import * as nodeAsyncHooks from "node:async_hooks";
 import * as nodeModule from "node:module";
-import { type BlockedGlobal, getBlockedGlobals } from "./blocked-globals.js";
+import {
+  type BlockedGlobal,
+  getBlockedGlobals,
+  getBlockedGlobalViolationTypes,
+} from "./blocked-globals.js";
+import { getSafeTimestamp } from "./safe-timestamp.js";
 import type {
   DefenseInDepthConfig,
   DefenseInDepthHandle,
@@ -41,6 +46,10 @@ import type {
   SecurityViolation,
   SecurityViolationType,
 } from "./types.js";
+import {
+  assertExcludableViolationTypes,
+  formatViolationErrorMessage,
+} from "./violation-error-message.js";
 
 /**
  * Whether we're running in a browser environment.
@@ -110,13 +119,6 @@ if (!IS_BROWSER) {
 }
 
 /**
- * Suffix added to all security violation messages.
- */
-const DEFENSE_IN_DEPTH_NOTICE =
-  "\n\nThis is a defense-in-depth measure and indicates a bug in just-bash. " +
-  "Please report this at security@vercel.com";
-
-/**
  * Error thrown when a security violation is detected and blocking is enabled.
  */
 export class SecurityViolationError extends Error {
@@ -124,7 +126,14 @@ export class SecurityViolationError extends Error {
     message: string,
     public readonly violation: SecurityViolation,
   ) {
-    super(message + DEFENSE_IN_DEPTH_NOTICE);
+    super(
+      formatViolationErrorMessage(
+        message,
+        violation.type,
+        violation.type === "error_prepare_stack_trace" ||
+          getBlockedGlobalViolationTypes().has(violation.type),
+      ),
+    );
     this.name = "SecurityViolationError";
   }
 }
@@ -198,6 +207,7 @@ function resolveConfig(
 ): ResolvedDefenseConfig {
   const supplied =
     typeof config === "boolean" ? { enabled: config } : (config ?? {});
+  assertExcludableViolationTypes(supplied.excludeViolationTypes);
   if (
     supplied.enabled !== undefined &&
     supplied.enabled !== true &&
@@ -812,7 +822,7 @@ export class DefenseInDepthBox {
     message: string,
   ): SecurityViolation {
     const violation: SecurityViolation = {
-      timestamp: Date.now(),
+      timestamp: getSafeTimestamp(),
       type,
       message,
       path,
@@ -1072,6 +1082,9 @@ export class DefenseInDepthBox {
   private applyPatches(): void {
     this.patchFailures = [];
     const blockedGlobals = getBlockedGlobals();
+    const excludedViolationTypes = new Set(
+      this.config.excludeViolationTypes ?? [],
+    );
 
     // IPC-related globals (process.send, process.channel, process.connected)
     // are only blocked in worker contexts (WorkerDefenseInDepth). In the main
@@ -1092,6 +1105,7 @@ export class DefenseInDepthBox {
     const permanentIntrinsicPatches: BlockedGlobal[] = [];
 
     for (const blocked of blockedGlobals) {
+      if (excludedViolationTypes.has(blocked.violationType)) continue;
       if (skipInMainThread.has(blocked.violationType)) continue;
       if (blocked.strategy === "freeze") {
         permanentIntrinsicPatches.push(blocked);
@@ -1105,7 +1119,9 @@ export class DefenseInDepthBox {
     this.protectConstructorChain();
 
     // Protect Error.prepareStackTrace (only block setting, not reading)
-    this.protectErrorPrepareStackTrace();
+    if (!excludedViolationTypes.has("error_prepare_stack_trace")) {
+      this.protectErrorPrepareStackTrace();
+    }
 
     // Wrap Promise.then callbacks created in sandbox context so deferred
     // callbacks cannot outlive handle deactivation.

@@ -28,4 +28,16 @@ describe("rethrowFatalExecutionError", () => {
       rethrowFatalExecutionError(new Error("ordinary")),
     ).not.toThrow();
   });
+
+  it("does not suggest exclusions for defense context invariants", () => {
+    const violation = new SecurityViolationError("test", {
+      type: "missing_defense_context",
+      message: "test",
+      path: "DefenseInDepthBox.context",
+      timestamp: Date.now(),
+      executionId: "test",
+    });
+
+    expect(violation.message).not.toContain("excludeViolationTypes");
+  });
 });
