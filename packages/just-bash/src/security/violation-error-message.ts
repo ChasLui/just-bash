@@ -1,6 +1,6 @@
 import type { SecurityViolationType } from "./types.js";
 
-export const NON_EXCLUDABLE_VIOLATION_TYPES: ReadonlySet<SecurityViolationType> =
+const NON_EXCLUDABLE_VIOLATION_TYPES: ReadonlySet<SecurityViolationType> =
   new Set([
     "function_constructor",
     "async_function_constructor",
