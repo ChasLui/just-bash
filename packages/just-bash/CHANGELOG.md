@@ -1,5 +1,11 @@
 # just-bash
 
+## 3.4.2
+
+### Patch Changes
+
+- [#381](https://github.com/vercel-labs/just-bash/pull/381) [`d40a42d`](https://github.com/vercel-labs/just-bash/commit/d40a42d514b22da4ed023635d747c8b3f029a6c5) Thanks [@cramforce](https://github.com/cramforce)! - Include the security and transform declaration trees referenced by the package entrypoints and worker declarations in published packages.
+
 ## 3.4.1
 
 ### Patch Changes
