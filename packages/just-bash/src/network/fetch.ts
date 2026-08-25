@@ -1,13 +1,11 @@
 /**
- * Secure fetch wrapper with allow-list enforcement
+ * Secure fetch adapter.
  *
- * This module provides a fetch wrapper that:
- * 1. Enforces URL allow-list at the fetch layer (not subject to parsing)
- * 2. Handles redirects manually to check each redirect target against the allow-list
- * 3. Provides timeout support
+ * just-bash retains path allow-listing, firewall headers, response conversion,
+ * and redirect policy; guarded-fetch handles SSRF and transport safety.
  */
 
-import { lookup as dnsLookup } from "node:dns";
+import type { GuardedFetchOptions } from "guarded-fetch";
 import { combineAbortSignals } from "../abort-signals.js";
 import { DefenseInDepthBox } from "../security/defense-in-depth-box.js";
 import { _clearTimeout, _setTimeout } from "../timers.js";
@@ -17,13 +15,7 @@ import {
   matchesAllowListEntry,
   validateAllowList,
 } from "./allow-list.js";
-import {
-  createPinnedConnectionOwner,
-  DnsPinningUnavailableError,
-  type PinnedAddress,
-  type PinnedConnectionOwner,
-} from "./dns-pin.js";
-import type { AllowedUrl, AllowedUrlEntry, DnsLookupResult } from "./types.js";
+import type { AllowedUrl, AllowedUrlEntry } from "./types.js";
 import {
   type FetchResult,
   type HttpMethod,
@@ -35,20 +27,32 @@ import {
   TooManyRedirectsError,
 } from "./types.js";
 
-// DNS resolution for private IP check
-function dnsLookupAll(hostname: string): Promise<DnsLookupResult[]> {
-  return new Promise<DnsLookupResult[]>((resolve, reject) => {
-    dnsLookup(hostname, { all: true }, (err, addresses) => {
-      if (err) reject(err);
-      else resolve(addresses);
-    });
-  });
-}
+declare const __BROWSER__: boolean | undefined;
 
 const DEFAULT_MAX_REDIRECTS = 20;
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MAX_RESPONSE_SIZE = 10485760; // 10MB
 const DEFAULT_ALLOWED_METHODS: HttpMethod[] = ["GET", "HEAD"];
+
+/** Load guarded-fetch before the defense-in-depth loader hook is active. */
+type GuardedFetchModule = typeof import("guarded-fetch");
+
+/**
+ * The guarded transport, or `null` in the browser build: guarded-fetch is
+ * undici-backed and Node-only, so the browser uses ambient `fetch` instead.
+ */
+let guardedFetchPromise: Promise<GuardedFetchModule> | null;
+
+// Keep the browser branch statically foldable for esbuild.
+if (typeof __BROWSER__ !== "undefined" && __BROWSER__) {
+  guardedFetchPromise = null;
+} else {
+  // Load before the defense-in-depth loader hook activates.
+  guardedFetchPromise = import("guarded-fetch");
+  // Handled here so a failed import surfaces on the awaiting request, not as
+  // a module-init unhandled rejection.
+  void guardedFetchPromise.catch(() => undefined);
+}
 
 /**
  * HTTP methods that should not have a body
@@ -68,59 +72,6 @@ function abortReason(signal: AbortSignal): Error {
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) throw abortReason(signal);
-}
-
-async function awaitWithSignal<T>(
-  promise: Promise<T>,
-  signal: AbortSignal | undefined,
-): Promise<T> {
-  if (!signal) return promise;
-  if (signal.aborted) {
-    // The operation may already have started before its promise reached this
-    // helper (DNS and dispatcher disposal are examples). Observe a later
-    // rejection while returning the cancellation immediately.
-    void promise.catch(() => undefined);
-    throw abortReason(signal);
-  }
-
-  let onAbort: (() => void) | undefined;
-  const aborted = new Promise<never>((_resolve, reject) => {
-    onAbort = () => reject(abortReason(signal));
-    signal.addEventListener("abort", onAbort, { once: true });
-  });
-  try {
-    return await Promise.race([promise, aborted]);
-  } finally {
-    if (onAbort) signal.removeEventListener("abort", onAbort);
-  }
-}
-
-/**
- * Await a request-owned transport without leaking an owner that is created
- * after cancellation wins the race. A factory cannot always be cancelled
- * while it imports/initializes its connector, so late fulfillment must carry
- * its own disposal continuation.
- */
-async function awaitConnectionOwner(
-  promise: Promise<PinnedConnectionOwner>,
-  signal: AbortSignal | undefined,
-): Promise<PinnedConnectionOwner> {
-  try {
-    return await awaitWithSignal(promise, signal);
-  } catch (error) {
-    if (signal?.aborted) {
-      void promise
-        .then((owner) => DefenseInDepthBox.runTrustedAsync(() => owner.close()))
-        .catch(() => undefined);
-    }
-    throw error;
-  }
-}
-
-async function cancelResponseBody(response: Response): Promise<void> {
-  if (response.body && !response.body.locked) {
-    await response.body.cancel();
-  }
 }
 
 export interface SecureFetchOptions {
@@ -149,6 +100,25 @@ export type SecureFetch = (
  */
 export function createSecureFetch(config: NetworkConfig): SecureFetch {
   const entries: AllowedUrlEntry[] = config.allowedUrlPrefixes ?? [];
+
+  // guarded-fetch resolves and pins internally with no seam for these, so
+  // accepting them would silently downgrade an embedder's own policy.
+  if (config._dnsResolve) {
+    throw new Error(
+      "NetworkConfig._dnsResolve is no longer supported: DNS resolution is " +
+        "performed by guarded-fetch and cannot be overridden",
+    );
+  }
+  if (config._createConnectionOwner) {
+    throw new Error(
+      "NetworkConfig._createConnectionOwner is no longer supported: " +
+        "connect-time IP pinning is performed by guarded-fetch and cannot " +
+        "be overridden",
+    );
+  }
+
+  // Test-only transport override; see the pinned path below.
+  const injectedFetch = config._fetch;
 
   // Fail fast on invalid allow-list entries
   if (!config.dangerouslyAllowFullInternetAccess) {
@@ -210,120 +180,145 @@ export function createSecureFetch(config: NetworkConfig): SecureFetch {
   const denyPrivateRanges =
     config.denyPrivateRanges ??
     (typeof process !== "undefined" && process.env?.NODE_ENV === "production");
-  const resolveDns = config._dnsResolve ?? dnsLookupAll;
-  const createConnectionOwner =
-    config._createConnectionOwner ?? createPinnedConnectionOwner;
 
-  function addressFamily(address: string): 4 | 6 | null {
-    const normalized =
-      address.startsWith("[") && address.endsWith("]")
-        ? address.slice(1, -1)
-        : address;
-    const validIpv4 =
-      /^(?:0|[1-9]\d{0,2})(?:\.(?:0|[1-9]\d{0,2})){3}$/.test(normalized) &&
-      normalized.split(".").every((part) => Number(part) <= 255);
-    if (validIpv4) return 4;
-
-    if (normalized.includes(":") && !normalized.includes("%")) {
-      try {
-        if (new URL(`http://[${normalized}]/`).hostname.length > 2) return 6;
-      } catch {
-        // Invalid IPv6 address.
-      }
+  /**
+   * Builds the hostname allowlist that guarded-fetch enforces. guarded-fetch
+   * matches hostnames exactly or as subdomains; just-bash's allow-list is
+   * origin + path prefix, so the host portion is extracted here and the
+   * path portion continues to be enforced by `checkPathAllowed` below.
+   */
+  const allowedHosts: string[] = [];
+  for (const entry of entries) {
+    const entryUrl = typeof entry === "string" ? entry : entry.url;
+    try {
+      allowedHosts.push(new URL(entryUrl).hostname);
+    } catch {
+      // validateAllowList already rejected malformed entries above.
     }
-    return null;
   }
 
-  function validatedPinnedAddress(
-    url: string,
-    hostname: string,
-    result: DnsLookupResult,
-  ): PinnedAddress {
-    const { address, family } = result;
-    if (addressFamily(address) !== family) {
-      throw new NetworkAccessDeniedError(
-        url,
-        "DNS returned an invalid address for private IP check",
-      );
-    }
+  // DNS resolution and connection pinning are handled by guarded-fetch.
 
-    return { hostname, address, family };
+  /**
+   * Extracts a hostname for guarded-fetch's host allowlist, returning a
+   * bare string that won't accidentally match the empty-host deny-all rule.
+   */
+  function safeHostnameOf(requestUrl: string): string {
+    try {
+      return new URL(requestUrl).hostname || "localhost.invalid";
+    } catch {
+      return "localhost.invalid";
+    }
   }
 
   /**
-   * Checks if a URL is allowed by the configuration and, when
-   * denyPrivateRanges is on, returns the validated DNS result so the
-   * actual fetch can be pinned to that exact address (defeats DNS
-   * rebinding between the preflight check and connection).
+   * Builds the guarded-fetch host-policy options for a given URL.
+   *
+   * just-bash only performs DNS resolution when `denyPrivateRanges` is on.
+   * guarded-fetch always resolves DNS unless `skipSsrfCheckForAllowedHosts`
+   * matches the request's hostname. To preserve the bespoke "no DNS when
+   * private-range denial is off" behavior, the request's own hostname is
+   * passed as a one-entry allowlist with the SSRF check skipped. When
+   * `denyPrivateRanges` is on, the configured hosts (or none, for full
+   * internet) are passed without skipping so guarded-fetch's DNS/SSRF
+   * layer runs.
+   */
+  function buildHostPolicy(
+    requestUrl: string,
+  ): Pick<
+    GuardedFetchOptions,
+    "allowedHosts" | "skipSsrfCheckForAllowedHosts"
+  > {
+    if (config.dangerouslyAllowFullInternetAccess) {
+      if (denyPrivateRanges) {
+        // guarded-fetch enforces SSRF checks without a host allowlist.
+        return {
+          allowedHosts: undefined,
+          skipSsrfCheckForAllowedHosts: undefined,
+        };
+      }
+      // Skip DNS for the explicit private-range opt-out.
+      return {
+        allowedHosts: [safeHostnameOf(requestUrl)],
+        skipSsrfCheckForAllowedHosts: true,
+      };
+    }
+    // Combine guarded-fetch hostname checks with path-prefix checks.
+    return {
+      allowedHosts,
+      skipSsrfCheckForAllowedHosts: !denyPrivateRanges,
+    };
+  }
+
+  /** Whether the URL's host is a private/loopback IP literal. */
+  function isPrivateLiteral(requestUrl: string): boolean {
+    try {
+      return isPrivateIp(new URL(requestUrl).hostname);
+    } catch {
+      // Malformed URLs are rejected by the surrounding policy checks.
+      return false;
+    }
+  }
+
+  /**
+   * Ambient-`fetch` transport for the audited unguarded paths, reachable only
+   * while private-range enforcement is off.
+   */
+  async function unguardedFetch(
+    requestUrl: string,
+    fetchOptions: GuardedFetchOptions,
+  ): Promise<Response> {
+    const init: RequestInit = {
+      method: fetchOptions.method,
+      headers: fetchOptions.headers,
+      signal: fetchOptions.signal,
+      redirect: "manual",
+    };
+    if (fetchOptions.body !== undefined) {
+      init.body = fetchOptions.body;
+    }
+    // @banned-pattern-ignore: audited unguarded transport, reachable only when private-range enforcement is disabled
+    const ambientFetch = injectedFetch ?? globalThis.fetch;
+    return await ambientFetch(requestUrl, init);
+  }
+
+  /**
+   * Checks if a URL is allowed by the path-prefix allow-list.
+   *
+   * guarded-fetch only allowlists by hostname, so the path-scoped portion of
+   * just-bash's policy (e.g. `https://api.example.com/v1/`) is enforced here,
+   * before the request is handed to guarded-fetch.
    *
    * @throws NetworkAccessDeniedError if the URL is not allowed
    */
-  async function checkAllowed(
-    url: string,
-    signal: AbortSignal | undefined,
-  ): Promise<PinnedAddress | null> {
-    throwIfAborted(signal);
+  function checkPathAllowed(url: string): void {
     if (
       !config.dangerouslyAllowFullInternetAccess &&
       !isUrlAllowed(url, entries)
     ) {
       throw new NetworkAccessDeniedError(url);
     }
+  }
 
-    if (!denyPrivateRanges) return null;
-
+  /**
+   * Mirrors the bespoke preflight for private IP literals. guarded-fetch
+   * rejects these at connect time too, but checking here keeps the
+   * `NetworkAccessDeniedError` message shape that e2e suites assert on.
+   */
+  function checkPrivateLiteral(url: string): void {
+    if (!denyPrivateRanges) return;
     let parsed: URL;
     try {
       parsed = new URL(url);
     } catch {
       throw new NetworkAccessDeniedError(url, "invalid URL");
     }
-
-    // Private IP check still runs when full internet access is enabled.
     if (isPrivateIp(parsed.hostname)) {
       throw new NetworkAccessDeniedError(
         url,
         "private/loopback IP address blocked",
       );
     }
-
-    // Public IP literals already name the exact connection address and cannot
-    // be rebound. Every domain name must resolve successfully and be pinned.
-    const hostname = parsed.hostname;
-    if (addressFamily(hostname) !== null) return null;
-
-    let addresses: DnsLookupResult[];
-    try {
-      addresses = await awaitWithSignal(resolveDns(hostname), signal);
-    } catch {
-      if (signal?.aborted) throw abortReason(signal);
-      // Negative answers are not safe: proceeding would cause a second,
-      // unrestricted lookup during connection establishment.
-      throw new NetworkAccessDeniedError(
-        url,
-        "DNS resolution failed for private IP check",
-      );
-    }
-
-    if (!Array.isArray(addresses) || addresses.length === 0) {
-      throw new NetworkAccessDeniedError(
-        url,
-        "DNS resolution returned no addresses for private IP check",
-      );
-    }
-
-    const validated = addresses.map((result) =>
-      validatedPinnedAddress(url, hostname, result),
-    );
-    for (const { address } of validated) {
-      if (isPrivateIp(address)) {
-        throw new NetworkAccessDeniedError(
-          url,
-          "hostname resolves to private/loopback IP address",
-        );
-      }
-    }
-    return validated[0];
   }
 
   /**
@@ -342,7 +337,58 @@ export function createSecureFetch(config: NetworkConfig): SecureFetch {
   }
 
   /**
+   * Translates a guarded-fetch failure into just-bash's domain error types so
+   * the bespoke error messages that curl/tests assert on are preserved.
+   */
+  function mapGuardedFetchError(
+    error: unknown,
+    url: string,
+    mod: GuardedFetchModule,
+    context: { onRedirectHop: boolean; subReason?: string },
+  ): Error {
+    if (!mod.isGuardedFetchError(error)) return error as Error;
+    const gfError = error as {
+      code: string;
+      hostname?: string;
+      message: string;
+    };
+    const { onRedirectHop, subReason } = context;
+    switch (gfError.code) {
+      case "host_not_allowed":
+      case "protocol_not_allowed":
+        // A hop rejected on its own address reads as a refused redirect.
+        return onRedirectHop
+          ? new RedirectNotAllowedError(url)
+          : new NetworkAccessDeniedError(url);
+      case "hostname_unsafe":
+        // One code covers every DNS/SSRF rejection; the sub-reason separates
+        // "could not resolve" from "resolved to a private address".
+        return onRedirectHop
+          ? new RedirectNotAllowedError(url)
+          : new NetworkAccessDeniedError(
+              url,
+              subReason === "dns_resolution_failed"
+                ? "DNS resolution failed for private IP check"
+                : "hostname resolves to private/loopback IP address",
+            );
+      case "redirect_to_unsafe_host":
+        return new RedirectNotAllowedError(url);
+      case "too_many_redirects":
+        return new TooManyRedirectsError(maxRedirects);
+      case "response_too_large":
+        return new ResponseTooLargeError(maxResponseSize);
+      default:
+        // Preserve the underlying timeout, network, or URL error.
+        return error as Error;
+    }
+  }
+
+  /**
    * Performs a fetch with allow-list enforcement and manual redirect handling.
+   *
+   * Redirects are driven here (rather than left to guarded-fetch) so that
+   * firewall headers can be re-evaluated for each hop's URL and path-scoped
+   * allow-listing is re-checked against the redirect target.
    */
   async function secureFetch(
     url: string,
@@ -378,117 +424,173 @@ export function createSecureFetch(config: NetworkConfig): SecureFetch {
     );
 
     try {
-      // One deadline covers DNS review, all redirect hops, body consumption,
-      // and transport disposal. Redirects never receive a fresh allowance.
-      let pinned = await checkAllowed(url, combinedAbort.signal);
+      // Keep preflight inside finally so rejected requests clean up.
+      checkPathAllowed(url);
+      checkPrivateLiteral(url);
       checkMethodAllowed(method);
+
+      // Loaded at init and cached; `null` in the browser build.
+      const gfModule = guardedFetchPromise ? await guardedFetchPromise : null;
 
       let currentUrl = url;
       let redirectCount = 0;
 
+      // Redirects update method, body, and user credentials per hop.
+      let currentMethod = method;
+      let currentBody = options.body;
+      const currentHeaders = options.headers;
+      let credentialsStripped = false;
+
       while (true) {
         throwIfAborted(combinedAbort.signal);
-        let connectionOwner: PinnedConnectionOwner | undefined;
 
-        try {
-          // Header construction and the Node-only connector import may touch
-          // protected host intrinsics, so keep them in the trusted boundary.
-          const response = await DefenseInDepthBox.runTrustedAsync(async () => {
-            const firewallHeaders = getFirewallHeaders(currentUrl);
-            const mergedHeaders = buildMergedHeaders(
-              options.headers,
-              firewallHeaders,
-            );
-            const fetchOptions: RequestInit = {
-              method,
-              headers: mergedHeaders,
-              signal: combinedAbort.signal,
-              redirect: "manual",
-            };
+        // Keep transport creation inside the trusted boundary.
+        const response = await DefenseInDepthBox.runTrustedAsync(async () => {
+          // Strip user credentials; firewall credentials are re-applied below.
+          let userHeaders = currentHeaders;
+          if (credentialsStripped && userHeaders) {
+            const h =
+              userHeaders instanceof Headers
+                ? new Headers(userHeaders)
+                : new Headers(userHeaders);
+            h.delete("authorization");
+            h.delete("cookie");
+            userHeaders = h;
+          }
 
-            if (options.body && !BODYLESS_METHODS.has(method)) {
-              fetchOptions.body = options.body;
-            }
+          const firewallHeaders = getFirewallHeaders(currentUrl);
+          const mergedHeaders = buildMergedHeaders(
+            userHeaders,
+            firewallHeaders,
+          );
 
-            if (!pinned) {
-              // @banned-pattern-ignore: audited no-pin branch is reachable only when private-range denial is disabled
-              return await awaitWithSignal(
-                fetch(currentUrl, fetchOptions),
-                combinedAbort.signal,
-              );
-            }
+          const fetchOptions: GuardedFetchOptions = {
+            method: currentMethod,
+            headers: mergedHeaders,
+            signal: combinedAbort.signal,
+            // Redirects are handled here so headers and path policy are reapplied.
+            followRedirects: false,
+            timeoutMs: effectiveTimeout,
+            // Preserve firewall-managed Cookie/Host semantics.
+            sanitizeHeaders: false,
+          };
 
-            try {
-              connectionOwner = await awaitConnectionOwner(
-                createConnectionOwner(pinned),
-                combinedAbort.signal,
-              );
-              return await awaitWithSignal(
-                connectionOwner.fetch(currentUrl, fetchOptions),
-                combinedAbort.signal,
-              );
-            } catch (error) {
-              if (error instanceof DnsPinningUnavailableError) {
-                throw new NetworkAccessDeniedError(
-                  currentUrl,
-                  "DNS pinning unavailable for private IP enforcement",
-                );
-              }
-              throw error;
-            }
-          });
+          if (currentBody && !BODYLESS_METHODS.has(currentMethod)) {
+            fetchOptions.body = currentBody;
+          }
 
-          if (REDIRECT_CODES.has(response.status) && followRedirects) {
-            const location = response.headers.get("location");
-            if (!location) {
-              return await responseToResult(
-                response,
+          Object.assign(fetchOptions, buildHostPolicy(currentUrl));
+
+          // No guarded transport exists for the browser build, and
+          // guarded-fetch rejects private IP literals even with its host skip.
+          // Both are the explicit opt-out only; enforcement on fails closed.
+          if (!gfModule || isPrivateLiteral(currentUrl)) {
+            if (denyPrivateRanges) {
+              throw new NetworkAccessDeniedError(
                 currentUrl,
-                maxResponseSize,
-                combinedAbort.signal,
+                "DNS pinning unavailable for private IP enforcement",
               );
             }
+            return await unguardedFetch(currentUrl, fetchOptions);
+          }
 
-            const redirectUrl = new URL(location, currentUrl).href;
-            // Do not leave a redirect body or connection live while reviewing
-            // the next address.
-            await awaitWithSignal(
-              cancelResponseBody(response),
+          if (denyPrivateRanges) {
+            // Pinning is promised here, so keep guarded-fetch's own undici
+            // `fetch`: a host-wrapped `globalThis.fetch` can rebuild the init
+            // and drop the `dispatcher`, reopening the rebinding window.
+            if (injectedFetch) {
+              fetchOptions.fetch = injectedFetch;
+            }
+          } else {
+            // No pinning promised; ambient fetch keeps host shims working.
+            // @banned-pattern-ignore: audited no-pin path, reachable only when private-range enforcement is disabled
+            fetchOptions.fetch = injectedFetch ?? globalThis.fetch;
+            fetchOptions.dispatcher = null;
+          }
+
+          // The block reason reaches us only through this hook.
+          let blockedSubReason: string | undefined;
+          fetchOptions.onUrlBlocked = (event) => {
+            blockedSubReason = event.subReason;
+          };
+
+          try {
+            return await gfModule.guardedFetch(currentUrl, fetchOptions);
+          } catch (error) {
+            throw mapGuardedFetchError(error, currentUrl, gfModule, {
+              onRedirectHop: redirectCount > 0,
+              subReason: blockedSubReason,
+            });
+          }
+        });
+
+        if (REDIRECT_CODES.has(response.status) && followRedirects) {
+          const location = response.headers.get("location");
+          if (!location) {
+            return await responseToResult(
+              response,
+              currentUrl,
+              maxResponseSize,
               combinedAbort.signal,
             );
-            try {
-              pinned = await checkAllowed(redirectUrl, combinedAbort.signal);
-            } catch {
-              if (combinedAbort.signal?.aborted) {
-                throw abortReason(combinedAbort.signal);
-              }
-              throw new RedirectNotAllowedError(redirectUrl);
-            }
-
-            redirectCount++;
-            if (redirectCount > effectiveMaxRedirects) {
-              throw new TooManyRedirectsError(effectiveMaxRedirects);
-            }
-
-            currentUrl = redirectUrl;
-            continue;
           }
 
-          return await responseToResult(
-            response,
-            currentUrl,
-            maxResponseSize,
+          const redirectUrl = new URL(location, currentUrl).href;
+          // Do not leave a redirect body live while reviewing the next address.
+          await awaitWithSignal(
+            cancelResponseBody(response),
             combinedAbort.signal,
           );
-        } finally {
-          if (connectionOwner) {
-            const owner = connectionOwner;
-            const closePromise = DefenseInDepthBox.runTrustedAsync(() =>
-              owner.close(),
-            );
-            await awaitWithSignal(closePromise, combinedAbort.signal);
+
+          // Re-check path-prefix allow-list and private literal for the hop.
+          try {
+            checkPathAllowed(redirectUrl);
+            checkPrivateLiteral(redirectUrl);
+          } catch (error) {
+            if (combinedAbort.signal?.aborted) {
+              throw abortReason(combinedAbort.signal);
+            }
+            if (error instanceof NetworkAccessDeniedError) {
+              throw new RedirectNotAllowedError(redirectUrl);
+            }
+            throw error;
           }
+
+          // Per the fetch standard and curl: 301/302 rewrite POST only, 303
+          // rewrites all but GET/HEAD, 307/308 preserve method and body.
+          const status = response.status;
+          const rewriteToGet =
+            ((status === 301 || status === 302) && currentMethod === "POST") ||
+            (status === 303 &&
+              currentMethod !== "GET" &&
+              currentMethod !== "HEAD");
+          if (rewriteToGet) {
+            currentMethod = "GET";
+            currentBody = undefined;
+            // A rewritten method is a new request under the same policy.
+            checkMethodAllowed(currentMethod);
+          }
+
+          // Do not forward user credentials across origins.
+          if (new URL(redirectUrl).origin !== new URL(currentUrl).origin) {
+            credentialsStripped = true;
+          }
+
+          redirectCount++;
+          if (redirectCount > effectiveMaxRedirects) {
+            throw new TooManyRedirectsError(effectiveMaxRedirects);
+          }
+
+          currentUrl = redirectUrl;
+          continue;
         }
+
+        return await responseToResult(
+          response,
+          currentUrl,
+          maxResponseSize,
+          combinedAbort.signal,
+        );
       }
     } finally {
       _clearTimeout(timeoutId);
@@ -497,6 +599,38 @@ export function createSecureFetch(config: NetworkConfig): SecureFetch {
   }
 
   return secureFetch;
+}
+
+/**
+ * Awaits a promise, rejecting early if the signal aborts. Mirrors the helper
+ * the bespoke implementation used so cancellation semantics are preserved.
+ */
+async function awaitWithSignal<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    void promise.catch(() => undefined);
+    throw abortReason(signal);
+  }
+
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(abortReason(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([promise, aborted]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+async function cancelResponseBody(response: Response): Promise<void> {
+  if (response.body && !response.body.locked) {
+    await response.body.cancel();
+  }
 }
 
 /**

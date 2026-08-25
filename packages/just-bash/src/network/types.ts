@@ -133,15 +133,24 @@ export interface NetworkConfig {
 
   /**
    * @internal Override DNS resolution for testing.
-   * When set, used instead of the default `dns.lookup` for the
-   * denyPrivateRanges DNS rebinding check.
+   * @deprecated guarded-fetch resolves DNS internally; `createSecureFetch`
+   * throws when this is set rather than running a weaker policy silently.
    */
   _dnsResolve?: (hostname: string) => Promise<DnsLookupResult[]>;
 
   /**
    * @internal Override request-owned connection binding for testing.
+   * @deprecated guarded-fetch pins connections itself; `createSecureFetch`
+   * throws when this is set rather than running a weaker policy silently.
    */
   _createConnectionOwner?: PinnedConnectionOwnerFactory;
+
+  /**
+   * @internal Override the HTTP transport for testing. Required to intercept
+   * requests on the private-range-enforcing path, which ignores
+   * `globalThis.fetch`. DNS resolution and IP validation still run.
+   */
+  _fetch?: typeof fetch;
 }
 
 /**

@@ -121,20 +121,20 @@ export interface EnvAdapter {
   readFile(path: string): Promise<string>;
 }
 
-function withMockConnectionOwner(
+function withMockFetch(
   network: BashOptions["network"],
 ): BashOptions["network"] {
-  if (!network?.denyPrivateRanges || network._createConnectionOwner) {
+  if (!network?.denyPrivateRanges || network._fetch) {
     return network;
   }
   return {
     ...network,
-    // These suites mock global fetch. Keep the reviewed-address owner
-    // boundary explicit instead of falling through to the real network.
-    _createConnectionOwner: async () => ({
-      fetch: async (url: string, init: RequestInit) => global.fetch(url, init),
-      async close() {},
-    }),
+    // These suites mock global fetch. The private-range-enforcing path uses
+    // guarded-fetch's own undici transport, so the mock has to be injected
+    // explicitly instead of read off the ambient global — otherwise these
+    // tests would fall through to the real network.
+    _fetch: (input: RequestInfo | URL, init?: RequestInit) =>
+      global.fetch(input, init),
   };
 }
 
@@ -144,7 +144,7 @@ function withMockConnectionOwner(
 export function createBashEnvAdapter(options: BashOptions): EnvAdapter {
   const env = new Bash({
     ...options,
-    network: withMockConnectionOwner(options.network),
+    network: withMockFetch(options.network),
   });
   return {
     exec: (cmd) => env.exec(cmd),
@@ -159,7 +159,7 @@ export async function createSandboxAdapter(
   options: BashOptions,
 ): Promise<EnvAdapter> {
   const sandbox = await Sandbox.create({
-    network: withMockConnectionOwner(options.network),
+    network: withMockFetch(options.network),
   });
   return {
     exec: async (cmd) => {
@@ -211,40 +211,6 @@ export async function expectBlockedPrivate(
   const blockedUrl = expectedUrl ?? url;
   expect(result.stderr).toBe(
     `curl: (7) Network access denied: private/loopback IP address blocked: ${blockedUrl}\n`,
-  );
-}
-
-/**
- * Utility for testing that a URL is blocked due to DNS-resolved private IP
- */
-export async function expectBlockedDnsPrivate(
-  env: EnvAdapter,
-  url: string,
-  expectedUrl?: string,
-): Promise<void> {
-  const result = await env.exec(`curl "${url}"`);
-  expect(result.exitCode).toBe(7);
-  expect(result.stdout).toBe("");
-  const blockedUrl = expectedUrl ?? url;
-  expect(result.stderr).toBe(
-    `curl: (7) Network access denied: hostname resolves to private/loopback IP address: ${blockedUrl}\n`,
-  );
-}
-
-/**
- * Utility for testing that a URL is blocked due to DNS resolution failure (fail-closed)
- */
-export async function expectBlockedDnsFailure(
-  env: EnvAdapter,
-  url: string,
-  expectedUrl?: string,
-): Promise<void> {
-  const result = await env.exec(`curl "${url}"`);
-  expect(result.exitCode).toBe(7);
-  expect(result.stdout).toBe("");
-  const blockedUrl = expectedUrl ?? url;
-  expect(result.stderr).toBe(
-    `curl: (7) Network access denied: DNS resolution failed for private IP check: ${blockedUrl}\n`,
   );
 }
 
