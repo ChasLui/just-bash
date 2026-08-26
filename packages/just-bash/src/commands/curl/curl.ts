@@ -20,7 +20,7 @@ import { parseOptions } from "./parse.js";
 import {
   applyWriteOut,
   extractFilename,
-  formatHeaders,
+  formatHeaderBlock,
 } from "./response-formatting.js";
 import type { CurlOptions } from "./types.js";
 
@@ -208,9 +208,11 @@ function buildOutput(
 
   // Include headers with -i/--include
   if (options.includeHeaders && !options.verbose) {
-    output += `HTTP/1.1 ${result.status} ${result.statusText}\r\n`;
-    output += formatHeaders(result.headers);
-    output += "\r\n\r\n";
+    output += formatHeaderBlock(
+      result.status,
+      result.statusText,
+      result.headers,
+    );
   }
 
   // Add body (unless head-only mode)
@@ -220,9 +222,11 @@ function buildOutput(
     // For HEAD, we already showed headers
   } else {
     // HEAD without -i shows headers
-    output += `HTTP/1.1 ${result.status} ${result.statusText}\r\n`;
-    output += formatHeaders(result.headers);
-    output += "\r\n";
+    output += formatHeaderBlock(
+      result.status,
+      result.statusText,
+      result.headers,
+    );
   }
 
   // Write-out format
@@ -298,6 +302,13 @@ export const curlCommand: RuntimeCommand = {
       );
       const headers = prepareHeaders(options, contentType);
 
+      // Real curl truncates the dump file when the transfer starts, so a
+      // failed connection does not leave stale headers from a prior run.
+      if (options.dumpHeader !== undefined && options.dumpHeader !== "-") {
+        const dumpPath = ctx.fs.resolvePath(ctx.cwd, options.dumpHeader);
+        await ctx.fs.writeFile(dumpPath, "");
+      }
+
       const result = await ctx.fetch(url, {
         method: options.method,
         headers,
@@ -311,37 +322,89 @@ export const curlCommand: RuntimeCommand = {
       // Save cookies if requested
       await saveCookies(options, result.headers, ctx);
 
+      const finalHeaderBlock = formatHeaderBlock(
+        result.status,
+        result.statusText,
+        result.headers,
+      );
+      // Concatenate intermediate redirect hops then the final response, matching
+      // real `curl -D` / `-L` dumps.
+      let headerBlock = "";
+      if (result.redirectChain) {
+        for (const hop of result.redirectChain) {
+          headerBlock += formatHeaderBlock(
+            hop.status,
+            hop.statusText,
+            hop.headers,
+          );
+        }
+      }
+      headerBlock += finalHeaderBlock;
+
+      // -D/--dump-header FILE writes headers even when -f fails the transfer
+      // (real curl still dumps 4xx/5xx response headers).
+      if (options.dumpHeader !== undefined && options.dumpHeader !== "-") {
+        const dumpPath = ctx.fs.resolvePath(ctx.cwd, options.dumpHeader);
+        await ctx.fs.writeFile(dumpPath, headerBlock);
+      }
+
       // Check for HTTP errors with -f/--fail
       if (options.failSilently && result.status >= 400) {
         const stderr =
           options.showError || !options.silent
             ? `curl: (22) The requested URL returned error: ${result.status}\n`
             : "";
-        return { stdout: "", stderr, exitCode: 22 };
+        // -D - still emits headers on stdout under -f (real curl).
+        const stdout = options.dumpHeader === "-" ? headerBlock : "";
+        return {
+          stdout,
+          stderr,
+          exitCode: 22,
+          stdoutKind: stdout ? "bytes" : undefined,
+        };
       }
 
       let output = buildOutput(options, result, url);
 
-      // Write to file
+      // Write body to file when -o/-O is set
       if (options.outputFile || options.useRemoteName) {
         const filename = options.outputFile || extractFilename(url);
         const filePath = ctx.fs.resolvePath(ctx.cwd, filename);
         await ctx.fs.writeFile(filePath, options.headOnly ? "" : result.body);
 
-        // When writing to file, don't output body to stdout unless verbose
-        if (!options.verbose) {
+        // Body goes to the file. stdout composition:
+        // - `-D -` always emits the raw header block (even with `-v`)
+        // - `-v` keeps its verbose chatter (real curl sends verbose to stderr;
+        //   we keep it on stdout as before, after the dump block)
+        // - otherwise empty, then optional `-w`
+        if (options.verbose) {
+          output = (options.dumpHeader === "-" ? headerBlock : "") + output;
+        } else if (options.dumpHeader === "-") {
+          output = headerBlock;
+        } else {
           output = "";
         }
 
-        // Add write-out after file write
         if (options.writeOut) {
-          output = applyWriteOut(options.writeOut, {
+          const writeOut = applyWriteOut(options.writeOut, {
             status: result.status,
             headers: result.headers,
             url: result.url,
             bodyLength: result.body.byteLength,
           });
+          if (options.verbose) {
+            // Preserve verbose + optional -D - block, then append -w
+            output += writeOut;
+          } else if (options.dumpHeader === "-") {
+            output = headerBlock + writeOut;
+          } else {
+            output = writeOut;
+          }
         }
+      } else if (options.dumpHeader === "-") {
+        // No -o: prepend the dump block. When -i/-I/verbose already emitted
+        // headers, this doubles them the way real `curl -D - -i` does.
+        output = headerBlock + output;
       }
 
       // The response body is a latin1-shaped byte buffer (see

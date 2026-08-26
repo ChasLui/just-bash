@@ -434,6 +434,7 @@ export function createSecureFetch(config: NetworkConfig): SecureFetch {
 
       let currentUrl = url;
       let redirectCount = 0;
+      const redirectChain: NonNullable<FetchResult["redirectChain"]> = [];
 
       // Redirects update method, body, and user credentials per hop.
       let currentMethod = method;
@@ -532,8 +533,16 @@ export function createSecureFetch(config: NetworkConfig): SecureFetch {
               currentUrl,
               maxResponseSize,
               combinedAbort.signal,
+              redirectChain,
             );
           }
+
+          // Record this hop for curl -D before discarding the body.
+          redirectChain.push({
+            status: response.status,
+            statusText: response.statusText,
+            headers: headersToRecord(response.headers),
+          });
 
           const redirectUrl = new URL(location, currentUrl).href;
           // Do not leave a redirect body live while reviewing the next address.
@@ -590,6 +599,7 @@ export function createSecureFetch(config: NetworkConfig): SecureFetch {
           currentUrl,
           maxResponseSize,
           combinedAbort.signal,
+          redirectChain,
         );
       }
     } finally {
@@ -663,6 +673,17 @@ function buildMergedHeaders(
 }
 
 /**
+ * Snapshot response headers into a null-prototype record (lowercase keys).
+ */
+function headersToRecord(headers: Headers): Record<string, string> {
+  const out: Record<string, string> = Object.create(null);
+  headers.forEach((value, key) => {
+    out[key.toLowerCase()] = value;
+  });
+  return out;
+}
+
+/**
  * Converts a Response to a FetchResult, enforcing response size limits.
  */
 async function responseToResult(
@@ -670,12 +691,10 @@ async function responseToResult(
   url: string,
   maxResponseSize: number,
   signal?: AbortSignal,
+  redirectChain?: FetchResult["redirectChain"],
 ): Promise<FetchResult> {
   // Use null-prototype to prevent prototype pollution via malicious response headers
-  const headers: Record<string, string> = Object.create(null);
-  response.headers.forEach((value, key) => {
-    headers[key.toLowerCase()] = value;
-  });
+  const headers = headersToRecord(response.headers);
 
   // Fast path: check Content-Length header
   if (maxResponseSize > 0) {
@@ -727,11 +746,15 @@ async function responseToResult(
     body = new Uint8Array(ab);
   }
 
-  return {
+  const result: FetchResult = {
     status: response.status,
     statusText: response.statusText,
     headers,
     body,
     url,
   };
+  if (redirectChain && redirectChain.length > 0) {
+    result.redirectChain = redirectChain;
+  }
+  return result;
 }

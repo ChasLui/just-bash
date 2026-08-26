@@ -163,6 +163,16 @@ export interface FetchResult {
   /** Raw response bytes (never decoded as UTF-8 text). */
   body: Uint8Array;
   url: string;
+  /**
+   * Intermediate redirect responses in hop order (excluding the final
+   * response). Populated when redirects were followed so callers like
+   * `curl -D` can dump every status/header block the way real curl does.
+   */
+  redirectChain?: Array<{
+    status: number;
+    statusText: string;
+    headers: Record<string, string>;
+  }>;
 }
 
 /**

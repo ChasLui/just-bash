@@ -28,6 +28,7 @@ export const curlHelp: {
     "-T, --upload-file FILE  Upload file (PUT)",
     "-o, --output FILE     Write output to file",
     "-O, --remote-name     Write to file named from URL",
+    "-D, --dump-header FILE  Write response headers to FILE (`-` for stdout)",
     "-I, --head            Show headers only (HEAD request)",
     "-i, --include         Include response headers in output",
     "-s, --silent          Silent mode (no progress)",

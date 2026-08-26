@@ -5,10 +5,21 @@
 /**
  * Format response headers for output
  */
-export function formatHeaders(headers: Record<string, string>): string {
+function formatHeaders(headers: Record<string, string>): string {
   return Object.entries(headers)
     .map(([name, value]) => `${name}: ${value}`)
     .join("\r\n");
+}
+
+/**
+ * Status line + headers + trailing blank line, matching `-i` / `-D` layout.
+ */
+export function formatHeaderBlock(
+  status: number,
+  statusText: string,
+  headers: Record<string, string>,
+): string {
+  return `HTTP/1.1 ${status} ${statusText}\r\n${formatHeaders(headers)}\r\n\r\n`;
 }
 
 /**

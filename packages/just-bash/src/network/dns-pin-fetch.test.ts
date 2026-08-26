@@ -79,6 +79,15 @@ describe("secureFetch behavior", () => {
     expect(result.status).toBe(200);
     expect(new TextDecoder().decode(result.body)).toBe("final");
     expect(result.url).toBe("https://example.com/final");
+    expect(result.redirectChain).toEqual([
+      {
+        status: 302,
+        statusText: "",
+        headers: expect.objectContaining({
+          location: "https://example.com/final",
+        }),
+      },
+    ]);
   });
 
   it("respects maxRedirects cap", async () => {

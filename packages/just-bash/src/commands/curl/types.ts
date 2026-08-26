@@ -54,6 +54,11 @@ export interface CurlOptions {
   uploadFile?: string;
   cookieJar?: string;
   outputFile?: string;
+  /**
+   * `-D` / `--dump-header` destination. `"-"` writes headers to stdout;
+   * any other string is a VFS path. Undefined when the flag was not given.
+   */
+  dumpHeader?: string;
   useRemoteName: boolean;
   headOnly: boolean;
   includeHeaders: boolean;

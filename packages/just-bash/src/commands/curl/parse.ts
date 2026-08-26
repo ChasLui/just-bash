@@ -244,6 +244,37 @@ export function parseOptions(args: string[]): CurlOptions | ExecResult {
       options.outputFile = args[++i];
     } else if (arg.startsWith("--output=")) {
       options.outputFile = arg.slice(9);
+    } else if (arg === "-D" || arg === "--dump-header") {
+      const value = args[++i];
+      if (value === undefined) {
+        return {
+          stdout: "",
+          stderr: `curl: option ${arg}: requires parameter\n`,
+          exitCode: 1,
+        };
+      }
+      if (value === "") {
+        return {
+          stdout: "",
+          stderr: `curl: option ${arg}: blank argument where content is expected\n`,
+          exitCode: 1,
+        };
+      }
+      options.dumpHeader = value;
+    } else if (arg.startsWith("--dump-header=")) {
+      const value = arg.slice(14);
+      if (value === "") {
+        return {
+          stdout: "",
+          stderr:
+            "curl: option --dump-header: blank argument where content is expected\n",
+          exitCode: 1,
+        };
+      }
+      options.dumpHeader = value;
+    } else if (arg.startsWith("-D") && arg.length > 2) {
+      // Real curl accepts `-Dfile` (attached path, including `-D-` for stdout)
+      options.dumpHeader = arg.slice(2);
     } else if (arg === "-O" || arg === "--remote-name") {
       options.useRemoteName = true;
     } else if (arg === "-I" || arg === "--head") {
