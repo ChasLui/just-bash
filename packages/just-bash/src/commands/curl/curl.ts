@@ -364,10 +364,17 @@ export const curlCommand: RuntimeCommand = {
         };
       }
 
-      let output = buildOutput(options, result, url);
+      // When the body goes to a file and we're not verbose, the block below
+      // overwrites `output` unconditionally (with "" or the -D - header block),
+      // so building it first would stringify the whole response body just to
+      // throw the string away — a full UTF-16 copy of the payload on top of the
+      // bytes we write out. Skip buildOutput entirely on that path.
+      const writesToFile = Boolean(options.outputFile || options.useRemoteName);
+      const skipStdoutBody = writesToFile && !options.verbose;
+      let output = skipStdoutBody ? "" : buildOutput(options, result, url);
 
       // Write body to file when -o/-O is set
-      if (options.outputFile || options.useRemoteName) {
+      if (writesToFile) {
         const filename = options.outputFile || extractFilename(url);
         const filePath = ctx.fs.resolvePath(ctx.cwd, filename);
         await ctx.fs.writeFile(filePath, options.headOnly ? "" : result.body);
