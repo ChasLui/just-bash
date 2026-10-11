@@ -56,9 +56,7 @@ impl InMemoryFs {
     pub fn read_file(&self, path: &str) -> Result<&str, Error> {
         match self.entries.get(path) {
             Some(FsEntry::File(contents)) => Ok(contents),
-            Some(FsEntry::Directory) => {
-                Err(Error::FileSystem(format!("{path}: Is a directory")))
-            }
+            Some(FsEntry::Directory) => Err(Error::FileSystem(format!("{path}: Is a directory"))),
             None => Err(Error::FileSystem(format!(
                 "{path}: No such file or directory"
             ))),
@@ -69,9 +67,7 @@ impl InMemoryFs {
         let normalized = normalize_absolute(path);
         self.ensure_parent_dir(&normalized)?;
         if matches!(self.entries.get(&normalized), Some(FsEntry::Directory)) {
-            return Err(Error::FileSystem(format!(
-                "{normalized}: Is a directory"
-            )));
+            return Err(Error::FileSystem(format!("{normalized}: Is a directory")));
         }
         self.entries
             .insert(normalized, FsEntry::File(contents.to_string()));
@@ -83,9 +79,7 @@ impl InMemoryFs {
         let mut next = match self.entries.get(&normalized) {
             Some(FsEntry::File(existing)) => existing.clone(),
             Some(FsEntry::Directory) => {
-                return Err(Error::FileSystem(format!(
-                    "{normalized}: Is a directory"
-                )));
+                return Err(Error::FileSystem(format!("{normalized}: Is a directory")));
             }
             None => String::new(),
         };
@@ -211,9 +205,7 @@ impl InMemoryFs {
         let parent = parent_dir(path);
         match self.entries.get(&parent) {
             Some(FsEntry::Directory) => Ok(()),
-            Some(FsEntry::File(_)) => {
-                Err(Error::FileSystem(format!("{parent}: Not a directory")))
-            }
+            Some(FsEntry::File(_)) => Err(Error::FileSystem(format!("{parent}: Not a directory"))),
             None => Err(Error::FileSystem(format!(
                 "{parent}: No such file or directory"
             ))),

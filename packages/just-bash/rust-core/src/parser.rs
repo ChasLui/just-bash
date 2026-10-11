@@ -22,11 +22,17 @@ impl Default for ParseLimits {
 pub enum WordPartKind {
     /// Single-quoted literal — copied verbatim, no `$` expansion.
     Literal,
+    /// A single backslash-escaped character — copied verbatim, no `$`
+    /// expansion, and never treated as shell syntax (upstream #347).
+    Escaped,
     /// Normal text — `$VAR`, `${VAR}`, `$?`, `$1`, etc. are expanded.
     Variable,
     /// Command substitution `$(…)` — the inner script is run and its stdout
     /// (trailing newlines stripped) replaces the word part.
     CommandSub,
+    /// Arithmetic expansion `$((…))` — the inner expression is evaluated and
+    /// the decimal result replaces the word part.
+    Arithmetic,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +44,12 @@ pub struct WordPart {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Word {
     pub parts: Vec<WordPart>,
+    /// True when any part of this word came from a quoted or escaped context.
+    ///
+    /// Reserved words (`if`, `for`, `then`, …) and redirection/pipeline
+    /// operators are only recognized for entirely unquoted words, so `\if`,
+    /// `'if'` and `"if"` are ordinary command names (upstream #347).
+    pub quoted: bool,
 }
 
 impl Word {
@@ -48,12 +60,26 @@ impl Word {
                 text: value.into(),
                 kind: WordPartKind::Variable,
             }],
+            quoted: false,
         }
     }
 
     /// Return the raw (unexpanded) text of all parts joined.
     pub fn text(&self) -> String {
         self.parts.iter().map(|p| p.text.as_str()).collect()
+    }
+
+    /// Whether this word may still act as a reserved word or shell operator.
+    ///
+    /// Anything that was quoted or escaped loses keyword status, matching
+    /// upstream's "preserve escaped reserved words" behavior (upstream #347).
+    pub fn is_bare(&self) -> bool {
+        !self.quoted
+    }
+
+    /// True when this word is exactly `keyword` and is entirely unquoted.
+    pub fn is_reserved(&self, keyword: &str) -> bool {
+        self.is_bare() && self.text() == keyword
     }
 }
 
@@ -62,7 +88,10 @@ impl Word {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Redirect {
     pub mode: RedirectMode,
+    /// Target word. Empty for [`RedirectMode::Dup`] and [`RedirectMode::Close`].
     pub target: Word,
+    /// File descriptor being redirected: 0 for input, 1 for output.
+    pub fd: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +99,10 @@ pub enum RedirectMode {
     Read,
     Write,
     Append,
+    /// `n>&m` — duplicate descriptor `m`.
+    Dup(u32),
+    /// `n>&-` — close descriptor `n`.
+    Close,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,9 +195,14 @@ enum Token {
     Pipe,
     AndIf,
     OrIf,
-    RedirectRead,
-    RedirectWrite,
-    RedirectAppend,
+    /// Input redirection on descriptor `u32`.
+    RedirectRead(u32),
+    /// Output redirection on descriptor `u32`.
+    RedirectWrite(u32),
+    /// Appending output redirection on descriptor `u32`.
+    RedirectAppend(u32),
+    /// `n>&m`: duplicate descriptor `m`; `None` means close (`>&-`).
+    RedirectDup(u32, Option<u32>),
     Separator,
 }
 
@@ -257,22 +295,30 @@ fn parse_single_statement(
         return Ok(None);
     }
 
-    if let Token::Word(w) = &tokens[*pos] {
-        match w.text().as_str() {
-            t if terminators.contains(&t) => return Ok(None),
-            "if" => {
-                *pos += 1;
-                return Ok(Some(StatementKind::If(parse_if(tokens, pos)?)));
+    if let Token::Word(w) = &tokens[*pos]
+        && w.is_bare()
+    {
+        {
+            match w.text().as_str() {
+                t if terminators.contains(&t) => return Ok(None),
+                "if" => {
+                    *pos += 1;
+                    return Ok(Some(StatementKind::If(parse_if(tokens, pos)?)));
+                }
+                "while" => {
+                    *pos += 1;
+                    return Ok(Some(StatementKind::While(parse_while(tokens, pos)?)));
+                }
+                "for" => {
+                    *pos += 1;
+                    return Ok(Some(StatementKind::For(parse_for(tokens, pos)?)));
+                }
+                other => {
+                    if let Some(message) = unsupported_construct(other) {
+                        return Err(Error::Parse(message));
+                    }
+                }
             }
-            "while" => {
-                *pos += 1;
-                return Ok(Some(StatementKind::While(parse_while(tokens, pos)?)));
-            }
-            "for" => {
-                *pos += 1;
-                return Ok(Some(StatementKind::For(parse_for(tokens, pos)?)));
-            }
-            _ => {}
         }
     }
 
@@ -296,18 +342,48 @@ fn parse_pipeline_statement(
                 if is_keyword_at(tokens, *pos, terminators) {
                     break;
                 }
+                // A command-position reserved word this runtime cannot execute
+                // fails closed instead of running as an external command
+                // (upstream #348). Only the first word of a command is checked,
+                // and quoted/escaped words are ordinary command names.
+                if words.is_empty()
+                    && w.is_bare()
+                    && let Some(message) = unsupported_construct(&w.text())
+                {
+                    return Err(Error::Parse(message));
+                }
                 words.push(w.clone());
                 pending_pipe = false;
                 *pos += 1;
             }
-            Token::RedirectRead | Token::RedirectWrite | Token::RedirectAppend => {
-                let mode = match tokens[*pos] {
-                    Token::RedirectRead => RedirectMode::Read,
-                    Token::RedirectWrite => RedirectMode::Write,
-                    Token::RedirectAppend => RedirectMode::Append,
+            Token::RedirectRead(_)
+            | Token::RedirectWrite(_)
+            | Token::RedirectAppend(_)
+            | Token::RedirectDup(_, _) => {
+                let (mode, fd) = match tokens[*pos] {
+                    Token::RedirectRead(fd) => (RedirectMode::Read, fd),
+                    Token::RedirectWrite(fd) => (RedirectMode::Write, fd),
+                    Token::RedirectAppend(fd) => (RedirectMode::Append, fd),
+                    Token::RedirectDup(fd, target) => match target {
+                        Some(target) => (RedirectMode::Dup(target), fd),
+                        None => (RedirectMode::Close, fd),
+                    },
                     _ => unreachable!(),
                 };
                 *pos += 1;
+                // Dup/Close carry their target in the token itself.
+                if matches!(mode, RedirectMode::Dup(_) | RedirectMode::Close) {
+                    redirects.push(Redirect {
+                        mode,
+                        target: Word {
+                            parts: Vec::new(),
+                            quoted: false,
+                        },
+                        fd,
+                    });
+                    pending_pipe = false;
+                    continue;
+                }
                 let Some(Token::Word(target)) = tokens.get(*pos) else {
                     return Err(Error::Parse(
                         "syntax error near unexpected token `newline'".to_string(),
@@ -316,6 +392,7 @@ fn parse_pipeline_statement(
                 redirects.push(Redirect {
                     mode,
                     target: target.clone(),
+                    fd,
                 });
                 pending_pipe = false;
                 *pos += 1;
@@ -433,7 +510,7 @@ fn parse_for(tokens: &[Token], pos: &mut usize) -> Result<ForStatement, Error> {
 
     // expect "in"
     match tokens.get(*pos) {
-        Some(Token::Word(w)) if w.text() == "in" => *pos += 1,
+        Some(Token::Word(w)) if w.is_reserved("in") => *pos += 1,
         _ => {
             return Err(Error::Parse(
                 "syntax error: expected 'in' after for variable".to_string(),
@@ -445,7 +522,7 @@ fn parse_for(tokens: &[Token], pos: &mut usize) -> Result<ForStatement, Error> {
     let mut items = Vec::new();
     while *pos < tokens.len() {
         match &tokens[*pos] {
-            Token::Word(w) if w.text() == "do" => break,
+            Token::Word(w) if w.is_reserved("do") => break,
             Token::Word(w) => {
                 items.push(w.clone());
                 *pos += 1;
@@ -461,7 +538,7 @@ fn parse_for(tokens: &[Token], pos: &mut usize) -> Result<ForStatement, Error> {
     // expect "do" (possibly after separator)
     skip_separators(tokens, pos);
     match tokens.get(*pos) {
-        Some(Token::Word(w)) if w.text() == "do" => *pos += 1,
+        Some(Token::Word(w)) if w.is_reserved("do") => *pos += 1,
         _ => {
             return Err(Error::Parse(
                 "syntax error: expected 'do' in for loop".to_string(),
@@ -477,7 +554,7 @@ fn parse_for(tokens: &[Token], pos: &mut usize) -> Result<ForStatement, Error> {
 fn expect_keyword(tokens: &[Token], pos: &mut usize, keyword: &str) -> Result<(), Error> {
     skip_separators(tokens, pos);
     match tokens.get(*pos) {
-        Some(Token::Word(w)) if w.text() == keyword => {
+        Some(Token::Word(w)) if w.is_reserved(keyword) => {
             *pos += 1;
             Ok(())
         }
@@ -485,9 +562,7 @@ fn expect_keyword(tokens: &[Token], pos: &mut usize, keyword: &str) -> Result<()
             "syntax error near unexpected token `{}'",
             w.text()
         ))),
-        Some(_) => Err(Error::Parse(format!(
-            "syntax error: expected '{keyword}'"
-        ))),
+        Some(_) => Err(Error::Parse(format!("syntax error: expected '{keyword}'"))),
         None => Err(Error::Parse(format!(
             "syntax error: unexpected end of file, expected '{keyword}'"
         ))),
@@ -500,9 +575,84 @@ fn skip_separators(tokens: &[Token], pos: &mut usize) {
     }
 }
 
+/// Constructs bash accepts but this runtime does not implement.
+///
+/// Recognizing them and failing closed is deliberately safer than letting them
+/// fall through to "command not found" and silently continuing with the rest of
+/// the script (upstream #348).
+fn unsupported_construct(word: &str) -> Option<String> {
+    const UNSUPPORTED: &[&str] = &[
+        "case", "until", "select", "coproc", "function", "time", "[[", "]]", "{", "}", "!", "(",
+        ")", "in", "then", "else", "elif", "fi", "do", "done", "esac",
+    ];
+    if UNSUPPORTED.contains(&word) {
+        Some(format!("syntax error: unsupported construct `{word}'"))
+    } else {
+        None
+    }
+}
+
+/// `n>` only names a descriptor when the preceding token is entirely unquoted
+/// digits directly adjacent to the operator; `a2>f` is the word `a2` followed by
+/// a plain stdout redirect.
+fn take_fd_prefix(current: &mut Word, current_started: &mut bool, default_fd: u32) -> u32 {
+    if !*current_started || current.quoted {
+        return default_fd;
+    }
+    let text = current.text();
+    if !text.is_empty()
+        && text.chars().all(|ch| ch.is_ascii_digit())
+        && let Ok(fd) = text.parse::<u32>()
+    {
+        current.parts.clear();
+        *current_started = false;
+        return fd;
+    }
+    default_fd
+}
+
+/// Whether the upcoming characters are `>&N` / `>&-` rather than a plain `>`.
+fn dup_follows(chars: &std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    let mut lookahead = chars.clone();
+    if lookahead.next() != Some('&') {
+        return false;
+    }
+    matches!(lookahead.next(), Some('-') | Some('0'..='9'))
+}
+
+/// Read the descriptor named after `>&` / `<&`.
+fn lex_dup_target(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    fd: u32,
+) -> Result<Token, Error> {
+    let mut digits = String::new();
+    while let Some(next) = chars.peek().copied() {
+        if next.is_ascii_digit() {
+            digits.push(next);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    // `n>&m-` means "duplicate m, then close m".
+    if chars.peek() == Some(&'-') {
+        chars.next();
+    }
+    if digits.is_empty() {
+        // `n>&-`: close descriptor n.
+        return Ok(Token::RedirectDup(fd, None));
+    }
+    match digits.parse::<u32>() {
+        Ok(target) => Ok(Token::RedirectDup(fd, Some(target))),
+        Err(_) => Err(Error::Parse(format!(
+            "syntax error near unexpected token `{digits}'"
+        ))),
+    }
+}
+
 fn is_keyword_at(tokens: &[Token], pos: usize, keywords: &[&str]) -> bool {
     match tokens.get(pos) {
-        Some(Token::Word(w)) => keywords.contains(&w.text().as_str()),
+        Some(Token::Word(w)) => keywords.iter().any(|keyword| w.is_reserved(keyword)),
         _ => false,
     }
 }
@@ -524,8 +674,12 @@ fn push_command_to(
 
 fn lex(source: &str, limits: ParseLimits) -> Result<Vec<Token>, Error> {
     let mut tokens = Vec::new();
-    let mut current = Word { parts: Vec::new() };
+    let mut current = Word {
+        parts: Vec::new(),
+        quoted: false,
+    };
     let mut current_started = false;
+    let mut current_quoted = false;
     let mut chars = source.chars().peekable();
     let mut quote = None;
 
@@ -541,22 +695,39 @@ fn lex(source: &str, limits: ParseLimits) -> Result<Vec<Token>, Error> {
             }
             (None, '\'') => {
                 current_started = true;
+                current_quoted = true;
                 quote = Some(Quote::Single);
             }
             (None, '"') => {
                 current_started = true;
+                current_quoted = true;
                 quote = Some(Quote::Double);
             }
             (Some(Quote::Single), '\'') | (Some(Quote::Double), '"') => quote = None,
             (None, c) if c.is_whitespace() && c != '\n' => {
-                push_word_token(&mut tokens, &mut current, &mut current_started);
+                push_word_token(
+                    &mut tokens,
+                    &mut current,
+                    &mut current_started,
+                    &mut current_quoted,
+                );
             }
             (None, '\n' | ';') => {
-                push_word_token(&mut tokens, &mut current, &mut current_started);
+                push_word_token(
+                    &mut tokens,
+                    &mut current,
+                    &mut current_started,
+                    &mut current_quoted,
+                );
                 tokens.push(Token::Separator);
             }
             (None, '|') => {
-                push_word_token(&mut tokens, &mut current, &mut current_started);
+                push_word_token(
+                    &mut tokens,
+                    &mut current,
+                    &mut current_started,
+                    &mut current_quoted,
+                );
                 if chars.next_if_eq(&'|').is_some() {
                     tokens.push(Token::OrIf);
                 } else {
@@ -564,7 +735,12 @@ fn lex(source: &str, limits: ParseLimits) -> Result<Vec<Token>, Error> {
                 }
             }
             (None, '&') => {
-                push_word_token(&mut tokens, &mut current, &mut current_started);
+                push_word_token(
+                    &mut tokens,
+                    &mut current,
+                    &mut current_started,
+                    &mut current_quoted,
+                );
                 if chars.next_if_eq(&'&').is_some() {
                     tokens.push(Token::AndIf);
                 } else {
@@ -574,38 +750,88 @@ fn lex(source: &str, limits: ParseLimits) -> Result<Vec<Token>, Error> {
                 }
             }
             (None, '<') => {
-                push_word_token(&mut tokens, &mut current, &mut current_started);
-                tokens.push(Token::RedirectRead);
+                let fd = take_fd_prefix(&mut current, &mut current_started, 0);
+                push_word_token(
+                    &mut tokens,
+                    &mut current,
+                    &mut current_started,
+                    &mut current_quoted,
+                );
+                if dup_follows(&chars) {
+                    chars.next();
+                    tokens.push(lex_dup_target(&mut chars, fd)?);
+                } else {
+                    tokens.push(Token::RedirectRead(fd));
+                }
             }
             (None, '>') => {
-                push_word_token(&mut tokens, &mut current, &mut current_started);
+                let fd = take_fd_prefix(&mut current, &mut current_started, 1);
+                push_word_token(
+                    &mut tokens,
+                    &mut current,
+                    &mut current_started,
+                    &mut current_quoted,
+                );
                 if chars.next_if_eq(&'>').is_some() {
-                    tokens.push(Token::RedirectAppend);
+                    tokens.push(Token::RedirectAppend(fd));
+                } else if dup_follows(&chars) {
+                    chars.next();
+                    tokens.push(lex_dup_target(&mut chars, fd)?);
                 } else {
-                    tokens.push(Token::RedirectWrite);
+                    tokens.push(Token::RedirectWrite(fd));
                 }
             }
             // single-quoted character: Literal, no expansion
             (Some(Quote::Single), c) => {
                 push_part(&mut current, c, WordPartKind::Literal, &mut current_started);
             }
+            // inside double quotes, only `$`, `` ` ``, `"`, `\` and newline are
+            // special; any other backslash stays a literal backslash
+            (Some(Quote::Double), '\\') => match chars.peek().copied() {
+                // backslash-newline is a line continuation (removed entirely)
+                Some('\n') => {
+                    chars.next();
+                }
+                Some(next) if next == '$' || next == '`' || next == '"' || next == '\\' => {
+                    chars.next();
+                    push_part(
+                        &mut current,
+                        next,
+                        WordPartKind::Escaped,
+                        &mut current_started,
+                    );
+                }
+                _ => push_part(
+                    &mut current,
+                    '\\',
+                    WordPartKind::Literal,
+                    &mut current_started,
+                ),
+            },
             // command substitution $(...): execute and substitute
             (quote_state, '$') if quote_state != Some(Quote::Single) => {
                 if chars.next_if_eq(&'(').is_some() {
-                    let inner = if chars.next_if_eq(&'(').is_some() {
-                        consume_arithmetic_substitution(&mut chars)?
+                    // `$((…))` is arithmetic, `$(…)` is command substitution.
+                    // The two are distinguished here, at the lexer, rather than
+                    // guessed from the body later.
+                    let (inner, kind) = if chars.next_if_eq(&'(').is_some() {
+                        (
+                            consume_arithmetic_substitution(&mut chars)?,
+                            WordPartKind::Arithmetic,
+                        )
                     } else {
-                        consume_command_substitution(
-                            &mut chars,
-                            limits.max_command_substitution_depth,
-                        )?
+                        (
+                            consume_command_substitution(
+                                &mut chars,
+                                limits.max_command_substitution_depth,
+                            )?,
+                            WordPartKind::CommandSub,
+                        )
                     };
-                    // Each $(...) is its own CommandSub part (never merged)
+                    // Each $(...)/$((...)) is its own part (never merged)
                     current_started = true;
-                    current.parts.push(WordPart {
-                        text: inner,
-                        kind: WordPartKind::CommandSub,
-                    });
+                    current_quoted = true;
+                    current.parts.push(WordPart { text: inner, kind });
                 } else {
                     push_part(
                         &mut current,
@@ -615,17 +841,27 @@ fn lex(source: &str, limits: ParseLimits) -> Result<Vec<Token>, Error> {
                     );
                 }
             }
-            // backslash escape (outside single quotes)
-            (_, '\\') => {
-                if let Some(next) = chars.next() {
-                    let kind = if quote == Some(Quote::Single) {
-                        WordPartKind::Literal
-                    } else {
-                        WordPartKind::Variable
-                    };
-                    push_part(&mut current, next, kind, &mut current_started);
+            // backslash escape outside double/single quotes: the escaped
+            // character is kept verbatim and the word loses reserved status
+            (_, '\\') => match chars.next() {
+                // backslash-newline is a line continuation (removed entirely)
+                Some('\n') => {}
+                Some(next) => {
+                    current_quoted = true;
+                    push_part(
+                        &mut current,
+                        next,
+                        WordPartKind::Escaped,
+                        &mut current_started,
+                    );
                 }
-            }
+                None => push_part(
+                    &mut current,
+                    '\\',
+                    WordPartKind::Variable,
+                    &mut current_started,
+                ),
+            },
             // all other characters
             (_, c) => {
                 let kind = if quote == Some(Quote::Single) {
@@ -643,7 +879,12 @@ fn lex(source: &str, limits: ParseLimits) -> Result<Vec<Token>, Error> {
             "unexpected EOF while looking for matching quote".to_string(),
         ));
     }
-    push_word_token(&mut tokens, &mut current, &mut current_started);
+    push_word_token(
+        &mut tokens,
+        &mut current,
+        &mut current_started,
+        &mut current_quoted,
+    );
     Ok(tokens)
 }
 
@@ -782,8 +1023,8 @@ fn consume_arithmetic_substitution(
 
 fn push_part(word: &mut Word, ch: char, kind: WordPartKind, current_started: &mut bool) {
     *current_started = true;
-    // Merge adjacent parts of the same kind (but never merge CommandSub)
-    if !matches!(kind, WordPartKind::CommandSub) {
+    // Merge adjacent parts of the same kind (but never merge Escaped/CommandSub)
+    if !matches!(kind, WordPartKind::CommandSub | WordPartKind::Escaped) {
         if let Some(part) = word.parts.last_mut().filter(|p| p.kind == kind) {
             part.text.push(ch);
             return;
@@ -795,13 +1036,23 @@ fn push_part(word: &mut Word, ch: char, kind: WordPartKind, current_started: &mu
     });
 }
 
-fn push_word_token(tokens: &mut Vec<Token>, current: &mut Word, current_started: &mut bool) {
+fn push_word_token(
+    tokens: &mut Vec<Token>,
+    current: &mut Word,
+    current_started: &mut bool,
+    current_quoted: &mut bool,
+) {
     if *current_started || !current.parts.is_empty() {
+        current.quoted = *current_quoted;
         tokens.push(Token::Word(std::mem::replace(
             current,
-            Word { parts: Vec::new() },
+            Word {
+                parts: Vec::new(),
+                quoted: false,
+            },
         )));
         *current_started = false;
+        *current_quoted = false;
     }
 }
 
@@ -929,8 +1180,19 @@ mod tests {
         let cmds = pipeline_cmds(&script, 0);
         let sub_word = &cmds[0].words[1];
         assert_eq!(sub_word.parts.len(), 1);
-        assert_eq!(sub_word.parts[0].kind, WordPartKind::CommandSub);
+        // `$((…))` is distinguished from `$(…)` at lex time, so a bare word is
+        // never mistaken for an arithmetic expression.
+        assert_eq!(sub_word.parts[0].kind, WordPartKind::Arithmetic);
         assert_eq!(sub_word.parts[0].text, "i + 2 * 3");
+    }
+
+    #[test]
+    fn bare_word_command_substitution_is_not_arithmetic() {
+        let script = parse_script("echo $(mycommand)").unwrap();
+        let cmds = pipeline_cmds(&script, 0);
+        let sub_word = &cmds[0].words[1];
+        assert_eq!(sub_word.parts[0].kind, WordPartKind::CommandSub);
+        assert_eq!(sub_word.parts[0].text, "mycommand");
     }
 
     #[test]
@@ -989,5 +1251,189 @@ mod tests {
         assert_eq!(f.var, "x");
         assert_eq!(f.items.len(), 3);
         assert_eq!(f.body.len(), 1);
+    }
+}
+
+/// Tests for escaped/quoted word handling and fail-closed parsing
+/// (upstream #347, #348).
+#[cfg(test)]
+mod escape_and_reserved_word_tests {
+    use super::*;
+
+    fn pipeline(script: &Script, index: usize) -> &[CommandInvocation] {
+        match &script.statements[index].kind {
+            StatementKind::Pipeline(commands) => commands,
+            other => panic!("expected Pipeline, got {other:?}"),
+        }
+    }
+
+    fn first_kind(script: &str) -> StatementKind {
+        parse_script(script).unwrap().statements[0].kind.clone()
+    }
+
+    #[test]
+    fn escaped_reserved_word_is_an_ordinary_command() {
+        // `\if` must not open an if-statement: it is the command name `if`.
+        let script = parse_script("\\if true").unwrap();
+        let commands = pipeline(&script, 0);
+        assert_eq!(commands[0].words[0].text(), "if");
+        assert!(!commands[0].words[0].is_bare());
+        assert_eq!(commands[0].words[1].text(), "true");
+
+        // Consequently the matching `then` is a stray reserved word in command
+        // position, which bash also rejects (verified: syntax error, exit 2).
+        let error = parse_script("\\if true; then echo yes; fi").unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported construct `then'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn quoted_reserved_word_is_an_ordinary_command() {
+        for source in ["'if' x", "\"if\" x"] {
+            let script = parse_script(source).unwrap();
+            let commands = pipeline(&script, 0);
+            assert_eq!(commands[0].words[0].text(), "if", "{source}");
+            assert!(!commands[0].words[0].is_bare(), "{source}");
+        }
+    }
+
+    #[test]
+    fn partially_quoted_reserved_word_is_not_reserved() {
+        for source in ["i\\f x", "i\"f\" x", "\"i\"f x"] {
+            let script = parse_script(source).unwrap();
+            let commands = pipeline(&script, 0);
+            assert_eq!(commands[0].words[0].text(), "if", "{source}");
+        }
+    }
+
+    #[test]
+    fn unquoted_reserved_word_still_opens_a_statement() {
+        assert!(matches!(
+            first_kind("if true; then echo y; fi"),
+            StatementKind::If(_)
+        ));
+        assert!(matches!(
+            first_kind("while false; do :; done"),
+            StatementKind::While(_)
+        ));
+        assert!(matches!(
+            first_kind("for i in 1; do :; done"),
+            StatementKind::For(_)
+        ));
+    }
+
+    #[test]
+    fn backslash_newline_joins_and_keeps_reserved_status() {
+        // `ti\<newline>me` joins into the *unquoted* word `time`, so it is still
+        // a reserved word. This runtime has no timing prefix, so it fails
+        // closed rather than running `time` as an external command.
+        let error = parse_script("ti\\\nme echo").unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported construct `time'"),
+            "{error}"
+        );
+
+        // The escaped form stays a non-reserved, ordinary command word.
+        let escaped = parse_script("\\time echo").unwrap();
+        let commands = pipeline(&escaped, 0);
+        assert_eq!(commands[0].words[0].text(), "time");
+        assert!(!commands[0].words[0].is_bare());
+    }
+
+    #[test]
+    fn backslash_newline_joins_ordinary_words() {
+        let script = parse_script("echo a\\\nb").unwrap();
+        let commands = pipeline(&script, 0);
+        assert_eq!(commands[0].words[1].text(), "ab");
+    }
+
+    #[test]
+    fn escaped_characters_become_literal_parts() {
+        let script = parse_script("echo \\$HOME").unwrap();
+        let commands = pipeline(&script, 0);
+        let word = &commands[0].words[1];
+        assert_eq!(word.parts[0].kind, WordPartKind::Escaped);
+        assert_eq!(word.parts[0].text, "$");
+        assert_eq!(word.text(), "$HOME");
+    }
+
+    #[test]
+    fn double_quote_escape_set_is_narrow() {
+        // Only $, `, " and \ are escapable inside double quotes.
+        let script = parse_script("echo \"a\\qb\"").unwrap();
+        let commands = pipeline(&script, 0);
+        assert_eq!(commands[0].words[1].text(), "a\\qb");
+
+        let script = parse_script("echo \"a\\\"b\"").unwrap();
+        let commands = pipeline(&script, 0);
+        assert_eq!(commands[0].words[1].text(), "a\"b");
+    }
+
+    #[test]
+    fn single_quotes_keep_every_character_verbatim() {
+        let script = parse_script("echo 'a\\$b'").unwrap();
+        let commands = pipeline(&script, 0);
+        assert_eq!(commands[0].words[1].text(), "a\\$b");
+        assert_eq!(commands[0].words[1].parts[0].kind, WordPartKind::Literal);
+    }
+
+    #[test]
+    fn unsupported_constructs_fail_closed() {
+        for source in [
+            "case x in x) echo q;; esac",
+            "select x; do echo q; done",
+            "coproc echo hi",
+            "until false; do echo q; done",
+            "echo input | coproc",
+            "! select",
+        ] {
+            let error = parse_script(source).unwrap_err();
+            assert!(
+                error.to_string().contains("unsupported construct"),
+                "{source} -> {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_words_remain_valid_as_arguments() {
+        let script = parse_script("echo select coproc").unwrap();
+        let commands = pipeline(&script, 0);
+        assert_eq!(commands[0].words[1].text(), "select");
+        assert_eq!(commands[0].words[2].text(), "coproc");
+    }
+
+    #[test]
+    fn parses_fd_prefixes_and_duplication() {
+        let script = parse_script("cmd 2> err.txt 1>&2 3>&- < in.txt").unwrap();
+        let commands = pipeline(&script, 0);
+        let redirects = &commands[0].redirects;
+        assert_eq!(redirects[0].mode, RedirectMode::Write);
+        assert_eq!(redirects[0].fd, 2);
+        assert_eq!(redirects[0].target.text(), "err.txt");
+        assert_eq!(redirects[1].mode, RedirectMode::Dup(2));
+        assert_eq!(redirects[1].fd, 1);
+        assert_eq!(redirects[2].mode, RedirectMode::Close);
+        assert_eq!(redirects[2].fd, 3);
+        assert_eq!(redirects[3].mode, RedirectMode::Read);
+        assert_eq!(redirects[3].fd, 0);
+    }
+
+    #[test]
+    fn digit_ending_words_are_not_descriptors() {
+        let script = parse_script("echo a2>f").unwrap();
+        let commands = pipeline(&script, 0);
+        assert_eq!(commands[0].words[1].text(), "a2");
+        assert_eq!(commands[0].redirects[0].fd, 1);
+    }
+
+    #[test]
+    fn append_redirection_keeps_its_descriptor() {
+        let script = parse_script("cmd 2>> log").unwrap();
+        let commands = pipeline(&script, 0);
+        assert_eq!(commands[0].redirects[0].mode, RedirectMode::Append);
+        assert_eq!(commands[0].redirects[0].fd, 2);
     }
 }
