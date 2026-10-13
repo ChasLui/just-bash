@@ -4,19 +4,15 @@
 runtime. The Rust core lives in [`packages/just-bash/rust-core`](./packages/just-bash/rust-core)
 and provides:
 
-- an in-memory filesystem,
-- a quote-aware shell parser,
-- a small execution engine with built-ins, pipelines, redirections, and
-  environment expansion,
-- fd-aware redirection (`n>`, `n>>`, `n<`, `n>&m` duplication such as `2>&1`,
-  `n>&-` close, `/dev/null` discard),
-- parameter expansion with `${p:-word}`-style operators, `${#name}`, `$#`, and
-  `set --` positional assignment,
-- `break`/`continue`, bundled `set -euo pipefail`, and fail-closed parse errors
-  for unsupported command syntax,
-- default per-`exec` shell-state isolation (filesystem remains shared),
-- configurable execution limits for script size, command count, command
-  substitution depth, output size, and loop iterations,
+- an in-memory filesystem with entry metadata (mode, size, logical mtime),
+- a quote-aware shell parser covering heredocs/here-strings, `case`, `until`,
+  functions, `[[ … ]]`, arrays and process substitution,
+- an execution engine with built-ins, pipelines (with `PIPESTATUS` and
+  consumer-bounded producers), background jobs, globbing and process
+  substitution,
+- a dependency-free POSIX ERE engine used by `grep -E`/`-P`, `sed` and
+  `[[ =~ ]]`,
+- an offline-by-default `curl` with an injectable response table,
 - a native `just-bash-rs` CLI for running snippets from argv or stdin.
 
 Upstream sync status: [`UPSTREAM_SYNC.md`](./UPSTREAM_SYNC.md) records the
@@ -31,10 +27,15 @@ Cargo.toml                     Rust workspace manifest
 packages/just-bash/rust-core/  Rust library and CLI crate
 ```
 
+The runtime is dependency-free: every module uses only the Rust standard
+library.
+
 ## Development
 
 ```bash
 cargo fmt --all --check
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets
 cargo test --workspace
 cargo build --workspace
 ```

@@ -69,25 +69,62 @@ Notes:
 - `bash --posix` handling, `xtrace`, `PS4`, arrays and `expansionStderr`
   ordering from the same upstream range are not part of this slice.
 
+## Ported in the current slice
+
+This slice closes the language-feature gap the previous revision listed as "not
+yet ported". It has no single upstream commit to align with, so the rows record
+the upstream behavior family each area corresponds to.
+
+| Area | Behavior ported | Rust carrier |
+| --- | --- | --- |
+| Heredocs | `<<DELIM`, `<<-DELIM` (tab stripping), quoted delimiters suppressing expansion, bodies handed to a pipeline stage | `parser.rs`: `PendingHeredoc`, `consume_heredoc_bodies`, `parse_heredoc_word`, `RedirectMode::Heredoc`; `shell.rs`: `expand_heredoc` |
+| Here-strings | `<<<word`, trailing newline, no field splitting | `parser.rs`: `Token::RedirectHereString`, `RedirectMode::HereString` |
+| `case` | `case WORD in PAT\|PAT) … ;; esac`, optional `(`, glob patterns, `*)` default | `parser.rs`: `CaseStatement`, `parse_case`; `shell.rs`: `exec_case` |
+| `until` | `until COND; do … done` (body runs while the condition fails) | `parser.rs`: `WhileStatement::until`; `shell.rs`: `exec_while` |
+| Functions | `f() { …; }`, `function f { …; }`, `f() ( … )`, per-call positional parameters, `return N`, recursion | `parser.rs`: `FunctionDef`, `parse_function_keyword`, `parse_function_body`; `shell.rs`: `define_function`, `call_function`, `return` |
+| `[[ … ]]` | `&&`/`\|\|`/`!`/parentheses, unary file and string tests, numeric comparisons, `==`/`!=` glob matching, `=~` regex, `-nt`/`-ot`/`-ef` | `parser.rs`: `CondExpr`, `CondTerm`, `parse_condition`, `lex_condition_words`; `shell.rs`: `exec_cond`, `eval_cond_term` |
+| Compound commands | `{ …; }` groups, `( … )` subshells (state isolated, filesystem persists), `! cmd` negation | `parser.rs`: `StatementKind::Group`/`Subshell`, `Statement::negated`; `shell.rs`: `run_subshell`, `exec_statement` |
+| Background jobs | `cmd &`, `$!`, `jobs`, `wait`, filesystem visibility, no environment leak | `parser.rs`: `Token::Background`, `Statement::background`; `shell.rs`: `exec_background`, `JobRecord`, `run_jobs`, `run_wait` |
+| Process substitution | `<(cmd)` and `>(cmd)` through deterministic temporary paths, removed after the command | `parser.rs`: `WordPartKind::ProcSubIn`/`ProcSubOut`; `shell.rs`: `exec_procsub_script`, `flush_procsub_readers`, `cleanup_procsubs` |
+| Pathname expansion | Unquoted `*`/`?`/`[...]` with ranges and negation, hidden-file rules, sorted results, relative output shape, trailing-slash directory restriction | `glob.rs`: `pattern_matches`, `component_matches`, `expand`; `shell.rs`: `expand_word_list`, `glob_fields` |
+| Arrays | Indexed arrays: `a=(…)`, `a[i]=v`, `a+=(…)`, `${a[i]}`, `${a[@]}`, `${a[*]}`, `${#a[@]}`, `${#a[i]}`, `${!a[@]}`, indirect `${!name}`, `"${a[@]}"` as one field per element | `parser.rs`: `Token::ArrayAssign`, `ArrayAssign`, `WordPart::quoted`; `shell.rs`: `exec_array_assign`, `expand_word_list`, array-aware `parameter_value` |
+| `PIPESTATUS` | One status per pipeline stage, replaced after each command | `shell.rs`: `set_pipestatus`, `exec_pipeline`, `exec_statement_inner` |
+| Bounded pipelines | A downstream `head -n`/`grep -m` publishes a line budget that `yes`/`seq` honour, so an unbounded producer stops at demand | `shell.rs`: `pipeline_line_budget`, `head_line_limit`, `grep_max_count`, `run_yes`, `run_seq` |
+| `yes`, `mktemp`, `seq`, `sleep` | Bounded `yes`; deterministic `mktemp` (`-d`, `-p`, `X`-run templates); `seq FIRST [STEP] LAST`; operand-validating no-op `sleep` | `shell.rs`: `run_yes`, `run_mktemp`, `run_seq`, `substitute_x_run` |
+| `ls` sorting | `-a`, `-A`, `-1`, `-l`, `-r`, `-t`, `-S`, `-F`, `-d`, multiple operands with `name:` headers | `shell.rs`: `LsOptions`, `run_ls`, `sort_ls_entries`, `format_ls_entry` |
+| FS metadata | Mode, size and logical mtime per entry; `chmod`, `stat`, `touch` stamping, `test -r/-w/-x/-s` | `fs.rs`: `Metadata`, `EntryKind`, `set_mode`, `set_mtime`, logical clock; `shell.rs`: `run_chmod`, `run_stat` |
+| Regex engine | Dependency-free POSIX ERE engine (`new`/`is_match`/`find`/`captures`/`replace_all`/`split`) with a backtracking step budget, powering `grep -E`/`-P` and `[[ =~ ]]` | `regex.rs` (whole module); `shell.rs`: `compile_grep_patterns`, `GrepPattern`, `regex_matches`, `regex_matches_word` |
+| `sed` | `-n`, `-e`, substitution with `g`/`p`/`i`, `p`, `d`, `q`, line-number/`$` addresses, backed by the regex engine | `sed.rs` (whole module); `shell.rs`: the `sed` dispatch arm |
+| Network | `curl` with an offline-fail-closed default, an injectable deterministic URL → body table, and opt-in plain-HTTP fetching; `@file` bodies resolved from the virtual filesystem | `net.rs` (whole module); `shell.rs`: `run_curl`; `Options::allow_network` / `Options::http_responses` |
+
+Notes:
+
+- `grep`'s default mode remains literal substring matching (`-F` semantics); the
+  regex engine is selected explicitly with `-E`/`-P`. Upstream (and GNU grep)
+  default to BRE, which this engine does not implement, so the deviation is
+  deliberate and documented rather than silent.
+- `[[ =~ ]]` uses leftmost-first (PCRE-style) semantics rather than POSIX
+  leftmost-longest; boolean tests are unaffected.
+- `sed` is an ERE-based subset (`-E` semantics by default); BRE-specific escapes
+  are not emulated.
+- `curl` speaks plain HTTP only. HTTPS fails closed with an unsupported-protocol
+  error rather than silently downgrading.
+
 ## Not yet ported
 
-The following major upstream themes are absent from the Rust core. This list is
-not exhaustive and the absence of an item here is not a claim of parity.
+This list is not exhaustive, and the absence of an item is not a claim of parity.
 
-- Heredocs and here-strings (`<<`, `<<-`, `<<<`).
-- `case`, `until`, `select`, `coproc`, shell functions, and `[[ ]]` conditionals.
-  These currently fail closed at parse time rather than running.
-- Background jobs and `&` (a bare `&` is a parse error).
-- Process substitution (`<(…)`, `>(…)`).
-- Pathname expansion / globbing.
-- Arrays and associative arrays.
-- `PIPESTATUS`.
-- Streaming pipelines: each stage's stdout is buffered in memory before being
-  handed to the next stage.
-- `yes` and `mktemp`.
-- `ls` sorting flags and multi-operand handling (the current `ls` reads at most
-  one operand and does not sort).
-- mtime and mode metadata in the in-memory filesystem (entries store contents
-  only), and therefore `-t`/`-S`/`-F` classification.
-- Regex-engine-backed `grep`/`sed`/`awk`/`jq`.
-- Network commands and the `python`/`js`/`sqlite` command set.
+- `select`, `coproc`, `time`, `declare`/`typeset`/`local`, `let`, `eval`,
+  `source`/`.`, `trap`, `getopts`, `shift`, `alias`, `readonly`, `command`,
+  `type`, `hash`, and job control beyond `&`/`jobs`/`wait`.
+- Associative arrays, `${a[@]:off:len}` slicing, `${!prefix*}` prefix
+  expansion, and `read -a`.
+- Full BRE support and POSIX leftmost-longest ERE semantics.
+- Upstream's `awk`, `jq` and `find -exec` surfaces.
+- True concurrent streaming pipelines: stages are bounded by a consumer-derived
+  budget, but each stage's output is still materialised in memory before it is
+  handed to the next.
+- Real interpreter parity for `python`/`js`/`sqlite3`: the names exist and fail
+  closed, but no interpreter is embedded.
+- Host filesystem access, process spawning, signals, and host exit-status
+  propagation beyond the in-process model.
