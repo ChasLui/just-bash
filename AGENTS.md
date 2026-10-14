@@ -6,7 +6,8 @@ This file provides execution guidance for Codex (Codex.ai/code) in this reposito
 
 `just-bash` is a **Rust-only** shell runtime:
 
-- Core runtime: `packages/just-bash/rust-core`
+- Facade crate (public API + CLI): `crates/just-bash`
+- Execution core: `crates/just-bash-shell`
 - Crate: `just-bash`
 - CLI binary: `just-bash-rs`
 
@@ -30,7 +31,11 @@ cargo run -p just-bash --bin just-bash-rs -- 'echo hello from rust'
 
 ## Execution Rules for Agents
 
-- All core changes go in `packages/just-bash/rust-core`.
+- Core changes go in the owning crate under `crates/`: `just-bash-shell` for
+  execution, `just-bash-parser` for parsing, `just-bash-fs` for filesystem, and
+  the matching `just-bash-*` crate for each builtin.
+- Keep the public facade in `crates/just-bash` in sync when you add a new crate
+  or change an exported item.
 - Do not reintroduce Node/TypeScript runtime entrypoints, manifests, or build tooling.
 - When adding new behavior, prefer explicit limits and deterministic outputs.
 - Avoid introducing runtime dependencies not already approved by core architecture.

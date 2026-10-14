@@ -8,7 +8,7 @@
 //! command line, standard input, and a callback for reading files from the
 //! in-memory filesystem.
 
-use crate::regex::Regex;
+use just_bash_regex::Regex;
 
 /// The observable result of one `sed` invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]

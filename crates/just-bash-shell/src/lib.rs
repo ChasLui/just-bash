@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
-use crate::fs::{Error, InMemoryFs, Metadata, normalize_absolute, parent_dir};
-use crate::glob;
-use crate::parser::{
+use just_bash_fs::{Error, InMemoryFs, Metadata, normalize_absolute, parent_dir};
+use just_bash_glob as glob;
+use just_bash_parser::{
     ArrayAssign, CaseStatement, CommandInvocation, CondExpr, CondTerm, ForStatement, FunctionDef,
     IfStatement, ParseLimits, PipelineConnector, Redirect, RedirectMode, Statement, StatementKind,
     WhileStatement, Word, WordPartKind, parse_heredoc_word, parse_script_with_limits,
@@ -1839,7 +1839,7 @@ impl Bash {
             "jobs" => stdout.push_str(&self.run_jobs()),
             "wait" => exit_code = self.run_wait(args),
             "sed" => {
-                let outcome = crate::sed::run(args, stdin, &|path: &str| {
+                let outcome = just_bash_sed::run(args, stdin, &|path: &str| {
                     self.fs
                         .read_file(&self.resolve_path(path))
                         .map(str::to_string)
@@ -1859,7 +1859,7 @@ impl Bash {
                         .map(str::to_string)
                         .ok()
                 };
-                let outcome = crate::awk::run(args, stdin, &reader);
+                let outcome = just_bash_awk::run(args, stdin, &reader);
                 stdout.push_str(&outcome.stdout);
                 stderr.push_str(&outcome.stderr);
                 exit_code = outcome.exit_code;
@@ -1871,7 +1871,7 @@ impl Bash {
                         .map(str::to_string)
                         .ok()
                 };
-                let outcome = crate::jq::run(args, stdin, &reader);
+                let outcome = just_bash_jq::run(args, stdin, &reader);
                 stdout.push_str(&outcome.stdout);
                 stderr.push_str(&outcome.stderr);
                 exit_code = outcome.exit_code;
@@ -3184,7 +3184,7 @@ enum GrepPattern {
     /// A literal substring needle (`-F`, the default).
     Literal(String),
     /// A compiled regular expression (`-E` / `-P`).
-    Regex(crate::regex::Regex),
+    Regex(just_bash_regex::Regex),
 }
 
 /// Compile every pattern, or report grep's syntax error (`exit 2`).
@@ -3200,7 +3200,7 @@ fn compile_grep_patterns(
     }
     let mut compiled = Vec::with_capacity(patterns.len());
     for pattern in patterns {
-        match crate::regex::Regex::new_with_flags(pattern, options.ignore_case) {
+        match just_bash_regex::Regex::new_with_flags(pattern, options.ignore_case) {
             Ok(regex) => compiled.push(GrepPattern::Regex(regex)),
             Err(error) => return Err(format!("grep: {pattern}: {error}\n")),
         }
@@ -3246,7 +3246,7 @@ fn line_matches(line: &str, patterns: &[GrepPattern], options: &GrepOptions) -> 
 }
 
 /// `-w` for a regex: every match must be surrounded by non-word characters.
-fn regex_matches_word(regex: &crate::regex::Regex, line: &str) -> bool {
+fn regex_matches_word(regex: &just_bash_regex::Regex, line: &str) -> bool {
     let mut from = 0usize;
     while from <= line.len() {
         let Some((start, end)) = regex.find(&line[from..]) else {
@@ -3779,7 +3779,7 @@ impl Bash {
 
     /// `[[ str =~ re ]]`.
     fn regex_matches(&self, pattern: &str, text: &str) -> bool {
-        match crate::regex::Regex::new(pattern) {
+        match just_bash_regex::Regex::new(pattern) {
             Ok(regex) => regex.is_match(text),
             // An invalid pattern is a non-match rather than a panic.
             Err(_) => false,
@@ -4728,7 +4728,7 @@ impl Bash {
     /// real plain-HTTP fetch when [`Options::allow_network`] is set. HTTPS is
     /// rejected rather than silently downgraded.
     fn run_curl(&mut self, args: &[String], stdout: &mut String, stderr: &mut String) -> i32 {
-        let mut parsed = match crate::net::parse_curl_args(args) {
+        let mut parsed = match just_bash_net::parse_curl_args(args) {
             Ok(parsed) => parsed,
             Err(message) => {
                 stderr.push_str(&message);
@@ -4750,8 +4750,8 @@ impl Bash {
                         return 26;
                     }
                 }
-            } else if matches!(kind, crate::net::DataKind::UrlEncode) {
-                *value = crate::net::urlencode_form(value);
+            } else if matches!(kind, just_bash_net::DataKind::UrlEncode) {
+                *value = just_bash_net::urlencode_form(value);
             }
         }
         parsed.data = data;
@@ -4771,25 +4771,25 @@ impl Bash {
         let method = if parsed.head_only && parsed.method.is_none() {
             "HEAD".to_string()
         } else {
-            crate::net::effective_method(&parsed)
+            just_bash_net::effective_method(&parsed)
         };
-        let request = crate::net::HttpRequest {
+        let request = just_bash_net::HttpRequest {
             method,
             url: parsed.url.clone(),
             headers: parsed.headers.clone(),
             body,
         };
 
-        let response = match crate::net::perform(&request, &self.http_responses, self.allow_network)
-        {
-            Ok(response) => response,
-            Err(error) => {
-                if !parsed.silent {
-                    stderr.push_str(&format!("{}\n", error.message()));
+        let response =
+            match just_bash_net::perform(&request, &self.http_responses, self.allow_network) {
+                Ok(response) => response,
+                Err(error) => {
+                    if !parsed.silent {
+                        stderr.push_str(&format!("{}\n", error.message()));
+                    }
+                    return error.exit_code();
                 }
-                return error.exit_code();
-            }
-        };
+            };
 
         if parsed.fail_on_http_error && response.status >= 400 {
             if !parsed.silent {

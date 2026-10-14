@@ -68,7 +68,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::regex::Regex;
+use just_bash_regex::Regex;
 
 /// Result of one `awk` invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]

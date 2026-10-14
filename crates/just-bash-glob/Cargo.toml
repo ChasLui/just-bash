@@ -1,0 +1,10 @@
+[package]
+name = "just-bash-glob"
+version.workspace = true
+edition.workspace = true
+description = "Glob pattern matching and pathname expansion for the just-bash virtual shell"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+just-bash-fs.workspace = true

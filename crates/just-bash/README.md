@@ -1,8 +1,23 @@
-# just-bash Rust core
+# just-bash
 
-This crate is the Rust rewrite target for the `just-bash` execution core. It
-contains a native in-memory filesystem, parser, `Bash` execution facade,
-structured execution results, and a small CLI used by the crate tests.
+This crate is the facade for the Rust `just-bash` runtime: it re-exports the
+implementation crates, exposes the public API, and ships the `just-bash-rs`
+CLI. The implementation lives in sibling crates under `crates/`:
+
+| Module | Implementation crate | Contents |
+| --- | --- | --- |
+| `just_bash::fs` | `just-bash-fs` | in-memory filesystem |
+| `just_bash::parser` | `just-bash-parser` | quote-aware shell parser |
+| `just_bash::shell` | `just-bash-shell` | execution engine and built-ins |
+| `just_bash::regex` | `just-bash-regex` | POSIX ERE engine |
+| `just_bash::glob` | `just-bash-glob` | glob matching and pathname expansion |
+| `just_bash::awk` | `just-bash-awk` | awk implementation |
+| `just_bash::jq` | `just-bash-jq` | jq implementation |
+| `just_bash::sed` | `just-bash-sed` | sed implementation |
+| `just_bash::net` | `just-bash-net` | curl transport layer |
+
+Every module path and root re-export listed below stays available through this
+facade.
 
 The Rust milestone keeps the surface dependency-free (standard library only)
 while preserving the public runtime concepts of the original project:
@@ -116,8 +131,9 @@ Several accept GNU-style flags:
 Known interpreter names this core does not embed (`python`, `python3`, `node`,
 `js`, `sqlite3`) fail closed with an explicit message and exit status `127`
 rather than the generic "command not found". `awk` and `jq` are *not* in that
-group: both are implemented in-crate (see `awk.rs` and `jq.rs`) with no external
-dependency and no host access beyond the in-memory filesystem.
+group: both are implemented in-crate (see the `just-bash-awk` and `just-bash-jq`
+crates) with no external dependency and no host access beyond the in-memory
+filesystem.
 
 ## Determinism
 

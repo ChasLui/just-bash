@@ -4,11 +4,13 @@ This file provides guidance to Claude Code when working with this repository.
 
 ## Project Overview
 
-`just-bash` is a **Rust-only** shell runtime. The repository is a single Cargo
-workspace; there is no Node/TypeScript build path.
+`just-bash` is a **Rust-only** shell runtime. The repository is a Cargo
+workspace with the implementation split across focused crates under `crates/`;
+there is no Node/TypeScript build path.
 
-- Active core: `packages/just-bash/rust-core`
-- Public crate: `packages/just-bash/rust-core/Cargo.toml` (`name = "just-bash"`)
+- Facade crate (public API + CLI): `crates/just-bash`
+- Execution core: `crates/just-bash-shell`
+- Public crate: `crates/just-bash/Cargo.toml` (`name = "just-bash"`)
 - Primary binary: `just-bash-rs`
 
 ## Command Reference
@@ -37,15 +39,23 @@ cargo tree
 
 ## Local Workspace Behavior
 
-Use `packages/just-bash/rust-core/src` as the active execution source for runtime behavior.
+The behavior lives in focused crates under `crates/`:
 
-- `src/lib.rs` exposes the library API.
-- `src/main.rs` provides the CLI entrypoint.
-- `src/parser.rs`, `src/shell.rs`, and `src/fs.rs` contain the parser/shell/filesystem core.
+- `crates/just-bash/src/lib.rs` re-exports the implementation crates and the
+  public API.
+- `crates/just-bash/src/main.rs` provides the CLI entrypoint.
+- `crates/just-bash-parser/src/lib.rs` holds the parser (lexer, word model,
+  redirection/statement parsing).
+- `crates/just-bash-shell/src/lib.rs` holds expansion, execution and built-ins.
+- `crates/just-bash-fs/src/lib.rs` holds the in-memory filesystem.
 
 ## Development Rules
 
-- All core behavior lives in `packages/just-bash/rust-core`.
+- Core behavior lives in the owning crate under `crates/`: `just-bash-shell` for
+  execution, `just-bash-parser` for parsing, `just-bash-fs` for filesystem, and
+  the matching `just-bash-*` crate for each builtin (`awk`, `jq`, `sed`,
+  `regex`, `glob`, `net`).
+- Keep the `just-bash` facade in sync when adding a crate or changing an export.
 - Do not reintroduce Node/TypeScript runtime entrypoints, package manifests, or
   build tooling.
 - Run a focused verification command after any runtime change:

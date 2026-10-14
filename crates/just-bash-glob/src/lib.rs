@@ -5,7 +5,7 @@
 //! classic iterative star-backtracking algorithm, so a pattern like
 //! `*a*a*a*a*b` cannot blow up exponentially on a hostile input.
 
-use crate::fs::{InMemoryFs, normalize_absolute};
+use just_bash_fs::{InMemoryFs, normalize_absolute};
 
 /// A single compiled pattern element.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,7 +319,7 @@ fn join(directory: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::parent_dir;
+    use just_bash_fs::parent_dir;
 
     fn fs_with(entries: &[(&str, &str)]) -> InMemoryFs {
         let mut fs = InMemoryFs::new();

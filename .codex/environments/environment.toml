@@ -31,7 +31,7 @@ script = '''
 set -uo pipefail
 
 # target 可重建，清掉能显著减少 Codex 删除临时 worktree 的成本。
-rm -rf target packages/just-bash/rust-core/target
+rm -rf target crates/*/target
 find . -type f \( -name '*.profraw' -o -name '*.profdata' \) -delete
 '''
 

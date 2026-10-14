@@ -5,3 +5,75 @@ version = 4
 [[package]]
 name = "just-bash"
 version = "3.0.0"
+dependencies = [
+ "just-bash-awk",
+ "just-bash-fs",
+ "just-bash-glob",
+ "just-bash-jq",
+ "just-bash-net",
+ "just-bash-parser",
+ "just-bash-regex",
+ "just-bash-sed",
+ "just-bash-shell",
+]
+
+[[package]]
+name = "just-bash-awk"
+version = "3.0.0"
+dependencies = [
+ "just-bash-regex",
+]
+
+[[package]]
+name = "just-bash-fs"
+version = "3.0.0"
+
+[[package]]
+name = "just-bash-glob"
+version = "3.0.0"
+dependencies = [
+ "just-bash-fs",
+]
+
+[[package]]
+name = "just-bash-jq"
+version = "3.0.0"
+dependencies = [
+ "just-bash-regex",
+]
+
+[[package]]
+name = "just-bash-net"
+version = "3.0.0"
+
+[[package]]
+name = "just-bash-parser"
+version = "3.0.0"
+dependencies = [
+ "just-bash-fs",
+]
+
+[[package]]
+name = "just-bash-regex"
+version = "3.0.0"
+
+[[package]]
+name = "just-bash-sed"
+version = "3.0.0"
+dependencies = [
+ "just-bash-regex",
+]
+
+[[package]]
+name = "just-bash-shell"
+version = "3.0.0"
+dependencies = [
+ "just-bash-awk",
+ "just-bash-fs",
+ "just-bash-glob",
+ "just-bash-jq",
+ "just-bash-net",
+ "just-bash-parser",
+ "just-bash-regex",
+ "just-bash-sed",
+]
