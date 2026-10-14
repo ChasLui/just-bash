@@ -1,0 +1,10 @@
+[package]
+name = "just-bash-parser"
+version.workspace = true
+edition.workspace = true
+description = "Quote-aware shell parser for the just-bash virtual shell"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+just-bash-fs.workspace = true

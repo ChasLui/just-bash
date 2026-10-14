@@ -1,0 +1,7 @@
+[package]
+name = "just-bash-fs"
+version.workspace = true
+edition.workspace = true
+description = "Deterministic in-memory filesystem for the just-bash virtual shell"
+license.workspace = true
+repository.workspace = true

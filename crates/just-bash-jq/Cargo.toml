@@ -1,0 +1,10 @@
+[package]
+name = "just-bash-jq"
+version.workspace = true
+edition.workspace = true
+description = "Dependency-free jq implementation for the just-bash virtual shell"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+just-bash-regex.workspace = true

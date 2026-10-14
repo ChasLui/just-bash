@@ -1,4 +1,4 @@
-use crate::fs::Error;
+use just_bash_fs::Error;
 
 // ─── Public limits ────────────────────────────────────────────────────────────
 

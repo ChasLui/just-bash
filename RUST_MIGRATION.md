@@ -14,8 +14,9 @@ Removed in the final cleanup:
   `CHANGELOG.md`, `.npmignore`),
 - the TypeScript-specific threat model document.
 
-The Rust core in `packages/just-bash/rust-core` is fully self-contained and does
-not depend on any of the removed assets.
+The Rust implementation is split across focused crates under `crates/`, with
+`crates/just-bash` as the facade that exposes the public API and the CLI. It is
+fully self-contained and does not depend on any of the removed assets.
 
 Use these commands:
 

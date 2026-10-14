@@ -169,7 +169,7 @@
 //! A runtime error keeps whatever was already written to standard output, which
 //! is what `jq` does.
 
-use crate::regex::Regex;
+use just_bash_regex::Regex;
 
 /// Maximum JSON nesting depth accepted by the parser and the serializer, and
 /// the maximum depth a constructed value may reach.

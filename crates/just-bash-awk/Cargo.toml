@@ -1,0 +1,10 @@
+[package]
+name = "just-bash-awk"
+version.workspace = true
+edition.workspace = true
+description = "Dependency-free awk implementation for the just-bash virtual shell"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+just-bash-regex.workspace = true

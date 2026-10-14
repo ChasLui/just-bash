@@ -1,0 +1,7 @@
+[package]
+name = "just-bash-net"
+version.workspace = true
+edition.workspace = true
+description = "Offline-by-default HTTP transport for the just-bash curl builtin"
+license.workspace = true
+repository.workspace = true

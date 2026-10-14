@@ -1,8 +1,9 @@
 # just-bash
 
 `just-bash` is a Rust workspace centered on a native, deterministic shell
-runtime. The Rust core lives in [`packages/just-bash/rust-core`](./packages/just-bash/rust-core)
-and provides:
+runtime. The implementation is split across focused crates under [`crates/`](./crates),
+with [`crates/just-bash`](./crates/just-bash) as the facade crate that exposes the
+public API and the CLI. Together they provide:
 
 - an in-memory filesystem with entry metadata (mode, size, logical mtime),
 - a quote-aware shell parser covering heredocs/here-strings, `case`, `until`,
@@ -23,11 +24,24 @@ Security model details: [`THREAT_MODEL.md`](./THREAT_MODEL.md).
 ## Workspace layout
 
 ```text
-Cargo.toml                     Rust workspace manifest
-packages/just-bash/rust-core/  Rust library and CLI crate
+Cargo.toml                 workspace manifest
+crates/just-bash/          facade crate: public API (`just_bash`) + `just-bash-rs` CLI
+crates/just-bash-shell/    execution engine (built-ins, pipelines, jobs)
+crates/just-bash-parser/   quote-aware shell parser
+crates/just-bash-fs/       in-memory filesystem
+crates/just-bash-glob/     glob matching and pathname expansion
+crates/just-bash-regex/    POSIX ERE engine
+crates/just-bash-awk/      awk implementation
+crates/just-bash-jq/       jq implementation
+crates/just-bash-sed/      sed implementation
+crates/just-bash-net/      curl transport layer
 ```
 
-The runtime is dependency-free: every module uses only the Rust standard
+`just-bash` re-exports every implementation crate as a module, so
+`just_bash::shell::Bash`, `just_bash::parser::parse_script` and the root
+re-exports such as `just_bash::Bash` all remain available.
+
+The runtime is dependency-free: every crate uses only the Rust standard
 library.
 
 ## Development

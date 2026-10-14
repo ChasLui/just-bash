@@ -1,0 +1,7 @@
+[package]
+name = "just-bash-regex"
+version.workspace = true
+edition.workspace = true
+description = "Dependency-free POSIX ERE engine for the just-bash virtual shell"
+license.workspace = true
+repository.workspace = true
