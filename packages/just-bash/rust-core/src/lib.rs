@@ -1,13 +1,17 @@
+pub mod awk;
 pub mod fs;
 pub mod glob;
+pub mod jq;
 pub mod net;
 pub mod parser;
 pub mod regex;
 pub mod sed;
 pub mod shell;
 
+pub use awk::{AwkRun, MAX_RECORDS as AWK_MAX_RECORDS};
 pub use fs::{DEFAULT_DIR_MODE, DEFAULT_FILE_MODE, EntryKind, Error, InMemoryFs, Metadata};
 pub use glob::{component_matches, expand as glob_expand, pattern_matches};
+pub use jq::{JqRun, Json};
 pub use net::{CurlError, HttpRequest, HttpResponse};
 pub use parser::{
     ArrayAssign, CaseClause, CaseStatement, CommandInvocation, CondExpr, CondTerm, ForStatement,

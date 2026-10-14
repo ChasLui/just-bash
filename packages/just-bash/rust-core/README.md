@@ -35,11 +35,25 @@ while preserving the public runtime concepts of the original project:
 - **Expansion**: `$NAME`, `${NAME}`, `${p-word}`, `${p:-word}`, `${p=word}`,
   `${p:=word}`, `${p?word}`, `${p:?word}`, `${p+word}`, `${p:+word}`,
   `${#name}`, `$#`/`$@`/`$*`/`$?`/`$!`/`$$`, arithmetic `$(( … ))` (including
-  `$name`/`$1` operands), command substitution `$( … )`, process substitution
-  `<( … )` / `>( … )`, and pathname expansion (globbing).
-- **Arrays**: indexed arrays (`a=(1 2 3)`, `a[2]=x`, `a+=(4)`), `${a[i]}`,
-  `${a[@]}`/`${a[*]}`, `${#a[@]}`, `${#a[i]}`, `${!a[@]}` and indirect
-  `${!name}`. Associative arrays are not implemented.
+  `$name`/`$1` operands and unary signs), command substitution `$( … )`,
+  process substitution `<( … )` / `>( … )`, and pathname expansion (globbing).
+  A `${ … }` expansion is captured as one lexical unit, so spaces and shell
+  operators inside it (`${v:-a b}`, `${v: -2}`) stay literal.
+- **Arrays**: indexed arrays (`a=(1 2 3)`, `a[2]=x`, `a+=(4)`) and
+  associative arrays (`declare -A m`, `m[key]=v`, `declare -A m=([k]=v)`),
+  with `${a[i]}`/`${m[key]}`, `${a[@]}`/`${a[*]}` (one field per element for
+  `@`, one joined field for `*`), `${#a[@]}`/`${#m[@]}`, `${#a[i]}`,
+  `${!a[@]}` (indices) / `${!m[@]}` (keys), and indirect `${!name}`.
+  Subscripts may contain expansions (`${m[$key]}`).
+- **Slicing**: `${v:off}`, `${v:off:len}` on strings, `${a[@]:off:len}` on
+  arrays and `${@:off:len}` on positional parameters; negative offsets count
+  from the end, and a non-positive length yields nothing.
+- **Scoping**: `declare`/`typeset`/`local` (`-A` associative, `-a` indexed,
+  `-g` force global, `-r`/`-x`/`-i` accepted). Inside a function both `local`
+  and `declare` are function-local and restored on return, so recursion and
+  nested calls behave as in bash.
+- **`shift [n]`** drops leading positional parameters; shifting past the end
+  reports status 1 and leaves them unchanged.
 - **Jobs**: `cmd &` runs in a child shell, records a job, sets `$!`, and
   supports `jobs` and `wait` (see "Determinism" below).
 - **Shell options**: `set -e`, `set -u`, `set -o pipefail`, including bundled
@@ -58,10 +72,11 @@ relative paths just as bash does.
 ## Built-ins
 
 `:`, `basename`, `break`, `cat`, `cd`, `chmod`, `continue`, `cp`, `curl`, `cut`,
-`dirname`, `echo`, `env`, `exit`, `export`, `false`, `grep`, `head`, `jobs`,
-`ls`, `mkdir`, `mktemp`, `mv`, `printf`, `pwd`, `read`, `return`, `rm`, `sed`,
-`seq`, `set`, `sleep`, `sort`, `stat`, `tail`, `test`/`[`, `touch`, `tr`,
-`true`, `unset`, `uniq`, `wait`, `wc`, `yes`.
+`declare`, `dirname`, `echo`, `env`, `exit`, `export`, `false`, `grep`, `head`,
+`jobs`, `local`, `ls`, `mkdir`, `mktemp`, `mv`, `printf`, `pwd`, `read`,
+`return`, `rm`, `sed`, `seq`, `set`, `shift`, `sleep`, `sort`, `stat`, `tail`,
+`test`/`[`, `touch`, `tr`, `true`, `typeset`, `unset`, `uniq`, `wait`, `wc`,
+`yes`.
 
 Several accept GNU-style flags:
 
@@ -78,12 +93,31 @@ Several accept GNU-style flags:
 - `sed`: `-n`, `-e SCRIPT`, `s/re/repl/flags` (`g`, `p`, `i`), `p`, `d`, `q`,
   and line-number/`$` addresses. Other script commands fail closed.
 - `stat`: `-c FORMAT` with `%n`, `%s`, `%a`, `%A`, `%F`, `%Y`.
+- `awk`: `-F`, `-v`, `-f`, `--`; `BEGIN`/`END`, `pattern { action }`, `/re/` and
+  range patterns, fields and `NF`/`NR`/`FNR`/`FILENAME`, `OFS`/`ORS`, arrays
+  with `for (k in a)` (sorted key order), and the usual built-ins (`length`,
+  `substr`, `index`, `split`, `sub`, `gsub`, `match`, `sprintf`, `tolower`,
+  `toupper`, `int`, `sqrt`, `exp`, `log`, `sin`, `cos`, `atan2`, `rand`,
+  `srand`). `getline`, `system()`, user-defined functions and output
+  redirection fail closed; records, steps and output bytes are capped.
+- `jq`: `-r`, `-j`, `-c`, `-n`, `-s`, `-e`, `-a`, `--arg`, `--argjson`,
+  `--tab`, `--indent`, `--`; the documented filter subset (paths, `.[]`,
+  slices, pipes, commas, constructors, arithmetic and jq ordering, `//`,
+  `if/then/else`, `as $x`, `try`/`catch`, string interpolation and `del` over
+  path expressions, plus the documented built-ins). JSON nesting depth, filter
+  token count, filter nesting depth and output bytes are capped; unsupported
+  syntax is a compile error, never a silent no-op. Two deliberate deviations
+  from jq 1.8: numbers print in the shortest plain decimal form (`1e3` prints
+  `1000` instead of echoing the source literal) and the `{re, flags}` /
+  `[re, flags]` regex argument forms are accepted by every regex built-in.
 - `curl`: `-s`, `-i`, `-I`, `-X`, `-H`, `-d`/`--data`/`--data-raw`/
   `--data-binary`/`--data-urlencode`, `-o`, `-f`, `-L`, `--`.
 
 Known interpreter names this core does not embed (`python`, `python3`, `node`,
 `js`, `sqlite3`) fail closed with an explicit message and exit status `127`
-rather than the generic "command not found".
+rather than the generic "command not found". `awk` and `jq` are *not* in that
+group: both are implemented in-crate (see `awk.rs` and `jq.rs`) with no external
+dependency and no host access beyond the in-memory filesystem.
 
 ## Determinism
 
@@ -115,7 +149,10 @@ Default execution limits:
 
 The regex engine additionally enforces a backtracking step budget
 (`regex::DEFAULT_STEP_BUDGET`) so a pathological pattern is abandoned instead of
-hanging.
+hanging. `awk` and `jq` cap input records, executed steps, nesting depth and
+accumulated output bytes, and report a clean error when a bound is hit. `jq`
+also caps the filter token count so that a hostile filter cannot build a tree
+deep enough to exhaust the stack while parsing, evaluating or dropping it.
 
 ## Exec isolation
 
