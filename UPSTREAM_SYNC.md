@@ -95,6 +95,13 @@ the upstream behavior family each area corresponds to.
 | FS metadata | Mode, size and logical mtime per entry; `chmod`, `stat`, `touch` stamping, `test -r/-w/-x/-s` | `fs.rs`: `Metadata`, `EntryKind`, `set_mode`, `set_mtime`, logical clock; `shell.rs`: `run_chmod`, `run_stat` |
 | Regex engine | Dependency-free POSIX ERE engine (`new`/`is_match`/`find`/`captures`/`replace_all`/`split`) with a backtracking step budget, powering `grep -E`/`-P` and `[[ =~ ]]` | `regex.rs` (whole module); `shell.rs`: `compile_grep_patterns`, `GrepPattern`, `regex_matches`, `regex_matches_word` |
 | `sed` | `-n`, `-e`, substitution with `g`/`p`/`i`, `p`, `d`, `q`, line-number/`$` addresses, backed by the regex engine | `sed.rs` (whole module); `shell.rs`: the `sed` dispatch arm |
+| Associative arrays | `declare -A`/`local -A`, `m[key]=v`, `declare -A m=([k]=v)`, `${m[k]}`, `${#m[@]}`, `${!m[@]}` (keys), `${m[@]}`, `unset m[k]`, subscripts with expansions | `shell.rs`: `assoc_arrays`, `declare_assoc`, `run_declare`, `assign_element` |
+| Slicing | `${v:off}`, `${v:off:len}`, `${a[@]:off:len}`, `${@:off:len}`, negative offsets | `shell.rs`: `expand_slice`, `slice_bounds`, `slice_text` |
+| Scoping | `declare`/`typeset`/`local` with `-A`/`-a`/`-g`, function-local restored on return, array literals attached to a declaration (`declare -A m=(…)`, `local -a a=(…)`) | `shell.rs`: `ScopedVar`, `run_declare`, `restore_scope`, `local_scopes`; `parser.rs`: `CommandInvocation::array` |
+| `shift` | `shift [n]`, status 1 when shifting past the end | `shell.rs`: the `shift` dispatch arm |
+| Brace expansion capture | `${ … }` is lexed as one unit, so `${v:-a b}` and `${v: -2}` keep spaces/operators literal; unary signs in `$(( … ))` | `parser.rs`: `consume_parameter_expansion`; `shell.rs`: `eval_arithmetic_expr` |
+| `awk` | Pure-std AWK subset: `-F`/`-v`/`-f`, `BEGIN`/`END`, pattern and range rules, fields/`NF`/`NR`/`FNR`/`FILENAME`, `OFS`/`ORS`, arrays with sorted `for (k in a)`, the documented built-ins; bounded records/steps/output; `getline`/`system()`/user functions/output redirection fail closed | `awk.rs` (whole module); `shell.rs`: the `awk` dispatch arm |
+| `jq` | Pure-std jq subset: `-r`/`-j`/`-c`/`-n`/`-s`/`-e`/`-a`/`--arg`/`--argjson`/`--indent`/`--tab`, paths and `.[]`/slices, pipes/commas/constructors, jq ordering, `//`, `if/then/else`, `as $x`, `try`/`catch`, string interpolation, `del` over path expressions, documented built-ins, regex-backed `test`/`match`/`capture`/`sub`/`gsub`; bounded filter tokens/nesting depth and output so a hostile filter cannot exhaust the stack; unsupported syntax is a compile error | `jq.rs` (whole module); `shell.rs`: the `jq` dispatch arm |
 | Network | `curl` with an offline-fail-closed default, an injectable deterministic URL → body table, and opt-in plain-HTTP fetching; `@file` bodies resolved from the virtual filesystem | `net.rs` (whole module); `shell.rs`: `run_curl`; `Options::allow_network` / `Options::http_responses` |
 
 Notes:
@@ -109,18 +116,27 @@ Notes:
   are not emulated.
 - `curl` speaks plain HTTP only. HTTPS fails closed with an unsupported-protocol
   error rather than silently downgrading.
+- `awk` follows GNU awk where GNU and BSD disagree: `-F t`/`-Ft` are a literal
+  `t` (BSD reads a bare `t`/`n` as tab/newline), `0x1f` is the hex literal `31`
+  (BSD reads `0` then `x1f`), `length(x)` of an uninitialised variable is `0`,
+  and `for (k in a)` iterates in sorted key order. Differential runs against
+  macOS's BSD `awk` therefore show those specific differences and no others.
+- `jq` prints numbers in the shortest plain decimal form, so the literal filter
+  `1e3` prints `1000` where jq 1.8 echoes the source text as `1E+3`; computed
+  values agree, and the `{re, flags}` / `[re, flags]` regex argument forms are
+  accepted by every regex built-in.
 
 ## Not yet ported
 
 This list is not exhaustive, and the absence of an item is not a claim of parity.
 
-- `select`, `coproc`, `time`, `declare`/`typeset`/`local`, `let`, `eval`,
-  `source`/`.`, `trap`, `getopts`, `shift`, `alias`, `readonly`, `command`,
-  `type`, `hash`, and job control beyond `&`/`jobs`/`wait`.
-- Associative arrays, `${a[@]:off:len}` slicing, `${!prefix*}` prefix
-  expansion, and `read -a`.
+- `find -exec` and the wider upstream utility surface beyond `awk`/`jq`.
+- `select`, `coproc`, `time`, `let`, `eval`, `source`/`.`, `trap`, `getopts`,
+  `alias`, `readonly`, `command`, `type`, `hash`, and job control beyond
+  `&`/`jobs`/`wait`.
+- `${!prefix*}` prefix expansion, `${a[@]@Q}` transformations, `read -a`,
+  `mapfile`/`readarray`, and namerefs (`declare -n`).
 - Full BRE support and POSIX leftmost-longest ERE semantics.
-- Upstream's `awk`, `jq` and `find -exec` surfaces.
 - True concurrent streaming pipelines: stages are bounded by a consumer-derived
   budget, but each stage's output is still materialised in memory before it is
   handed to the next.

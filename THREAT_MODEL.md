@@ -50,11 +50,22 @@ goal is deterministic behavior with conservative resource limits.
    Plain HTTP honours connect/read timeouts and a response-size cap; HTTPS and
    any non-`http` scheme fail closed with an unsupported-protocol error rather
    than downgrading or retrying.
-7. **The regex engine is bounded.** `regex::Regex` enforces a backtracking step
+7. **`awk` and `jq` are in-crate, not delegated.** Both are std-only
+   implementations that read their inputs through the same in-memory
+   filesystem, so they add no host filesystem, process or network surface.
+   Each caps input records, executed steps, nesting depth and accumulated output
+   bytes, reports a clean `awk: …` / `jq: …` error when a bound is hit, and
+   fails closed on unsupported constructs (`getline`, `system()`, user-defined
+   functions, output redirection for `awk`; unsupported filters are compile
+   errors for `jq`). `jq` additionally caps the filter token count and nesting
+   depth *before* building a tree, so a hostile filter — deeply nested
+   parentheses or a flat `1 + 1 + …` chain — exits `3` with a clean message
+   instead of aborting the process by exhausting the stack.
+8. **The regex engine is bounded.** `regex::Regex` enforces a backtracking step
    budget (`DEFAULT_STEP_BUDGET`) and returns no match once it is exhausted, so
    patterns such as `(a+)+$` cannot pin a CPU. Glob matching uses an iterative
    star-backtracking algorithm and is linear in the pattern, not exponential.
-8. **Producers are bounded by consumers.** A downstream `head -n`/`grep -m`
+9. **Producers are bounded by consumers.** A downstream `head -n`/`grep -m`
    publishes a line budget that `yes`/`seq` honour, so an unbounded producer is
    stopped at demand instead of filling the output ceiling.
 
@@ -86,7 +97,7 @@ goal is deterministic behavior with conservative resource limits.
    constructs. A command-position word outside that list still falls through to
    `command not found` (exit 127), and the rest of the script continues to run.
    No host command is spawned; the impact is scope confusion, not escape.
-8. `sed`, `curl` and the regex engine are subsets of their GNU/POSIX
-   counterparts. Unsupported options and script commands are errors, but a
+8. `sed`, `curl`, `awk`, `jq` and the regex engine are subsets of their
+   GNU/POSIX counterparts. Unsupported options and script commands are errors, but a
    script that assumes a wider feature set may observe different (not silent)
    results.

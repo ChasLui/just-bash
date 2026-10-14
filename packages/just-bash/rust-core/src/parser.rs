@@ -150,6 +150,8 @@ pub enum RedirectMode {
 pub struct CommandInvocation {
     pub words: Vec<Word>,
     pub redirects: Vec<Redirect>,
+    /// An array literal written as an argument, e.g. `declare -A m=( … )`.
+    pub array: Option<ArrayAssign>,
 }
 
 // ─── Pipeline connector ───────────────────────────────────────────────────────
@@ -467,6 +469,15 @@ impl<'a> Lexer<'a> {
                     }
                     _ => self.push_char('\\', WordPartKind::Literal),
                 },
+                // Parameter expansion `${ … }` is captured whole so that
+                // whitespace and shell operators inside it stay literal.
+                (quote_state, '$')
+                    if quote_state != Some(Quote::Single) && self.chars.peek() == Some(&'{') =>
+                {
+                    self.chars.next();
+                    let inner = consume_parameter_expansion(&mut self.chars)?;
+                    self.push_part(inner, WordPartKind::Variable, quote_state.is_some());
+                }
                 // Command substitution `$(...)` / arithmetic `$((...))`.
                 (quote_state, '$') if quote_state != Some(Quote::Single) => {
                     if self.chars.next_if_eq(&'(').is_some() {
@@ -1461,6 +1472,7 @@ fn parse_pipeline_statement(
     let mut commands: Vec<CommandInvocation> = Vec::new();
     let mut words: Vec<Word> = Vec::new();
     let mut redirects: Vec<Redirect> = Vec::new();
+    let mut array: Option<ArrayAssign> = None;
     let mut pending_pipe = false;
 
     while *pos < tokens.len() {
@@ -1585,9 +1597,46 @@ fn parse_pipeline_statement(
                         "syntax error near unexpected token `|'".to_string(),
                     ));
                 }
-                push_command_to(&mut commands, &mut words, &mut redirects);
+                push_command_to(&mut commands, &mut words, &mut redirects, &mut array);
                 pending_pipe = true;
                 *pos += 1;
+            }
+            // An array literal after a command word belongs to that command:
+            // `declare -A m=( … )`, `local -a a=( … )`.
+            Token::ArrayAssign(name, append) => {
+                if array.is_some() {
+                    return Err(Error::Parse(
+                        "syntax error near unexpected token `('".to_string(),
+                    ));
+                }
+                let name = name.clone();
+                let append = *append;
+                *pos += 1;
+                let mut items = Vec::new();
+                loop {
+                    skip_separators(tokens, pos);
+                    match tokens.get(*pos) {
+                        Some(Token::RParen) => {
+                            *pos += 1;
+                            break;
+                        }
+                        Some(Token::Word(word)) => {
+                            items.push(word.clone());
+                            *pos += 1;
+                        }
+                        _ => {
+                            return Err(Error::Parse(
+                                "syntax error near unexpected token `('".to_string(),
+                            ));
+                        }
+                    }
+                }
+                array = Some(ArrayAssign {
+                    name,
+                    append,
+                    items,
+                });
+                pending_pipe = false;
             }
             Token::AndIf
             | Token::OrIf
@@ -1595,8 +1644,7 @@ fn parse_pipeline_statement(
             | Token::Background
             | Token::DoubleSemi
             | Token::RParen
-            | Token::LParen
-            | Token::ArrayAssign(_, _) => {
+            | Token::LParen => {
                 if pending_pipe {
                     return Err(Error::Parse(format!(
                         "syntax error near unexpected token `{}'",
@@ -1620,7 +1668,7 @@ fn parse_pipeline_statement(
         ));
     }
 
-    push_command_to(&mut commands, &mut words, &mut redirects);
+    push_command_to(&mut commands, &mut words, &mut redirects, &mut array);
 
     if commands.is_empty() {
         Ok(None)
@@ -2029,13 +2077,101 @@ fn push_command_to(
     commands: &mut Vec<CommandInvocation>,
     words: &mut Vec<Word>,
     redirects: &mut Vec<Redirect>,
+    array: &mut Option<ArrayAssign>,
 ) {
-    if !words.is_empty() || !redirects.is_empty() {
+    if !words.is_empty() || !redirects.is_empty() || array.is_some() {
         commands.push(CommandInvocation {
             words: std::mem::take(words),
             redirects: std::mem::take(redirects),
+            array: array.take(),
         });
     }
+}
+
+/// Consume a `${ … }` parameter expansion (after `${` has been consumed) and
+/// return the full text including the braces.
+///
+/// Bash allows spaces, quotes, shell operators and nested `$(…)` / `${…}`
+/// inside a parameter expansion, none of which end it.
+fn consume_parameter_expansion(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<String, Error> {
+    let mut output = String::from("${");
+    let mut depth = 1usize;
+    let mut quote: Option<Quote> = None;
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(Quote::Single) => {
+                output.push(ch);
+                if ch == '\'' {
+                    quote = None;
+                }
+            }
+            Some(Quote::Double) => {
+                output.push(ch);
+                if ch == '\\' {
+                    if let Some(next) = chars.next() {
+                        output.push(next);
+                    }
+                } else if ch == '"' {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '\'' => {
+                    output.push(ch);
+                    quote = Some(Quote::Single);
+                }
+                '"' => {
+                    output.push(ch);
+                    quote = Some(Quote::Double);
+                }
+                '\\' => {
+                    output.push(ch);
+                    if let Some(next) = chars.next() {
+                        output.push(next);
+                    }
+                }
+                // Nested substitutions are skipped as units so a `}` inside
+                // them is not mistaken for the end of this expansion.
+                '$' => {
+                    output.push(ch);
+                    if chars.next_if_eq(&'(').is_some() {
+                        // The consumers return the body only, so the closing
+                        // parens of the nested substitution are re-emitted here.
+                        if chars.next_if_eq(&'(').is_some() {
+                            let inner = consume_arithmetic_substitution(chars)?;
+                            output.push_str("((");
+                            output.push_str(&inner);
+                            output.push_str("))");
+                        } else {
+                            let inner = consume_command_substitution(chars, usize::MAX)?;
+                            output.push('(');
+                            output.push_str(&inner);
+                            output.push(')');
+                        }
+                    }
+                }
+                '{' => {
+                    depth += 1;
+                    output.push(ch);
+                }
+                '}' => {
+                    depth -= 1;
+                    output.push(ch);
+                    if depth == 0 {
+                        return Ok(output);
+                    }
+                }
+                _ => output.push(ch),
+            },
+        }
+    }
+
+    Err(Error::Parse(
+        "unexpected EOF while looking for matching `}'".to_string(),
+    ))
 }
 
 /// Consume a command substitution body (after the opening `$(` has been

@@ -104,6 +104,11 @@ pub struct Bash {
     positionals: Vec<String>,
     /// Indexed arrays. `PIPESTATUS` lives here too, as bash does.
     arrays: BTreeMap<String, Vec<String>>,
+    /// Associative arrays created with `declare -A` / `local -A`.
+    assoc_arrays: BTreeMap<String, BTreeMap<String, String>>,
+    /// Active `local`/`declare` scopes, innermost last. A function call pushes
+    /// one scope and restores it on return.
+    local_scopes: Vec<Vec<ScopedVar>>,
     /// Background jobs started with `&`, in start order.
     jobs: Vec<JobRecord>,
     next_job_id: u32,
@@ -125,6 +130,8 @@ pub struct Bash {
     procsub_counter: u64,
     /// Deterministic counter backing `mktemp`.
     mktemp_counter: u64,
+    /// Array literal attached to the command being run (`declare -A m=( … )`).
+    pending_array: Option<ArrayAssign>,
     allow_network: bool,
     http_responses: BTreeMap<String, String>,
 }
@@ -134,6 +141,24 @@ pub struct Bash {
 /// There is no concurrency in this runtime: a background statement is executed
 /// to completion in a child shell and only its status is retained, so `$!` and
 /// `wait` stay deterministic.
+/// A variable captured by `local`/`declare` inside a function, with the value
+/// it had before the local declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScopedVar {
+    Scalar {
+        name: String,
+        previous: Option<String>,
+    },
+    Indexed {
+        name: String,
+        previous: Option<Vec<String>>,
+    },
+    Associative {
+        name: String,
+        previous: Option<BTreeMap<String, String>>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct JobRecord {
     id: u32,
@@ -213,6 +238,8 @@ impl Bash {
             functions: BTreeMap::new(),
             positionals: Vec::new(),
             arrays: BTreeMap::new(),
+            assoc_arrays: BTreeMap::new(),
+            local_scopes: Vec::new(),
             jobs: Vec::new(),
             next_job_id: 1,
             function_depth: 0,
@@ -223,6 +250,7 @@ impl Bash {
             procsub_readers: Vec::new(),
             procsub_counter: 0,
             mktemp_counter: 0,
+            pending_array: None,
             allow_network: options.allow_network,
             http_responses: options.http_responses,
         })
@@ -258,6 +286,8 @@ impl Bash {
             let saved_functions = std::mem::take(&mut self.functions);
             let saved_positionals = std::mem::take(&mut self.positionals);
             let saved_arrays = std::mem::take(&mut self.arrays);
+            let saved_assoc = std::mem::take(&mut self.assoc_arrays);
+            let saved_scopes = std::mem::take(&mut self.local_scopes);
             let saved_jobs = std::mem::take(&mut self.jobs);
             let saved_job_id = self.next_job_id;
             self.env = self.initial_env.clone();
@@ -283,6 +313,8 @@ impl Bash {
             self.functions = saved_functions;
             self.positionals = saved_positionals;
             self.arrays = saved_arrays;
+            self.assoc_arrays = saved_assoc;
+            self.local_scopes = saved_scopes;
             self.jobs = saved_jobs;
             self.next_job_id = saved_job_id;
             self.nounset_error = None;
@@ -947,6 +979,10 @@ impl Bash {
             };
         }
 
+        // An array literal attached to this command is applied by the
+        // declaration builtin (or by the assignment path when there are no
+        // words).
+        self.pending_array = command.array.clone();
         // Shell functions take precedence over built-ins and external commands.
         let mut result = match words.first() {
             Some(name) if self.functions.contains_key(name) => {
@@ -970,6 +1006,14 @@ impl Bash {
         // reader has consumed them.
         self.flush_procsub_readers(&mut result);
         self.cleanup_procsubs();
+        // Only declaration built-ins consume an attached array literal; anywhere
+        // else it is a syntax error rather than a silent no-op.
+        if self.pending_array.take().is_some() {
+            result
+                .stderr
+                .push_str("bash: syntax error near unexpected token `('\n");
+            result.exit_code = 2;
+        }
 
         result
     }
@@ -1026,6 +1070,15 @@ impl Bash {
         let mut stderr = String::new();
         let mut exit_code = 0;
         if words.is_empty() {
+            // `m=( … )` with no command word is an array assignment.
+            if let Some(assign) = self.pending_array.take() {
+                let (out, err, code) = self.exec_array_assign(&assign);
+                return CommandOutput {
+                    stdout: out,
+                    stderr: err,
+                    exit_code: code,
+                };
+            }
             return CommandOutput {
                 stdout,
                 stderr,
@@ -1496,6 +1549,10 @@ impl Bash {
                 }
             }
             "export" => {
+                // `export a=( … )` also creates the array.
+                if let Some(assign) = self.pending_array.take() {
+                    self.exec_array_assign(&assign);
+                }
                 for assignment in args {
                     if let Some((key, value)) = assignment.split_once('=') {
                         self.env.insert(key.to_string(), value.to_string());
@@ -1516,6 +1573,26 @@ impl Bash {
                             if !unset_vars {
                                 continue;
                             }
+                            // `unset a[k]` removes one element; `unset a`
+                            // removes the whole array.
+                            if let Some((name, subscript)) = split_array_subscript(other) {
+                                if let Some(map) = self.assoc_arrays.get_mut(name) {
+                                    if subscript == "@" || subscript == "*" {
+                                        map.clear();
+                                    } else {
+                                        map.remove(subscript);
+                                    }
+                                } else if let Some(values) = self.arrays.get_mut(name)
+                                    && let Ok(index) = subscript.parse::<usize>()
+                                    && index < values.len()
+                                {
+                                    values.remove(index);
+                                }
+                                continue;
+                            }
+                            let removed_assoc = self.assoc_arrays.remove(other).is_some();
+                            self.arrays.remove(other);
+                            let _ = removed_assoc;
                             self.env.remove(other);
                         }
                     }
@@ -1732,6 +1809,33 @@ impl Bash {
             "chmod" => exit_code = self.run_chmod(args, &mut stderr),
             "stat" => exit_code = self.run_stat(args, &mut stdout, &mut stderr),
             "seq" => exit_code = self.run_seq(args, &mut stdout, &mut stderr),
+            "declare" | "typeset" | "local" => {
+                exit_code = self.run_declare(command, args, &mut stderr);
+            }
+            // `shift [n]` drops the first n positional parameters; asking for
+            // more than exist fails with status 1 and changes nothing.
+            "shift" => {
+                let count = match args.first() {
+                    Some(text) => match text.parse::<usize>() {
+                        Ok(count) => count,
+                        Err(_) => {
+                            stderr.push_str(&format!(
+                                "bash: shift: {text}: numeric argument required\n"
+                            ));
+                            exit_code = 1;
+                            0
+                        }
+                    },
+                    None => 1,
+                };
+                if exit_code == 0 {
+                    if count > self.positionals.len() {
+                        exit_code = 1;
+                    } else {
+                        self.positionals.drain(0..count);
+                    }
+                }
+            }
             "jobs" => stdout.push_str(&self.run_jobs()),
             "wait" => exit_code = self.run_wait(args),
             "sed" => {
@@ -1746,6 +1850,32 @@ impl Bash {
                 exit_code = outcome.exit_code;
             }
             "curl" => exit_code = self.run_curl(args, &mut stdout, &mut stderr),
+            // `awk` and `jq` are implemented in-crate (see awk.rs / jq.rs), so
+            // they get the same virtual filesystem and no host access.
+            "awk" => {
+                let reader = |path: &str| {
+                    self.fs
+                        .read_file(&self.resolve_path(path))
+                        .map(str::to_string)
+                        .ok()
+                };
+                let outcome = crate::awk::run(args, stdin, &reader);
+                stdout.push_str(&outcome.stdout);
+                stderr.push_str(&outcome.stderr);
+                exit_code = outcome.exit_code;
+            }
+            "jq" => {
+                let reader = |path: &str| {
+                    self.fs
+                        .read_file(&self.resolve_path(path))
+                        .map(str::to_string)
+                        .ok()
+                };
+                let outcome = crate::jq::run(args, stdin, &reader);
+                stdout.push_str(&outcome.stdout);
+                stderr.push_str(&outcome.stderr);
+                exit_code = outcome.exit_code;
+            }
             // There is no wall clock in this runtime, so `sleep` validates its
             // operand and returns immediately. Combined with `&`/`wait` this
             // keeps timing-dependent scripts deterministic.
@@ -2000,12 +2130,32 @@ impl Bash {
         }
         let (parameter, rest) = split_parameter(content);
 
+        // An associative subscript is a string, and may itself contain
+        // expansions (`${m[$key]}`), so expand it before the lookup.
+        let expanded_parameter: String = match split_array_subscript(parameter) {
+            Some((name, subscript)) if self.assoc_arrays.contains_key(name) => {
+                let key = self.expand_text(subscript);
+                format!("{name}[{key}]")
+            }
+            _ => parameter.to_string(),
+        };
+        let parameter: &str = &expanded_parameter;
+
         // `${#name}` is the length of `name`, not a parameter called `#name`.
         if parameter == "#" && !rest.is_empty() {
             let (inner, inner_rest) = split_parameter(rest);
             if inner_rest.is_empty() && !inner.is_empty() {
                 return self.expand_length(inner);
             }
+        }
+
+        // `${v:off:len}` / `${a[@]:off:len}` slicing. A `:` followed by `-`,
+        // `=`, `?` or `+` is a parameter operator, never a slice; anything else
+        // (including a variable or arithmetic offset) is a slice.
+        if let Some(spec) = rest.strip_prefix(':')
+            && !spec.starts_with(['-', '=', '?', '+'])
+        {
+            return self.expand_slice(parameter, spec.trim());
         }
 
         let is_set = self.parameter_is_set(parameter);
@@ -2106,6 +2256,9 @@ impl Bash {
         if let Some((name, subscript)) = split_array_subscript(parameter)
             && (subscript == "@" || subscript == "*")
         {
+            if let Some(map) = self.assoc_arrays.get(name) {
+                return map.len().to_string();
+            }
             return self
                 .arrays
                 .get(name)
@@ -2135,14 +2288,19 @@ impl Bash {
     /// Whether `parameter` currently has a value (`${p-word}` semantics).
     fn parameter_is_set(&self, parameter: &str) -> bool {
         if let Some((name, subscript)) = split_array_subscript(parameter) {
+            if let Some(map) = self.assoc_arrays.get(name) {
+                return match subscript {
+                    "@" | "*" => true,
+                    key => map.contains_key(key),
+                };
+            }
             let Some(elements) = self.arrays.get(name) else {
                 return false;
             };
             return match subscript {
                 "@" | "*" => true,
-                index => index
-                    .parse::<usize>()
-                    .ok()
+                index => self
+                    .array_subscript_index(index)
                     .is_some_and(|index| elements.get(index).is_some()),
             };
         }
@@ -2157,6 +2315,13 @@ impl Bash {
 
     fn parameter_value(&self, parameter: &str) -> Option<String> {
         if let Some((name, subscript)) = split_array_subscript(parameter) {
+            // An associative array is keyed by string, not by index.
+            if let Some(map) = self.assoc_arrays.get(name) {
+                return match subscript {
+                    "@" | "*" => Some(map.values().cloned().collect::<Vec<_>>().join(" ")),
+                    key => Some(map.get(key).cloned().unwrap_or_default()),
+                };
+            }
             return match subscript {
                 "@" | "*" => Some(
                     self.arrays
@@ -2166,7 +2331,7 @@ impl Bash {
                 ),
                 index => {
                     let elements = self.arrays.get(name)?;
-                    let index = index.parse::<usize>().ok()?;
+                    let index = self.array_subscript_index(index)?;
                     Some(elements.get(index).cloned().unwrap_or_default())
                 }
             };
@@ -2191,7 +2356,13 @@ impl Bash {
                     .env
                     .get(parameter)
                     .cloned()
-                    .or_else(|| self.arrays.get(parameter).and_then(|v| v.first().cloned())),
+                    .or_else(|| self.arrays.get(parameter).and_then(|v| v.first().cloned()))
+                    // A bare associative name expands to the value of key `0`.
+                    .or_else(|| {
+                        self.assoc_arrays
+                            .get(parameter)
+                            .and_then(|map| map.get("0").cloned())
+                    }),
             },
         }
     }
@@ -2560,10 +2731,16 @@ fn eval_arithmetic_expr(
 
     let mut values: Vec<i64> = Vec::new();
     let mut ops: Vec<Tok<'_>> = Vec::new();
+    // Whether the next token must be an operand, so a leading `+`/`-` is read
+    // as a unary sign (`-x` evaluates as `0 - x`).
+    let mut expect_operand = true;
 
     for token in tokens {
         match token {
-            Tok::Num(value) => values.push(value),
+            Tok::Num(value) => {
+                values.push(value);
+                expect_operand = false;
+            }
             Tok::Ident(name) => {
                 // A bare name is a variable; digits alone are not identifiers.
                 let value = env
@@ -2571,8 +2748,12 @@ fn eval_arithmetic_expr(
                     .and_then(|value| value.trim().parse::<i64>().ok())
                     .unwrap_or(0);
                 values.push(value);
+                expect_operand = false;
             }
-            Tok::LParen => ops.push(token),
+            Tok::LParen => {
+                ops.push(token);
+                expect_operand = true;
+            }
             Tok::RParen => {
                 while let Some(op) = ops.pop() {
                     if op == Tok::LParen {
@@ -2580,8 +2761,23 @@ fn eval_arithmetic_expr(
                     }
                     apply_op(&mut values, op)?;
                 }
+                expect_operand = false;
             }
             Tok::Plus | Tok::Minus | Tok::Mul | Tok::Div | Tok::Mod => {
+                if expect_operand {
+                    // A unary sign binds tighter than any pending binary
+                    // operator, so it is pushed without reducing first:
+                    // `2 - -3` is `2 - (0 - 3)`, not `(2 - 0) - 3`.
+                    match token {
+                        Tok::Plus | Tok::Minus => {
+                            values.push(0);
+                            ops.push(token);
+                            continue;
+                        }
+                        // `* 3` / `/ 3` with no left operand is a syntax error.
+                        _ => return Err(()),
+                    }
+                }
                 while let Some(&op) = ops.last() {
                     if op == Tok::LParen || precedence(op) < precedence(token) {
                         break;
@@ -2590,6 +2786,7 @@ fn eval_arithmetic_expr(
                     apply_op(&mut values, op)?;
                 }
                 ops.push(token);
+                expect_operand = true;
             }
         }
     }
@@ -3435,7 +3632,10 @@ impl Bash {
         self.link_positionals(args);
         let saved_return = self.return_signal.take();
         self.function_depth += 1;
+        self.local_scopes.push(Vec::new());
         let (stdout, stderr, exit_code) = self.exec_statement_list(body);
+        let scope = self.local_scopes.pop().unwrap_or_default();
+        self.restore_scope(scope);
         self.function_depth -= 1;
         let returned = self.return_signal.take();
         self.return_signal = saved_return;
@@ -3589,30 +3789,56 @@ impl Bash {
     // ── Arrays ───────────────────────────────────────────────────────────────
 
     fn exec_array_assign(&mut self, assign: &ArrayAssign) -> (String, String, i32) {
-        let mut elements: Vec<(Option<usize>, String)> = Vec::new();
+        // Each element keeps its raw subscript text: an associative array uses
+        // that text as a key, an indexed array evaluates it as an index.
+        let mut elements: Vec<(Option<String>, String)> = Vec::new();
         for word in &assign.items {
             let fields = self.expand_word_list(word);
             for field in fields {
-                // `[k]=value` gives an explicit index.
+                // `[k]=value` gives an explicit subscript.
                 if !word.quoted
                     && field.starts_with('[')
                     && let Some(close) = field.find("]=")
                 {
-                    let index = self.array_index(&field[1..close]).unwrap_or(0);
-                    elements.push((Some(index), field[close + 2..].to_string()));
+                    elements.push((
+                        Some(field[1..close].to_string()),
+                        field[close + 2..].to_string(),
+                    ));
                 } else {
                     elements.push((None, field));
                 }
             }
         }
 
+        // `declare -A a; a=([k]=v …)` fills an associative array.
+        if self.assoc_arrays.contains_key(&assign.name) {
+            if !assign.append {
+                self.assoc_arrays
+                    .insert(assign.name.clone(), BTreeMap::new());
+            }
+            for (subscript, value) in elements {
+                let key = match subscript {
+                    // `a=([k]=v)` keys by the literal text, and the subscript
+                    // may itself contain expansions.
+                    Some(subscript) => self.expand_text(&subscript),
+                    // A bare element contributes its own value as the key.
+                    None => value.clone(),
+                };
+                self.assoc_arrays
+                    .entry(assign.name.clone())
+                    .or_default()
+                    .insert(key, value);
+            }
+            return (String::new(), String::new(), 0);
+        }
         if !assign.append {
             self.arrays.remove(&assign.name);
         }
         let mut values = self.arrays.get(&assign.name).cloned().unwrap_or_default();
-        for (index, value) in elements {
-            match index {
-                Some(index) => {
+        for (subscript, value) in elements {
+            match subscript {
+                Some(subscript) => {
+                    let index = self.array_index(&subscript).unwrap_or(0);
                     if index >= values.len() {
                         values.resize(index + 1, String::new());
                     }
@@ -3631,8 +3857,25 @@ impl Bash {
         usize::try_from(value).ok()
     }
 
-    /// `a[3]=value` (an indexed assignment written as an ordinary word).
+    /// An indexed subscript is an arithmetic expression, so `${a[i]}` and
+    /// `${a[i+1]}` resolve through the environment like `$(( … ))` does.
+    fn array_subscript_index(&self, subscript: &str) -> Option<usize> {
+        let value = eval_arithmetic_expr(subscript, &self.env, &self.positionals).ok()?;
+        usize::try_from(value).ok()
+    }
+
+    /// `a[3]=value` (an indexed assignment written as an ordinary word), or
+    /// `a[key]=value` when the target is an associative array.
     fn assign_element(&mut self, name: &str, subscript: &str, value: &str) {
+        if self.assoc_arrays.contains_key(name) {
+            // The subscript may still contain expansions inside `${a[$k]}`.
+            let key = self.expand_text(subscript);
+            self.assoc_arrays
+                .entry(name.to_string())
+                .or_default()
+                .insert(key, value.to_string());
+            return;
+        }
         let index = self.array_index(subscript).unwrap_or(0);
         let mut values = self.arrays.get(name).cloned().unwrap_or_default();
         if index >= values.len() {
@@ -3642,11 +3885,298 @@ impl Bash {
         self.arrays.insert(name.to_string(), values);
     }
 
+    /// Values of an array in expansion order: insertion order for indexed
+    /// arrays, sorted key order for associative ones (deterministic).
+    fn array_values_in_order(&self, name: &str) -> Vec<String> {
+        if let Some(map) = self.assoc_arrays.get(name) {
+            return map.values().cloned().collect();
+        }
+        self.arrays.get(name).cloned().unwrap_or_default()
+    }
+
+    fn eval_int(&mut self, expression: &str) -> Option<i64> {
+        let mut text = expression.trim();
+        // A slice offset may arrive wrapped in an arithmetic expansion, as in
+        // `${v:$((1+1)):2}`; unwrap any nesting before evaluating.
+        while let Some(inner) = text
+            .strip_prefix("$((")
+            .and_then(|rest| rest.strip_suffix("))"))
+        {
+            text = inner.trim();
+        }
+        if text.is_empty() {
+            return Some(0);
+        }
+        eval_arithmetic_expr(text, &self.env, &self.positionals).ok()
+    }
+
+    /// `(start, end)` for a `${p:off:len}` slice over `length` items.
+    ///
+    /// A negative offset counts from the end and clamps at 0; a missing or
+    /// empty length runs to the end; a non-positive length yields an empty
+    /// range, all matching bash.
+    fn slice_bounds(&mut self, spec: &str, length: usize) -> Option<(usize, usize)> {
+        let (offset_text, length_text) = split_slice_spec(spec);
+        let offset = self.eval_int(offset_text)?;
+        let start = if offset < 0 {
+            (length as i64 + offset).max(0) as usize
+        } else {
+            (offset as usize).min(length)
+        };
+        let end = match length_text {
+            None => length,
+            Some(text) if text.trim().is_empty() => length,
+            Some(text) => {
+                let requested = self.eval_int(text)?;
+                if requested <= 0 {
+                    start
+                } else {
+                    start.saturating_add(requested as usize).min(length)
+                }
+            }
+        };
+        Some((start, end))
+    }
+
+    fn slice_text(&mut self, text: &str, spec: &str) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        match self.slice_bounds(spec, chars.len()) {
+            Some((start, end)) => chars[start..end].iter().collect(),
+            None => {
+                self.param_error = Some(format!("bash: {spec}: syntax error in expression\n"));
+                String::new()
+            }
+        }
+    }
+
+    /// `${p:off:len}` in a scalar context.
+    fn expand_slice(&mut self, parameter: &str, spec: &str) -> String {
+        // `${@:off:len}` / `${*:off:len}` slice the positional parameters.
+        if parameter == "@" || parameter == "*" {
+            let parameters = self.positional_parameters();
+            let bound = self.slice_bounds(spec, parameters.len());
+            return match bound {
+                Some((start, end)) => parameters[start..end].join(" "),
+                None => {
+                    self.param_error = Some(format!("bash: {spec}: syntax error in expression\n"));
+                    String::new()
+                }
+            };
+        }
+        if let Some((name, subscript)) = split_array_subscript(parameter)
+            && (subscript == "@" || subscript == "*")
+        {
+            let items = self.array_values_in_order(name);
+            return match self.slice_bounds(spec, items.len()) {
+                Some((start, end)) => items[start..end].join(" "),
+                None => {
+                    self.param_error = Some(format!("bash: {spec}: syntax error in expression\n"));
+                    String::new()
+                }
+            };
+        }
+        let value = match self.parameter_value(parameter) {
+            Some(value) => value,
+            None => {
+                if self.opt_nounset {
+                    self.nounset_error = Some(parameter.to_string());
+                }
+                return String::new();
+            }
+        };
+        self.slice_text(&value, spec)
+    }
+
+    // ── declare / local / typeset ───────────────────────────────────────────
+
+    fn record_local(&mut self, entry: ScopedVar) {
+        if let Some(scope) = self.local_scopes.last_mut() {
+            scope.push(entry);
+        }
+    }
+
+    /// Restore a function's `local` declarations, innermost first.
+    fn restore_scope(&mut self, scope: Vec<ScopedVar>) {
+        for entry in scope.into_iter().rev() {
+            match entry {
+                ScopedVar::Scalar { name, previous } => match previous {
+                    Some(value) => {
+                        self.env.insert(name, value);
+                    }
+                    None => {
+                        self.env.remove(&name);
+                    }
+                },
+                ScopedVar::Indexed { name, previous } => match previous {
+                    Some(values) => {
+                        self.assoc_arrays.remove(&name);
+                        self.arrays.insert(name, values);
+                    }
+                    None => {
+                        self.arrays.remove(&name);
+                    }
+                },
+                ScopedVar::Associative { name, previous } => match previous {
+                    Some(map) => {
+                        self.arrays.remove(&name);
+                        self.assoc_arrays.insert(name, map);
+                    }
+                    None => {
+                        self.assoc_arrays.remove(&name);
+                    }
+                },
+            }
+        }
+    }
+
+    fn declare_assoc(&mut self, name: &str, local: bool) {
+        if local {
+            self.record_local(ScopedVar::Associative {
+                name: name.to_string(),
+                previous: self.assoc_arrays.get(name).cloned(),
+            });
+        }
+        self.arrays.remove(name);
+        self.assoc_arrays.entry(name.to_string()).or_default();
+    }
+
+    fn declare_indexed(&mut self, name: &str, local: bool) {
+        if local {
+            self.record_local(ScopedVar::Indexed {
+                name: name.to_string(),
+                previous: self.arrays.get(name).cloned(),
+            });
+        }
+        self.assoc_arrays.remove(name);
+        self.arrays.entry(name.to_string()).or_default();
+    }
+
+    fn declare_scalar(&mut self, name: &str, local: bool) {
+        if local {
+            self.record_local(ScopedVar::Scalar {
+                name: name.to_string(),
+                previous: self.env.get(name).cloned(),
+            });
+        }
+    }
+
+    /// `declare`/`typeset`/`local`: `-A` associative, `-a` indexed, otherwise a
+    /// scalar (or an element assignment).
+    fn run_declare(&mut self, command: &str, args: &[String], stderr: &mut String) -> i32 {
+        if command == "local" && self.function_depth == 0 {
+            stderr.push_str("bash: local: can only be used in a function\n");
+            return 1;
+        }
+        // `declare`/`typeset` inside a function are function-local unless `-g`
+        // is given, exactly like `local`.
+        let force_global = args.iter().any(|arg| arg == "-g");
+        let local = command == "local" || (self.function_depth > 0 && !force_global);
+        let literal = self.pending_array.take();
+        let mut associative = false;
+        let mut indexed = false;
+        let mut exit_code = 0;
+        for arg in args {
+            match arg.as_str() {
+                "-A" => {
+                    associative = true;
+                    continue;
+                }
+                "-a" => {
+                    indexed = true;
+                    continue;
+                }
+                // Accepted for compatibility; this runtime has no readonly or
+                // integer attributes to attach. `-g` is handled above.
+                "-r" | "-x" | "-i" | "-g" | "--" => continue,
+                other if other.starts_with('-') && other.len() > 1 => {
+                    stderr.push_str(&format!(
+                        "bash: {command}: {}: invalid option\n",
+                        other.trim_start_matches('-')
+                    ));
+                    exit_code = 1;
+                    continue;
+                }
+                _ => {}
+            }
+
+            let (declaration, value) = match arg.split_once('=') {
+                Some((name, value)) => (name, Some(value.to_string())),
+                None => (arg.as_str(), None),
+            };
+            let (name, subscript) = match split_array_subscript(declaration) {
+                Some((name, subscript)) => (name.to_string(), Some(subscript.to_string())),
+                None => (declaration.to_string(), None),
+            };
+            if !is_shell_name(&name) {
+                stderr.push_str(&format!(
+                    "bash: {command}: `{arg}': not a valid identifier\n"
+                ));
+                exit_code = 1;
+                continue;
+            }
+
+            if associative {
+                self.declare_assoc(&name, local);
+                if let (Some(subscript), Some(value)) = (&subscript, &value) {
+                    self.assoc_arrays
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(subscript.clone(), value.clone());
+                }
+                continue;
+            }
+            if indexed {
+                self.declare_indexed(&name, local);
+                match (&subscript, &value) {
+                    (Some(subscript), Some(value)) => self.assign_element(&name, subscript, value),
+                    (None, Some(value)) => {
+                        self.arrays.insert(name.clone(), vec![value.clone()]);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            self.declare_scalar(&name, local);
+            if let Some(value) = value {
+                match subscript {
+                    Some(subscript) => self.assign_element(&name, &subscript, &value),
+                    None => {
+                        self.env.insert(name, value);
+                    }
+                }
+            }
+        }
+
+        // `declare -A m=( … )` / `local -a a=( … )` carry the literal that the
+        // command line attached.
+        if let Some(assign) = literal {
+            if !is_shell_name(&assign.name) {
+                stderr.push_str(&format!(
+                    "bash: {command}: `{}=(': not a valid identifier\n",
+                    assign.name
+                ));
+                return 1;
+            }
+            if associative {
+                self.declare_assoc(&assign.name, local);
+            } else {
+                // Without `-A`, a literal creates an indexed array.
+                self.declare_indexed(&assign.name, local);
+            }
+            self.exec_array_assign(&assign);
+        }
+        exit_code
+    }
+
     /// `${!name}` indirect expansion and `${!a[@]}` index listing.
     fn expand_indirect(&mut self, content: &str) -> String {
         if let Some((name, subscript)) = split_array_subscript(content)
             && (subscript == "@" || subscript == "*")
         {
+            // Associative arrays list their keys; indexed arrays list indices.
+            if let Some(map) = self.assoc_arrays.get(name) {
+                return map.keys().cloned().collect::<Vec<_>>().join(" ");
+            }
             let indices: Vec<String> = self
                 .arrays
                 .get(name)
@@ -3690,12 +4220,55 @@ impl Bash {
                 .strip_prefix("${")
                 .and_then(|rest| rest.strip_suffix('}'))
             {
+                // `${!a[@]}` lists keys (associative) or indices (indexed) as
+                // separate fields.
+                if let Some(indirect) = inner.strip_prefix('!')
+                    && let Some((name, subscript)) = split_array_subscript(indirect)
+                    && (subscript == "@" || subscript == "*")
+                {
+                    if let Some(map) = self.assoc_arrays.get(name) {
+                        return map.keys().cloned().collect();
+                    }
+                    return self
+                        .arrays
+                        .get(name)
+                        .map(|elements| {
+                            (0..elements.len()).map(|index| index.to_string()).collect()
+                        })
+                        .unwrap_or_default();
+                }
+                // `${a[@]:off:len}` slices the array in list context.
+                if let Some((base, spec)) = inner.split_once("]:")
+                    && let Some((name, subscript)) = split_array_subscript(&format!("{base}]"))
+                    && (subscript == "@" || subscript == "*")
+                {
+                    let items = self.array_values_in_order(name);
+                    let Some((start, end)) = self.slice_bounds(spec, items.len()) else {
+                        self.param_error =
+                            Some(format!("bash: {spec}: syntax error in expression\n"));
+                        return Vec::new();
+                    };
+                    let sliced = items[start..end].to_vec();
+                    if quoted {
+                        return sliced;
+                    }
+                    return sliced
+                        .into_iter()
+                        .flat_map(|element| self.glob_fields(&element))
+                        .collect();
+                }
                 if let Some((name, subscript)) = split_array_subscript(inner)
                     && (subscript == "@" || subscript == "*")
                 {
-                    let elements = self.arrays.get(name).cloned().unwrap_or_default();
+                    let elements = self.array_values_in_order(name);
                     if quoted {
-                        return elements;
+                        // `"${a[*]}"` is one joined field; `"${a[@]}"` keeps one
+                        // field per element.
+                        return if subscript == "*" {
+                            vec![elements.join(" ")]
+                        } else {
+                            elements
+                        };
                     }
                     return elements
                         .into_iter()
@@ -3705,7 +4278,11 @@ impl Bash {
                 if inner == "@" || inner == "*" {
                     let parameters = self.positional_parameters();
                     if quoted {
-                        return parameters;
+                        return if inner == "*" {
+                            vec![parameters.join(" ")]
+                        } else {
+                            parameters
+                        };
                     }
                     return parameters
                         .into_iter()
@@ -4286,6 +4863,23 @@ impl Bash {
             None => self.jobs.last().map(|job| job.status).unwrap_or(0),
         }
     }
+}
+
+/// Split a `${p:off:len}` spec at its top-level `:`, ignoring colons nested in
+/// parentheses or brackets (`${v:$((1+1)):2}`, `${a[i:j]:1}`).
+fn split_slice_spec(spec: &str) -> (&str, Option<&str>) {
+    let mut depth = 0i32;
+    for (index, ch) in spec.char_indices() {
+        match ch {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ':' if depth == 0 => {
+                return (&spec[..index], Some(&spec[index + 1..]));
+            }
+            _ => {}
+        }
+    }
+    (spec, None)
 }
 
 /// Expand a `tr` set: `a-z` ranges plus the usual backslash escapes.
@@ -6824,5 +7418,405 @@ mod feature_slice_tests {
     fn tr_understands_backslash_escapes() {
         // Every newline is translated, including the final one.
         assert_eq!(out("printf 'a\\nb\\n' | tr '\\n' ' '\n"), "a b ");
+    }
+}
+
+/// Tests for associative arrays, parameter/array slicing, `declare`/`local`
+/// and `shift`.
+#[cfg(test)]
+mod array_and_declare_tests {
+    use super::*;
+
+    fn run(script: &str) -> ExecResult {
+        Bash::new(Options::default())
+            .expect("initialize")
+            .exec(script)
+    }
+
+    fn out(script: &str) -> String {
+        let result = run(script);
+        assert_eq!(
+            result.stderr, "",
+            "unexpected stderr for {script:?}: {}",
+            result.stderr
+        );
+        result.stdout
+    }
+
+    // ── Associative arrays ──────────────────────────────────────────────────
+
+    #[test]
+    fn declare_a_creates_an_associative_array() {
+        assert_eq!(
+            out("declare -A m; m[foo]=bar; m[baz]=qux; echo ${m[foo]} ${#m[@]} ${!m[@]}\n"),
+            "bar 2 baz foo\n"
+        );
+    }
+
+    #[test]
+    fn associative_literal_keeps_string_keys() {
+        assert_eq!(
+            out("declare -A m=([a]=1 [b]=2); echo ${m[a]}${m[b]}\n"),
+            "12\n"
+        );
+        assert_eq!(out("declare -A m=([alpha]=x); echo ${m[alpha]}\n"), "x\n");
+    }
+
+    #[test]
+    fn associative_keys_are_not_evaluated_as_arithmetic() {
+        // `key` is a literal here, not a variable that evaluates to 0.
+        assert_eq!(
+            out("declare -A m; k=1; m[key]=v; echo ${m[key]}; echo ${#m[@]}\n"),
+            "v\n1\n"
+        );
+    }
+
+    #[test]
+    fn associative_expansions_inside_subscripts() {
+        assert_eq!(
+            out("declare -A m; k=name; m[$k]=value; echo ${m[name]}\n"),
+            "value\n"
+        );
+        assert_eq!(out("declare -A m=([a]=1); key=a; echo ${m[$key]}\n"), "1\n");
+    }
+
+    #[test]
+    fn associative_values_and_keys_lists() {
+        assert_eq!(out("declare -A m=([x]=1 [y]=2); echo ${m[@]}\n"), "1 2\n");
+        assert_eq!(
+            out("declare -A m=([x]=1 [y]=2); for k in \"${!m[@]}\"; do echo \"[$k]\"; done\n"),
+            "[x]\n[y]\n"
+        );
+    }
+
+    #[test]
+    fn associative_unset_removes_one_key() {
+        assert_eq!(
+            out("declare -A m=([a]=1 [b]=2); unset \"m[a]\"; echo ${#m[@]} ${!m[@]}\n"),
+            "1 b\n"
+        );
+    }
+
+    #[test]
+    fn bare_associative_name_reads_key_zero() {
+        assert_eq!(out("declare -A m=([0]=zero [k]=v); echo ${m}\n"), "zero\n");
+    }
+
+    #[test]
+    fn associative_arrays_are_isolated_between_exec_calls() {
+        let mut bash = Bash::new(Options::default()).expect("initialize");
+        bash.exec("declare -A m=([a]=1)");
+        assert_eq!(bash.exec("echo ${#m[@]}").stdout, "0\n");
+    }
+
+    // ── Indexed arrays keep working ─────────────────────────────────────────
+
+    #[test]
+    fn indexed_literals_and_slices() {
+        assert_eq!(out("a=(1 2 3 4 5); echo ${a[@]:1:2}\n"), "2 3\n");
+        assert_eq!(out("a=(1 2 3 4 5); echo ${a[@]: -2}\n"), "4 5\n");
+        assert_eq!(out("a=(1 2 3); echo ${a[@]:1}\n"), "2 3\n");
+        assert_eq!(out("a=(1 2 3); echo ${a[@]:5}\n"), "\n");
+    }
+
+    #[test]
+    fn indexing_assigns_beyond_the_end() {
+        assert_eq!(
+            out("declare -a a=([2]=x); echo ${#a[@]} ${a[2]}\n"),
+            "3 x\n"
+        );
+    }
+
+    #[test]
+    fn quoted_star_joins_and_at_splits() {
+        assert_eq!(
+            out("a=(p q r); printf \"[%s]\" \"${a[*]}\"; echo\n"),
+            "[p q r]\n"
+        );
+        assert_eq!(
+            out("a=(p q r); printf \"[%s]\" \"${a[@]}\"; echo\n"),
+            "[p][q][r]\n"
+        );
+        assert_eq!(out("set -- m n; printf \"[%s]\" \"$*\"; echo\n"), "[m n]\n");
+        assert_eq!(
+            out("set -- m n; printf \"[%s]\" \"$@\"; echo\n"),
+            "[m][n]\n"
+        );
+    }
+
+    // ── `${v:off:len}` slicing ─────────────────────────────────────────────
+
+    #[test]
+    fn string_slices() {
+        assert_eq!(out("v=abcdef; echo ${v:2}\n"), "cdef\n");
+        assert_eq!(out("v=abcdef; echo ${v:1:3}\n"), "bcd\n");
+        assert_eq!(out("v=abcdef; echo ${v: -2}\n"), "ef\n");
+        assert_eq!(out("v=abcdef; echo ${v: -4:2}\n"), "cd\n");
+        assert_eq!(out("v=abcdef; echo \"${v: 1:2}\"\n"), "bc\n");
+        assert_eq!(out("v=abcdef; echo ${v:10}\n"), "\n");
+    }
+
+    #[test]
+    fn positional_slices() {
+        assert_eq!(out("set -- a b c d; echo ${@:2:2}\n"), "c d\n");
+        assert_eq!(out("set -- a b c d; echo ${@: -2}\n"), "c d\n");
+    }
+
+    #[test]
+    fn slices_use_arithmetic_offsets() {
+        assert_eq!(out("v=abcdef; i=1; n=2; echo ${v:i:n}\n"), "bc\n");
+        assert_eq!(out("v=abcdef; echo ${v:1+1:2+1}\n"), "cde\n");
+    }
+
+    #[test]
+    fn parameter_operators_are_not_slices() {
+        assert_eq!(out("unset u; echo ${u:-fallback}\n"), "fallback\n");
+        assert_eq!(
+            out("unset u; echo ${u:=assigned}; echo $u\n"),
+            "assigned\nassigned\n"
+        );
+        assert_eq!(out("v=set; echo ${v:-x}\n"), "set\n");
+        assert_eq!(out("unset u; echo ${u:+alt}\n"), "\n");
+    }
+
+    #[test]
+    fn expansions_with_spaces_or_operators_inside_braces() {
+        // The whole `${ … }` is one lexical unit, so the space is literal.
+        assert_eq!(out("unset u; echo \"${u:-a b}\"\n"), "a b\n");
+        assert_eq!(out("v=xyz; echo ${v:-a|b}\n"), "xyz\n");
+        assert_eq!(out("v=abcdef; echo \"${v: -2}\"\n"), "ef\n");
+    }
+
+    // ── declare / local ────────────────────────────────────────────────────
+
+    #[test]
+    fn local_shadows_and_restores_a_variable() {
+        assert_eq!(
+            out("v=outer; f() { local v=inner; echo $v; }; f; echo $v\n"),
+            "inner\nouter\n"
+        );
+    }
+
+    #[test]
+    fn declare_inside_a_function_is_local() {
+        assert_eq!(
+            out("v=outer; f() { declare v=inner; echo $v; }; f; echo $v\n"),
+            "inner\nouter\n"
+        );
+        assert_eq!(
+            out(
+                "declare -A m=([k]=out); f() { declare -A m=([k]=in); echo ${m[k]}; }; f; echo ${m[k]}\n"
+            ),
+            "in\nout\n"
+        );
+    }
+
+    #[test]
+    fn declare_dash_g_sets_a_global() {
+        assert_eq!(out("f() { declare -g g=set; }; f; echo $g\n"), "set\n");
+    }
+
+    #[test]
+    fn local_arrays_are_restored() {
+        assert_eq!(
+            out("a=(global); f() { local -a a=(1 2 3); echo ${#a[@]}; }; f; echo ${a[0]}\n"),
+            "3\nglobal\n"
+        );
+    }
+
+    #[test]
+    fn local_outside_a_function_is_an_error() {
+        let result = run("local x=1\n");
+        assert_eq!(result.exit_code, 1);
+        assert!(
+            result.stderr.contains("can only be used in a function"),
+            "{}",
+            result.stderr
+        );
+    }
+
+    #[test]
+    fn declare_rejects_an_invalid_identifier() {
+        let result = run("declare 1bad=2\n");
+        assert_eq!(result.exit_code, 1);
+        assert!(
+            result.stderr.contains("not a valid identifier"),
+            "{}",
+            result.stderr
+        );
+    }
+
+    #[test]
+    fn nested_functions_share_dynamic_scope() {
+        // An inner function sees (and may change) the caller's local.
+        assert_eq!(
+            out("g() { local x=1; h; echo $x; }; h() { x=2; }; g\n"),
+            "2\n"
+        );
+    }
+
+    // ── Array literals attached to a command ───────────────────────────────
+
+    #[test]
+    fn array_literal_attached_to_declare() {
+        assert_eq!(out("declare -a a=(x y); echo ${a[1]}\n"), "y\n");
+        assert_eq!(out("declare -A m=([k]=v); echo ${m[k]}\n"), "v\n");
+        assert_eq!(
+            out("f() { local -A m=([k]=in); echo ${m[k]}; }; f\n"),
+            "in\n"
+        );
+    }
+
+    #[test]
+    fn array_literal_on_a_non_declaration_is_a_syntax_error() {
+        let result = run("echo a=(1 2)\n");
+        assert_eq!(result.exit_code, 2);
+        assert!(result.stderr.contains("syntax error"), "{}", result.stderr);
+    }
+
+    // ── shift ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn shift_drops_leading_positionals() {
+        assert_eq!(out("set -- a b c; shift; echo $@\n"), "b c\n");
+        assert_eq!(out("set -- a b c; shift 2; echo $@\n"), "c\n");
+        assert_eq!(out("set -- a b c; shift 3; echo \"[$*]\"\n"), "[]\n");
+    }
+
+    #[test]
+    fn shift_past_the_end_reports_failure() {
+        let result = run("set -- a; shift 5; echo $?\n");
+        assert_eq!(result.stdout, "1\n");
+        // The positional parameters are unchanged.
+        assert_eq!(out("set -- a; shift 5; echo $1\n"), "a\n");
+    }
+
+    #[test]
+    fn shift_rejects_a_non_numeric_count() {
+        let result = run("set -- a; shift x\n");
+        assert_eq!(result.exit_code, 1);
+        assert!(
+            result.stderr.contains("numeric argument required"),
+            "{}",
+            result.stderr
+        );
+    }
+
+    // ── Unary sign in arithmetic ───────────────────────────────────────────
+
+    #[test]
+    fn arithmetic_accepts_unary_sign() {
+        assert_eq!(out("echo $(( -5 + 2 ))\n"), "-3\n");
+        assert_eq!(out("x=3; echo $(( -x ))\n"), "-3\n");
+        assert_eq!(out("echo $(( 2 - -3 ))\n"), "5\n");
+        assert_eq!(out("echo $(( (-2) * 3 ))\n"), "-6\n");
+    }
+}
+
+/// Edge cases for the feature slice: nested expansions, mixed array kinds and
+/// interactions between the new syntax and existing behavior.
+#[cfg(test)]
+mod feature_edge_tests {
+    use super::*;
+
+    fn run(script: &str) -> ExecResult {
+        Bash::new(Options::default())
+            .expect("initialize")
+            .exec(script)
+    }
+
+    fn out(script: &str) -> String {
+        let result = run(script);
+        assert_eq!(
+            result.stderr, "",
+            "unexpected stderr for {script:?}: {}",
+            result.stderr
+        );
+        result.stdout
+    }
+
+    #[test]
+    fn nested_expansions_in_subscripts_and_slices() {
+        assert_eq!(
+            out("declare -A m=([a]=1 [b]=2); k=b; echo ${m[${k}]}\n"),
+            "2\n"
+        );
+        assert_eq!(out("v=abcdef; echo ${v:$((1+1)):2}\n"), "cd\n");
+        assert_eq!(out("a=(1 2 3); i=1; echo ${a[i]}\n"), "2\n");
+    }
+
+    #[test]
+    fn associative_and_indexed_arrays_can_coexist() {
+        assert_eq!(
+            out("a=(x y); declare -A m=([k]=v); echo ${a[1]} ${m[k]} ${#a[@]} ${#m[@]}\n"),
+            "y v 2 1\n"
+        );
+    }
+
+    #[test]
+    fn declaring_associative_replaces_an_indexed_array() {
+        assert_eq!(
+            out("a=(1 2 3); declare -A a; a[k]=v; echo ${#a[@]} ${a[k]}\n"),
+            "1 v\n"
+        );
+    }
+
+    #[test]
+    fn local_scope_survives_early_return() {
+        assert_eq!(
+            out("v=outer; f() { local v=inner; return 3; }; f; echo $? $v\n"),
+            "3 outer\n"
+        );
+    }
+
+    #[test]
+    fn slices_do_not_disturb_set_u() {
+        // `set -u` must not fire for a slice of an unset variable's default.
+        assert_eq!(out("set -u\nv=abc; echo ${v:1}\n"), "bc\n");
+        let result = run("set -u\nunset v\necho ${v:1}\n");
+        assert_eq!(result.exit_code, 1);
+        assert!(
+            result.stderr.contains("unbound variable"),
+            "{}",
+            result.stderr
+        );
+    }
+
+    #[test]
+    fn declare_without_arguments_lists_nothing_and_succeeds() {
+        assert_eq!(out("declare; echo ok\n"), "ok\n");
+        assert_eq!(out("declare -A; echo ok\n"), "ok\n");
+    }
+
+    #[test]
+    fn shift_inside_a_function_only_affects_the_call() {
+        assert_eq!(
+            out("set -- outer; f() { shift; echo \"[$*]\"; }; f a b c; echo $1\n"),
+            "[b c]\nouter\n"
+        );
+    }
+
+    #[test]
+    fn unset_of_an_indexed_element_removes_it() {
+        assert_eq!(
+            out("a=(x y z); unset 'a[1]'; echo ${#a[@]} ${a[@]}\n"),
+            "2 x z\n"
+        );
+    }
+
+    #[test]
+    fn arithmetic_unary_inside_conditionals_and_slices() {
+        assert_eq!(out("i=-2; echo $(( i ))\n"), "-2\n");
+        assert_eq!(out("v=abcdef; echo ${v:(-2)}\n"), "ef\n");
+    }
+
+    #[test]
+    fn assoc_values_expand_in_loops() {
+        assert_eq!(
+            out(
+                "declare -A m=([a]=1 [b]=2); total=0; for v in \"${m[@]}\"; do total=$(( total + v )); done; echo $total\n"
+            ),
+            "3\n"
+        );
     }
 }
