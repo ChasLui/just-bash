@@ -16,6 +16,16 @@ public API and the CLI. Together they provide:
 - an offline-by-default `curl` with an injectable response table,
 - a native `just-bash-rs` CLI for running snippets from argv or stdin.
 
+### Byte-exact output
+
+The output pipeline preserves raw bytes end to end, so non-UTF-8 / high-byte
+data survives command output, pipes, redirections and the in-memory filesystem.
+`ExecResult.stdout` and `ExecResult.stderr` are now `Vec<u8>`; use the lossy
+`stdout_text()` / `stderr_text()` helpers when you need a `String`. This is a
+breaking change in **v4.0.0**. Note that pure text filters (`awk`, `jq`, `sed`,
+`grep`, `sort`, …) still decode their input as UTF-8 at their boundary, so bytes
+flowing *through* them degrade to U+FFFD.
+
 Upstream sync status: [`UPSTREAM_SYNC.md`](./UPSTREAM_SYNC.md) records the
 upstream fork point, the ported slice, and what is not yet ported.
 

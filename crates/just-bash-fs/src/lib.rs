@@ -32,7 +32,8 @@ pub const EPOCH_SECONDS: i64 = 1_700_000_000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FsEntry {
     File {
-        contents: String,
+        /// Raw file contents, stored as bytes so non-UTF-8 data round-trips.
+        contents: Vec<u8>,
         mode: u32,
         mtime: i64,
     },
@@ -155,9 +156,9 @@ impl InMemoryFs {
         self.clock
     }
 
-    pub fn read_file(&self, path: &str) -> Result<&str, Error> {
+    pub fn read_file(&self, path: &str) -> Result<&[u8], Error> {
         match self.entries.get(path) {
-            Some(FsEntry::File { contents, .. }) => Ok(contents),
+            Some(FsEntry::File { contents, .. }) => Ok(contents.as_slice()),
             Some(FsEntry::Directory { .. }) => {
                 Err(Error::FileSystem(format!("{path}: Is a directory")))
             }
@@ -167,7 +168,13 @@ impl InMemoryFs {
         }
     }
 
-    pub fn write_file(&mut self, path: &str, contents: &str) -> Result<(), Error> {
+    /// Lossy UTF-8 view of a file's contents, for callers that want text.
+    pub fn read_file_str(&self, path: &str) -> Result<String, Error> {
+        self.read_file(path)
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    pub fn write_file<P: AsRef<[u8]>>(&mut self, path: &str, contents: P) -> Result<(), Error> {
         let normalized = normalize_absolute(path);
         self.ensure_parent_dir(&normalized)?;
         let stamp = self.tick();
@@ -183,7 +190,7 @@ impl InMemoryFs {
         self.entries.insert(
             normalized,
             FsEntry::File {
-                contents: contents.to_string(),
+                contents: contents.as_ref().to_vec(),
                 mode,
                 mtime: stamp,
             },
@@ -191,16 +198,16 @@ impl InMemoryFs {
         Ok(())
     }
 
-    pub fn append_file(&mut self, path: &str, contents: &str) -> Result<(), Error> {
+    pub fn append_file<P: AsRef<[u8]>>(&mut self, path: &str, contents: P) -> Result<(), Error> {
         let normalized = normalize_absolute(path);
         let mut next = match self.entries.get(&normalized) {
             Some(FsEntry::File { contents, .. }) => contents.clone(),
             Some(FsEntry::Directory { .. }) => {
                 return Err(Error::FileSystem(format!("{normalized}: Is a directory")));
             }
-            None => String::new(),
+            None => Vec::new(),
         };
-        next.push_str(contents);
+        next.extend_from_slice(contents.as_ref());
         self.write_file(&normalized, &next)
     }
 
@@ -410,7 +417,8 @@ impl InMemoryFs {
 
     /// Returns all entries under `path` (inclusive of the dir itself) as
     /// `(absolute_path, Option<contents>)` where `None` means a directory.
-    pub fn entries_under(&self, path: &str) -> Result<Vec<(String, Option<String>)>, Error> {
+    #[allow(clippy::type_complexity)]
+    pub fn entries_under(&self, path: &str) -> Result<Vec<(String, Option<Vec<u8>>)>, Error> {
         let normalized = normalize_absolute(path);
         if !self.is_dir(&normalized) {
             return Err(Error::FileSystem(format!("{normalized}: Not a directory")));
@@ -503,7 +511,7 @@ mod tests {
         let mut fs = InMemoryFs::new();
         for (path, contents) in entries {
             fs.create_dir_all(&parent_dir(path)).unwrap();
-            fs.write_file(path, contents).unwrap();
+            fs.write_file(path, *contents).unwrap();
         }
         fs
     }

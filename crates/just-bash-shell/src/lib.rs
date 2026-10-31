@@ -14,10 +14,26 @@ use just_bash_parser::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecResult {
-    pub stdout: String,
-    pub stderr: String,
+    /// Raw standard output bytes. Byte-oriented commands (`printf`, `cat`,
+    /// `od`, `xxd`, …) preserve non-UTF-8 data here; use [`ExecResult::stdout_text`]
+    /// for a lossy UTF-8 view.
+    pub stdout: Vec<u8>,
+    /// Raw standard error bytes (see [`ExecResult::stderr_text`]).
+    pub stderr: Vec<u8>,
     pub exit_code: i32,
     pub cwd: String,
+}
+
+impl ExecResult {
+    /// Lossy UTF-8 rendering of [`ExecResult::stdout`].
+    pub fn stdout_text(&self) -> String {
+        String::from_utf8_lossy(&self.stdout).into_owned()
+    }
+
+    /// Lossy UTF-8 rendering of [`ExecResult::stderr`].
+    pub fn stderr_text(&self) -> String {
+        String::from_utf8_lossy(&self.stderr).into_owned()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,7 +195,7 @@ pub struct Bash {
     line_budget: Option<usize>,
     /// Seed for the next pipeline's standard input (process substitution and
     /// `exec_script_with_stdin`).
-    seed_stdin: Option<String>,
+    seed_stdin: Option<Vec<u8>>,
     /// Standard input of the compound command currently executing, shared by
     /// every command inside it (`{ …; } < f`, `while …; done < f`).
     compound_stdin: Option<StdinBuffer>,
@@ -228,8 +244,8 @@ struct JobRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommandOutput {
-    stdout: String,
-    stderr: String,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
     exit_code: i32,
 }
 
@@ -253,36 +269,36 @@ enum Sink {
 /// line per iteration instead of re-reading the whole buffer.
 #[derive(Debug, Clone)]
 struct StdinBuffer {
-    data: String,
+    data: Vec<u8>,
     pos: usize,
 }
 
 impl StdinBuffer {
-    fn new(data: String) -> Self {
+    fn new(data: Vec<u8>) -> Self {
         Self { data, pos: 0 }
     }
 
     /// Take the remainder and mark the buffer consumed.
-    fn take_remaining(&mut self) -> String {
-        let rest = self.data[self.pos..].to_string();
+    fn take_remaining(&mut self) -> Vec<u8> {
+        let rest = self.data[self.pos..].to_vec();
         self.pos = self.data.len();
         rest
     }
 
     /// Take one line without its newline; `None` at end of input.
-    fn next_line(&mut self) -> Option<String> {
+    fn next_line(&mut self) -> Option<Vec<u8>> {
         if self.pos >= self.data.len() {
             return None;
         }
         let rest = &self.data[self.pos..];
-        match rest.find('\n') {
+        match rest.iter().position(|byte| *byte == b'\n') {
             Some(index) => {
-                let line = rest[..index].to_string();
+                let line = rest[..index].to_vec();
                 self.pos += index + 1;
                 Some(line)
             }
             None => {
-                let line = rest.to_string();
+                let line = rest.to_vec();
                 self.pos = self.data.len();
                 Some(line)
             }
@@ -378,11 +394,12 @@ impl Bash {
     pub fn exec(&mut self, script: &str) -> ExecResult {
         if script.len() > self.execution_limits.max_script_size_bytes {
             return ExecResult {
-                stdout: String::new(),
+                stdout: Vec::new(),
                 stderr: format!(
                     "bash: script exceeds limit ({} bytes)\n",
                     self.execution_limits.max_script_size_bytes
-                ),
+                )
+                .into_bytes(),
                 exit_code: 2,
                 cwd: if self.isolate_exec {
                     self.initial_cwd.clone()
@@ -463,8 +480,8 @@ impl Bash {
                 // appended to this script's result.
                 if let Some(body) = self.trap_exit.take() {
                     let trap_result = self.exec_in_current_state(&body);
-                    result.stdout.push_str(&trap_result.stdout);
-                    result.stderr.push_str(&trap_result.stderr);
+                    result.stdout.extend_from_slice(&trap_result.stdout);
+                    result.stderr.extend_from_slice(&trap_result.stderr);
                 }
                 result
             }
@@ -476,8 +493,8 @@ impl Bash {
                     .unwrap_or_else(|| "panic".to_string());
                 self.reset_transient_state();
                 ExecResult {
-                    stdout: String::new(),
-                    stderr: format!("bash: internal error: {detail}\n"),
+                    stdout: Vec::new(),
+                    stderr: format!("bash: internal error: {detail}\n").into_bytes(),
                     exit_code: 2,
                     cwd: self.cwd.clone(),
                 }
@@ -516,8 +533,8 @@ impl Bash {
             Ok(parsed) => parsed,
             Err(error) => {
                 return ExecResult {
-                    stdout: String::new(),
-                    stderr: format!("bash: {error}\n"),
+                    stdout: Vec::new(),
+                    stderr: format!("bash: {error}\n").into_bytes(),
                     exit_code: 2,
                     cwd: self.cwd.clone(),
                 };
@@ -532,18 +549,19 @@ impl Bash {
 
         if command_count > self.execution_limits.max_command_count {
             return ExecResult {
-                stdout: String::new(),
+                stdout: Vec::new(),
                 stderr: format!(
                     "bash: command count exceeds limit ({})\n",
                     self.execution_limits.max_command_count
-                ),
+                )
+                .into_bytes(),
                 exit_code: 2,
                 cwd: self.cwd.clone(),
             };
         }
 
-        let mut stdout = String::new();
-        let mut stderr = String::new();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
         let mut exit_code = 0;
 
         for statement in parsed.statements {
@@ -564,8 +582,8 @@ impl Bash {
             let exec_result = self.exec_statement(&statement);
             if self.exec_replaced {
                 // `exec cmd` replaced the shell, so nothing after it runs.
-                stdout.push_str(&exec_result.0);
-                stderr.push_str(&exec_result.1);
+                stdout.extend_from_slice(&exec_result.0);
+                stderr.extend_from_slice(&exec_result.1);
                 return ExecResult {
                     stdout,
                     stderr,
@@ -573,8 +591,8 @@ impl Bash {
                     cwd: self.cwd.clone(),
                 };
             }
-            stdout.push_str(&exec_result.0);
-            stderr.push_str(&exec_result.1);
+            stdout.extend_from_slice(&exec_result.0);
+            stderr.extend_from_slice(&exec_result.1);
             exit_code = exec_result.2;
 
             if self.check_output_limit(&mut stderr).is_err() {
@@ -697,7 +715,7 @@ impl Bash {
         }
     }
 
-    fn exec_statement(&mut self, statement: &Statement) -> (String, String, i32) {
+    fn exec_statement(&mut self, statement: &Statement) -> (Vec<u8>, Vec<u8>, i32) {
         if statement.background {
             return self.exec_background(statement);
         }
@@ -716,7 +734,7 @@ impl Bash {
     ///
     /// Used by `eval` and `source`: both must see and modify the caller's
     /// variables and functions, unlike `$( … )` or a subshell.
-    fn exec_script_text(&mut self, script: &str) -> (String, String, i32) {
+    fn exec_script_text(&mut self, script: &str) -> (Vec<u8>, Vec<u8>, i32) {
         let parsed = match parse_script_with_limits(
             script,
             ParseLimits {
@@ -727,13 +745,13 @@ impl Bash {
             },
         ) {
             Ok(parsed) => parsed,
-            Err(error) => return (String::new(), format!("bash: {error}\n"), 2),
+            Err(error) => return (Vec::new(), format!("bash: {error}\n").into_bytes(), 2),
         };
         self.exec_statement_list(&parsed.statements)
     }
 
     /// Execute a statement body; `&` and `!` are handled by the caller.
-    fn exec_statement_inner(&mut self, statement: &Statement) -> (String, String, i32) {
+    fn exec_statement_inner(&mut self, statement: &Statement) -> (Vec<u8>, Vec<u8>, i32) {
         let result = match &statement.kind {
             StatementKind::Pipeline(commands) => self.exec_pipeline(commands),
             StatementKind::If(if_stmt) => self.exec_if(if_stmt),
@@ -768,13 +786,13 @@ impl Bash {
     /// shared by every command inside it.
     /// `(( expression ))`: evaluate for its side effects. The exit status is 1
     /// when the value is zero, 0 otherwise, and 2 on a syntax error.
-    fn exec_arithmetic_command(&mut self, expression: &str) -> (String, String, i32) {
+    fn exec_arithmetic_command(&mut self, expression: &str) -> (Vec<u8>, Vec<u8>, i32) {
         let mut env = std::mem::take(&mut self.env);
         let result = eval_arithmetic_expr(expression, &mut env, &self.positionals);
         self.env = env;
         match result {
-            Ok(value) => (String::new(), String::new(), i32::from(value == 0)),
-            Err(message) => (String::new(), format!("bash: {message}\n"), 2),
+            Ok(value) => (Vec::new(), Vec::new(), i32::from(value == 0)),
+            Err(message) => (Vec::new(), format!("bash: {message}\n").into_bytes(), 2),
         }
     }
 
@@ -782,11 +800,11 @@ impl Bash {
         &mut self,
         inner: &StatementKind,
         redirects: &[Redirect],
-    ) -> (String, String, i32) {
-        let mut stdin_text = String::new();
+    ) -> (Vec<u8>, Vec<u8>, i32) {
+        let mut stdin_text = Vec::new();
         let (fd1, fd2) = match self.apply_redirects(redirects, &mut stdin_text) {
             Ok(sinks) => sinks,
-            Err(message) => return (String::new(), message, 1),
+            Err(message) => return (Vec::new(), message.into_bytes(), 1),
         };
 
         // A compound's stdin is a shared cursor, so `read` inside a loop
@@ -812,15 +830,17 @@ impl Bash {
             exit_code,
         };
         if let Err(error) = self.deliver(&mut result, &fd1, &fd2) {
-            result.stderr.push_str(&format!("bash: {error}\n"));
+            result
+                .stderr
+                .extend_from_slice(format!("bash: {error}\n").as_bytes());
             result.exit_code = 1;
         }
         (result.stdout, result.stderr, result.exit_code)
     }
 
-    fn exec_pipeline(&mut self, commands: &[CommandInvocation]) -> (String, String, i32) {
+    fn exec_pipeline(&mut self, commands: &[CommandInvocation]) -> (Vec<u8>, Vec<u8>, i32) {
         // Standard input may be seeded by process substitution.
-        let mut stdin = match self.seed_stdin.take() {
+        let mut stdin: Vec<u8> = match self.seed_stdin.take() {
             Some(seeded) => seeded,
             // Inside `{ …; } < f` / `while …; done < f` the whole compound
             // shares one stdin cursor. `read` pulls a single line so a loop
@@ -832,8 +852,11 @@ impl Bash {
                 // must not let `echo` drain the buffer.
                 Some(buffer) => match first_command_name(commands).as_deref() {
                     Some("read") => match buffer.next_line() {
-                        Some(line) => format!("{line}\n"),
-                        None => String::new(),
+                        Some(mut line) => {
+                            line.push(b'\n');
+                            line
+                        }
+                        None => Vec::new(),
                     },
                     Some(name) if command_reads_stdin(name) => buffer.take_remaining(),
                     // A compound stage has no command name of its own; its
@@ -845,13 +868,13 @@ impl Bash {
                     {
                         buffer.take_remaining()
                     }
-                    _ => String::new(),
+                    _ => Vec::new(),
                 },
-                None => String::new(),
+                None => Vec::new(),
             },
         };
-        let mut stdout = String::new();
-        let mut stderr = String::new();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
         let mut exit_code = 0;
         // For pipefail: track all non-zero exit codes in the pipeline
         let mut pipeline_last_failure: i32 = 0;
@@ -902,7 +925,7 @@ impl Bash {
             };
             self.line_budget = None;
 
-            stderr.push_str(&result.stderr);
+            stderr.extend_from_slice(&result.stderr);
             exit_code = result.exit_code;
             statuses.push(result.exit_code);
             if is_pipeline && result.exit_code != 0 {
@@ -910,7 +933,7 @@ impl Bash {
             }
 
             if is_last {
-                stdout.push_str(&result.stdout);
+                stdout.extend_from_slice(&result.stdout);
             } else {
                 stdin = result.stdout;
             }
@@ -939,7 +962,7 @@ impl Bash {
         (stdout, stderr, exit_code)
     }
 
-    fn exec_if(&mut self, if_stmt: &IfStatement) -> (String, String, i32) {
+    fn exec_if(&mut self, if_stmt: &IfStatement) -> (Vec<u8>, Vec<u8>, i32) {
         let (_, _, cond_exit) = self.exec_statement_list(&if_stmt.condition);
         if cond_exit == 0 {
             return self.exec_statement_list(&if_stmt.body);
@@ -955,29 +978,32 @@ impl Bash {
         if let Some(else_body) = &if_stmt.else_body {
             self.exec_statement_list(else_body)
         } else {
-            (String::new(), String::new(), 0)
+            (Vec::new(), Vec::new(), 0)
         }
     }
 
-    fn exec_while(&mut self, while_stmt: &WhileStatement) -> (String, String, i32) {
-        let mut stdout = String::new();
-        let mut stderr = String::new();
+    fn exec_while(&mut self, while_stmt: &WhileStatement) -> (Vec<u8>, Vec<u8>, i32) {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
         let mut exit_code = 0;
 
         loop {
             self.loop_iteration_count += 1;
             if self.loop_iteration_count > self.execution_limits.max_loop_iterations {
-                stderr.push_str(&format!(
-                    "bash: loop iteration limit exceeded ({})\n",
-                    self.execution_limits.max_loop_iterations
-                ));
+                stderr.extend_from_slice(
+                    format!(
+                        "bash: loop iteration limit exceeded ({})\n",
+                        self.execution_limits.max_loop_iterations
+                    )
+                    .as_bytes(),
+                );
                 return (stdout, stderr, 2);
             }
 
             let (cond_stdout, cond_stderr, cond_exit) =
                 self.exec_statement_list(&while_stmt.condition);
-            stdout.push_str(&cond_stdout);
-            stderr.push_str(&cond_stderr);
+            stdout.extend_from_slice(&cond_stdout);
+            stderr.extend_from_slice(&cond_stderr);
 
             // A break/continue in the condition targets this loop.
             match self.loop_directive() {
@@ -1006,8 +1032,8 @@ impl Bash {
             }
 
             let (body_stdout, body_stderr, body_exit) = self.exec_statement_list(&while_stmt.body);
-            stdout.push_str(&body_stdout);
-            stderr.push_str(&body_stderr);
+            stdout.extend_from_slice(&body_stdout);
+            stderr.extend_from_slice(&body_stderr);
             exit_code = body_exit;
 
             self.output_bytes_used += body_stdout.len() + body_stderr.len();
@@ -1034,9 +1060,9 @@ impl Bash {
         (stdout, stderr, exit_code)
     }
 
-    fn exec_for(&mut self, for_stmt: &ForStatement) -> (String, String, i32) {
-        let mut stdout = String::new();
-        let mut stderr = String::new();
+    fn exec_for(&mut self, for_stmt: &ForStatement) -> (Vec<u8>, Vec<u8>, i32) {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
         let mut exit_code = 0;
 
         let items: Vec<String> = if for_stmt.items.is_empty() {
@@ -1052,18 +1078,21 @@ impl Bash {
         for item in items {
             self.loop_iteration_count += 1;
             if self.loop_iteration_count > self.execution_limits.max_loop_iterations {
-                stderr.push_str(&format!(
-                    "bash: loop iteration limit exceeded ({})\n",
-                    self.execution_limits.max_loop_iterations
-                ));
+                stderr.extend_from_slice(
+                    format!(
+                        "bash: loop iteration limit exceeded ({})\n",
+                        self.execution_limits.max_loop_iterations
+                    )
+                    .as_bytes(),
+                );
                 return (stdout, stderr, 2);
             }
 
             self.env.insert(for_stmt.var.clone(), item);
 
             let (body_stdout, body_stderr, body_exit) = self.exec_statement_list(&for_stmt.body);
-            stdout.push_str(&body_stdout);
-            stderr.push_str(&body_stderr);
+            stdout.extend_from_slice(&body_stdout);
+            stderr.extend_from_slice(&body_stderr);
             exit_code = body_exit;
 
             self.output_bytes_used += body_stdout.len() + body_stderr.len();
@@ -1119,9 +1148,9 @@ impl Bash {
         self.last_exit_code = 0;
     }
 
-    fn exec_statement_list(&mut self, statements: &[Statement]) -> (String, String, i32) {
-        let mut stdout = String::new();
-        let mut stderr = String::new();
+    fn exec_statement_list(&mut self, statements: &[Statement]) -> (Vec<u8>, Vec<u8>, i32) {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
         let mut exit_code = 0;
 
         // `set -n`: parse and expand, but never execute.
@@ -1140,8 +1169,8 @@ impl Bash {
             }
 
             let (stmt_stdout, stmt_stderr, code) = self.exec_statement(statement);
-            stdout.push_str(&stmt_stdout);
-            stderr.push_str(&stmt_stderr);
+            stdout.extend_from_slice(&stmt_stdout);
+            stderr.extend_from_slice(&stmt_stderr);
             exit_code = code;
 
             self.output_bytes_used += stmt_stdout.len() + stmt_stderr.len();
@@ -1159,12 +1188,15 @@ impl Bash {
         (stdout, stderr, exit_code)
     }
 
-    fn check_output_limit(&mut self, stderr: &mut String) -> Result<(), ()> {
+    fn check_output_limit(&mut self, stderr: &mut Vec<u8>) -> Result<(), ()> {
         if self.output_bytes_used > self.execution_limits.max_output_bytes {
-            stderr.push_str(&format!(
-                "bash: output exceeds limit ({} bytes)\n",
-                self.execution_limits.max_output_bytes
-            ));
+            stderr.extend_from_slice(
+                format!(
+                    "bash: output exceeds limit ({} bytes)\n",
+                    self.execution_limits.max_output_bytes
+                )
+                .as_bytes(),
+            );
             Err(())
         } else {
             Ok(())
@@ -1182,7 +1214,7 @@ impl Bash {
     fn apply_redirects(
         &mut self,
         redirects: &[Redirect],
-        stdin: &mut String,
+        stdin: &mut Vec<u8>,
     ) -> Result<(Sink, Sink), String> {
         // Each descriptor points at a sink; `2>&1` makes fd 2 share fd 1's sink
         // (a duplicate descriptor), while two redirects to the same path are
@@ -1203,7 +1235,7 @@ impl Bash {
                         continue;
                     }
                     match self.fs.read_file(&target) {
-                        Ok(contents) => *stdin = contents.to_string(),
+                        Ok(contents) => *stdin = contents.to_vec(),
                         Err(error) => {
                             return Err(format!("bash: {error}\n"));
                         }
@@ -1289,16 +1321,16 @@ impl Bash {
                 // `<<<word`: the expanded word plus a newline becomes stdin.
                 RedirectMode::HereString => {
                     let word = redirect.target.clone();
-                    *stdin = format!("{}\n", self.expand_word(&word));
+                    *stdin = format!("{}\n", self.expand_word(&word)).into_bytes();
                 }
                 // `<<DELIM`: the collected body becomes stdin; a quoted
                 // delimiter suppresses expansion.
                 RedirectMode::Heredoc { .. } => {
                     if let RedirectMode::Heredoc { body, expand } = &redirect.mode {
                         *stdin = if *expand {
-                            self.expand_heredoc(body)
+                            self.expand_heredoc(body).into_bytes()
                         } else {
-                            body.clone()
+                            body.clone().into_bytes()
                         };
                     }
                 }
@@ -1354,9 +1386,9 @@ impl Bash {
     fn run_invocation(
         &mut self,
         command: &CommandInvocation,
-        pipeline_stdin: &str,
+        pipeline_stdin: &[u8],
     ) -> CommandOutput {
-        let mut stdin = pipeline_stdin.to_string();
+        let mut stdin = pipeline_stdin.to_vec();
         self.expansion_stderr.clear();
         self.expansion_failed = false;
 
@@ -1364,8 +1396,8 @@ impl Bash {
             Ok(sinks) => sinks,
             Err(message) => {
                 return CommandOutput {
-                    stdout: String::new(),
-                    stderr: message,
+                    stdout: Vec::new(),
+                    stderr: message.into_bytes(),
                     exit_code: 1,
                 };
             }
@@ -1418,10 +1450,10 @@ impl Bash {
         if self.expansion_failed {
             self.expansion_failed = false;
             self.cleanup_procsubs();
-            let mut stderr = expansion_stderr;
-            stderr.push_str("bash: command substitution failed\n");
+            let mut stderr = expansion_stderr.into_bytes();
+            stderr.extend_from_slice(b"bash: command substitution failed\n");
             return CommandOutput {
-                stdout: String::new(),
+                stdout: Vec::new(),
                 stderr,
                 exit_code: 2,
             };
@@ -1431,8 +1463,9 @@ impl Bash {
         if let Some(ref varname) = self.nounset_error.take() {
             self.cleanup_procsubs();
             return CommandOutput {
-                stdout: String::new(),
-                stderr: format!("{expansion_stderr}bash: {varname}: unbound variable\n"),
+                stdout: Vec::new(),
+                stderr: format!("{expansion_stderr}bash: {varname}: unbound variable\n")
+                    .into_bytes(),
                 exit_code: 1,
             };
         }
@@ -1440,8 +1473,8 @@ impl Bash {
         if let Some(message) = self.param_error.take() {
             self.cleanup_procsubs();
             return CommandOutput {
-                stdout: String::new(),
-                stderr: format!("{expansion_stderr}{message}"),
+                stdout: Vec::new(),
+                stderr: format!("{expansion_stderr}{message}").into_bytes(),
                 exit_code: 1,
             };
         }
@@ -1481,8 +1514,8 @@ impl Bash {
             if self.readonly_names.contains(name) {
                 // bash reports the attempt and leaves the value alone.
                 return CommandOutput {
-                    stdout: String::new(),
-                    stderr: format!("bash: {name}: readonly variable\n"),
+                    stdout: Vec::new(),
+                    stderr: format!("bash: {name}: readonly variable\n").into_bytes(),
                     exit_code: 1,
                 };
             }
@@ -1502,8 +1535,8 @@ impl Bash {
                     self.persistent_fds.insert(2, fd2.clone());
                 }
                 return CommandOutput {
-                    stdout: String::new(),
-                    stderr: String::new(),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
                     exit_code: 0,
                 };
             }
@@ -1533,11 +1566,15 @@ impl Bash {
             }
         }
         if !expansion_stderr.is_empty() {
-            result.stderr = format!("{expansion_stderr}{}", result.stderr);
+            let mut combined = expansion_stderr.into_bytes();
+            combined.extend_from_slice(&result.stderr);
+            result.stderr = combined;
         }
         // Deliver both streams exactly once, after the whole redirect list.
         if let Err(error) = self.deliver(&mut result, &fd1, &fd2) {
-            result.stderr.push_str(&format!("bash: {error}\n"));
+            result
+                .stderr
+                .extend_from_slice(format!("bash: {error}\n").as_bytes());
             result.exit_code = 1;
         }
 
@@ -1552,7 +1589,7 @@ impl Bash {
         if self.pending_array.take().is_some() {
             result
                 .stderr
-                .push_str("bash: syntax error near unexpected token `('\n");
+                .extend_from_slice(b"bash: syntax error near unexpected token `('\n");
             result.exit_code = 2;
         }
 
@@ -1572,26 +1609,27 @@ impl Bash {
         if fd1 == fd2
             && let Sink::File { path, append } = fd1
         {
-            let combined = format!("{stdout}{stderr}");
+            let mut combined = stdout;
+            combined.extend_from_slice(&stderr);
             return self.write_sink(path, *append, &combined);
         }
 
         match fd1 {
-            Sink::Stdout => result.stdout.push_str(&stdout),
-            Sink::Stderr => result.stderr.push_str(&stdout),
+            Sink::Stdout => result.stdout.extend_from_slice(&stdout),
+            Sink::Stderr => result.stderr.extend_from_slice(&stdout),
             Sink::Discard => {}
             Sink::File { path, append } => self.write_sink(path, *append, &stdout)?,
         }
         match fd2 {
-            Sink::Stderr => result.stderr.push_str(&stderr),
-            Sink::Stdout => result.stdout.push_str(&stderr),
+            Sink::Stderr => result.stderr.extend_from_slice(&stderr),
+            Sink::Stdout => result.stdout.extend_from_slice(&stderr),
             Sink::Discard => {}
             Sink::File { path, append } => self.write_sink(path, *append, &stderr)?,
         }
         Ok(())
     }
 
-    fn write_sink(&mut self, path: &str, append: bool, contents: &str) -> Result<(), Error> {
+    fn write_sink(&mut self, path: &str, append: bool, contents: &[u8]) -> Result<(), Error> {
         if append {
             self.fs.append_file(path, contents)
         } else {
@@ -1606,10 +1644,18 @@ impl Bash {
         self.resolve_path(&expanded)
     }
 
-    fn run_command(&mut self, words: &[String], stdin: &str) -> CommandOutput {
+    fn run_command(&mut self, words: &[String], stdin_bytes: &[u8]) -> CommandOutput {
+        // Text-oriented builtins read standard input as a lossy UTF-8 string;
+        // byte-oriented builtins use `stdin_bytes` directly.
+        let stdin_owned = String::from_utf8_lossy(stdin_bytes);
+        let stdin: &str = &stdin_owned;
         let mut stdout = String::new();
         let mut stderr = String::new();
         let mut exit_code = 0;
+        // Byte-exact output path: byte-oriented builtins (`printf`, `cat`,
+        // `head -c`, `xxd`, `base64 -d`, `tee`, …) store raw bytes here instead
+        // of pushing text into `stdout`, so non-UTF-8 data survives intact.
+        let mut raw_stdout: Option<Vec<u8>> = None;
         if words.is_empty() {
             // `m=( … )` with no command word is an array assignment.
             if let Some(assign) = self.pending_array.take() {
@@ -1621,8 +1667,8 @@ impl Bash {
                 };
             }
             return CommandOutput {
-                stdout,
-                stderr,
+                stdout: stdout.into_bytes(),
+                stderr: stderr.into_bytes(),
                 exit_code,
             };
         }
@@ -1639,8 +1685,8 @@ impl Bash {
                 }
             }
             return CommandOutput {
-                stdout,
-                stderr,
+                stdout: stdout.into_bytes(),
+                stderr: stderr.into_bytes(),
                 exit_code,
             };
         }
@@ -1707,7 +1753,9 @@ impl Bash {
             }
             "printf" => {
                 if let Some(format) = args.first() {
-                    stdout.push_str(&format_printf(format, &args[1..]));
+                    raw_stdout = Some(format_printf(format, &args[1..]));
+                } else {
+                    raw_stdout = Some(Vec::new());
                 }
             }
             "pwd" => {
@@ -1740,18 +1788,18 @@ impl Bash {
                     }
                 };
                 if exit_code == 0 {
-                    let mut input = String::new();
+                    let mut input: Vec<u8> = Vec::new();
                     if operands.is_empty() {
-                        input.push_str(stdin);
+                        input.extend_from_slice(stdin_bytes);
                     }
                     for arg in &operands {
                         // `-` is standard input, positioned where it appears.
                         if arg == "-" {
-                            input.push_str(stdin);
+                            input.extend_from_slice(stdin_bytes);
                             continue;
                         }
-                        match self.read_operand(arg) {
-                            Ok(contents) => input.push_str(&contents),
+                        match self.read_operand_bytes(arg) {
+                            Ok(contents) => input.extend_from_slice(&contents),
                             Err(error) => {
                                 stderr.push_str(&format!("cat: {error}\n"));
                                 exit_code = 1;
@@ -1759,9 +1807,9 @@ impl Bash {
                         }
                     }
                     if options.is_plain() {
-                        stdout.push_str(&input);
+                        raw_stdout = Some(input);
                     } else {
-                        stdout.push_str(&apply_cat_options(input.as_bytes(), &options));
+                        raw_stdout = Some(apply_cat_options(&input, &options).into_bytes());
                     }
                 }
             }
@@ -1837,15 +1885,13 @@ impl Bash {
                             bytes = true;
                         }
                         let files = parsed.operands;
-                        let mut texts: Vec<(String, String)> = Vec::new();
+                        let mut texts: Vec<(String, Vec<u8>)> = Vec::new();
                         if files.is_empty() {
-                            texts.push((String::new(), stdin.to_string()));
+                            texts.push((String::new(), stdin_bytes.to_vec()));
                         } else {
                             for name in &files {
                                 match self.fs.read_file(&self.resolve_path(name)) {
-                                    Ok(contents) => {
-                                        texts.push((name.clone(), contents.to_string()))
-                                    }
+                                    Ok(contents) => texts.push((name.clone(), contents.to_vec())),
                                     Err(error) => {
                                         stderr.push_str(&format!("wc: {error}\n"));
                                         exit_code = 1;
@@ -1861,11 +1907,12 @@ impl Bash {
                             let from_stdin = files.is_empty();
                             let mut rows: Vec<([usize; 5], String)> = Vec::new();
                             let mut total = [0usize; 5];
-                            for (name, text) in &texts {
+                            for (name, raw) in &texts {
+                                let text = String::from_utf8_lossy(raw);
                                 let counts = [
-                                    text.bytes().filter(|byte| *byte == b'\n').count(),
+                                    raw.iter().filter(|byte| **byte == b'\n').count(),
                                     text.split_whitespace().count(),
-                                    text.len(),
+                                    raw.len(),
                                     text.chars().count(),
                                     text.lines()
                                         .map(|line| line.chars().count())
@@ -1954,19 +2001,20 @@ impl Bash {
                         // Each file's header is emitted immediately before its
                         // own content, with a blank line between files, exactly
                         // as GNU head/tail do.
-                        let sources: Vec<(String, Option<String>)> = if files.is_empty() {
-                            vec![(String::new(), Some(stdin.to_string()))]
+                        let sources: Vec<(String, Option<Vec<u8>>)> = if files.is_empty() {
+                            vec![(String::new(), Some(stdin_bytes.to_vec()))]
                         } else {
                             files
                                 .iter()
                                 .map(|name| {
                                     // `/dev/zero` is bounded by the downstream
                                     // budget, so `head -c 5 /dev/zero` terminates.
-                                    (name.clone(), self.read_operand(name).ok())
+                                    (name.clone(), self.read_operand_bytes(name).ok())
                                 })
                                 .collect()
                         };
                         let multiple = sources.len() > 1;
+                        let mut out: Vec<u8> = Vec::new();
                         for (index, (name, text)) in sources.iter().enumerate() {
                             let Some(text) = text else {
                                 stderr.push_str(&format!(
@@ -1977,12 +2025,13 @@ impl Bash {
                             };
                             if multiple {
                                 if index > 0 {
-                                    stdout.push('\n');
+                                    out.push(b'\n');
                                 }
-                                stdout.push_str(&format!("==> {name} <==\n"));
+                                out.extend_from_slice(format!("==> {name} <==\n").as_bytes());
                             }
-                            stdout.push_str(&head_or_tail(text, &options));
+                            out.extend_from_slice(&head_or_tail_bytes(text, &options));
                         }
+                        raw_stdout = Some(out);
                     }
                 }
             }
@@ -2297,7 +2346,7 @@ impl Bash {
             "touch" => {
                 for arg in args {
                     let path = self.resolve_path(arg);
-                    let existing = self.fs.read_file(&path).unwrap_or("").to_string();
+                    let existing = self.fs.read_file(&path).unwrap_or(&[]).to_vec();
                     if let Err(error) = self.fs.write_file(&path, &existing) {
                         stderr.push_str(&format!("touch: {error}\n"));
                         exit_code = 1;
@@ -2311,7 +2360,7 @@ impl Bash {
                 } else {
                     let source = self.resolve_path(&args[0]);
                     let dest = self.resolve_path(&args[1]);
-                    match self.fs.read_file(&source).map(str::to_string) {
+                    match self.fs.read_file(&source).map(|bytes| bytes.to_vec()) {
                         Ok(contents) => {
                             if let Err(error) = self.fs.write_file(&dest, &contents) {
                                 stderr.push_str(&format!("cp: {error}\n"));
@@ -2431,7 +2480,7 @@ impl Bash {
                     let source = self.resolve_path(&args[0]);
                     let dest = self.resolve_path(&args[1]);
                     if self.fs.is_file(&source) {
-                        match self.fs.read_file(&source).map(str::to_string) {
+                        match self.fs.read_file(&source).map(|bytes| bytes.to_vec()) {
                             Ok(contents) => {
                                 if let Err(error) = self.fs.write_file(&dest, &contents) {
                                     stderr.push_str(&format!("mv: {error}\n"));
@@ -2666,7 +2715,7 @@ impl Bash {
                 let outcome = just_bash_sed::run(args, stdin, &|path: &str| {
                     self.fs
                         .read_file(&self.resolve_path(path))
-                        .map(str::to_string)
+                        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
                         .ok()
                 });
                 stdout.push_str(&outcome.stdout);
@@ -2680,7 +2729,7 @@ impl Bash {
                 let reader = |path: &str| {
                     self.fs
                         .read_file(&self.resolve_path(path))
-                        .map(str::to_string)
+                        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
                         .ok()
                 };
                 let outcome = just_bash_awk::run(args, stdin, &reader);
@@ -2692,7 +2741,7 @@ impl Bash {
                 let reader = |path: &str| {
                     self.fs
                         .read_file(&self.resolve_path(path))
-                        .map(str::to_string)
+                        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
                         .ok()
                 };
                 let outcome = just_bash_jq::run(args, stdin, &reader);
@@ -2940,16 +2989,14 @@ impl Bash {
                                     let is_dir = contents.is_none();
                                     members.push(just_bash_tar::Entry {
                                         path: format!("{base}/{relative}"),
-                                        data: contents
-                                            .map(|body| body.into_bytes())
-                                            .unwrap_or_default(),
+                                        data: contents.unwrap_or_default(),
                                         is_dir,
                                     });
                                 }
                             } else if let Ok(contents) = self.fs.read_file(&resolved) {
                                 members.push(just_bash_tar::Entry {
                                     path: operand.trim_start_matches('/').to_string(),
-                                    data: contents.as_bytes().to_vec(),
+                                    data: contents.to_vec(),
                                     is_dir: false,
                                 });
                             } else {
@@ -2965,10 +3012,9 @@ impl Bash {
                             } else {
                                 just_bash_tar::archive(&members)
                             };
-                            // Archives are binary; the filesystem holds strings, so
-                            // bytes are encoded losslessly as Latin-1 characters.
-                            let text = just_bash_tar::encode_bytes(&bytes);
-                            if let Err(fs_error) = self.fs.write_file(&archive_path, &text) {
+                            // Archives are binary; the byte-oriented filesystem
+                            // stores them losslessly as-is.
+                            if let Err(fs_error) = self.fs.write_file(&archive_path, &bytes) {
                                 stderr.push_str(&format!("tar: {fs_error}\n"));
                                 exit_code = 2;
                             }
@@ -2980,7 +3026,7 @@ impl Bash {
                                 exit_code = 2;
                             }
                             Ok(contents) => {
-                                let raw = just_bash_tar::decode_bytes(contents);
+                                let raw = contents.to_vec();
                                 let bytes = if compress {
                                     match just_bash_tar::gunzip(&raw) {
                                         Ok(bytes) => bytes,
@@ -3153,7 +3199,9 @@ impl Bash {
                             let mut inputs: Vec<String> = Vec::new();
                             for name in &operands {
                                 match self.fs.read_file(&self.resolve_path(name)) {
-                                    Ok(contents) => inputs.push(contents.to_string()),
+                                    Ok(contents) => {
+                                        inputs.push(String::from_utf8_lossy(contents).into_owned())
+                                    }
                                     Err(error) => {
                                         stderr.push_str(&format!("join: {error}\n"));
                                         exit_code = 1;
@@ -3276,15 +3324,13 @@ impl Bash {
                             .value("bytes")
                             .and_then(|v| v.parse().ok())
                             .unwrap_or(4);
-                        match self.read_inputs_for_text_tool(
+                        match self.read_inputs_for_bytes_tool(
                             &parsed.operands,
-                            stdin,
+                            stdin_bytes,
                             "strings",
                             &mut stderr,
                         ) {
-                            Ok(input) => {
-                                stdout.push_str(&textutils::strings(input.as_bytes(), min))
-                            }
+                            Ok(input) => stdout.push_str(&textutils::strings(&input, min)),
                             Err(()) => exit_code = 1,
                         }
                     }
@@ -3337,7 +3383,9 @@ impl Bash {
                                     rows.join("\n")
                                 } else {
                                     match self.fs.read_file(&self.resolve_path(name)) {
-                                        Ok(contents) => contents.to_string(),
+                                        Ok(contents) => {
+                                            String::from_utf8_lossy(contents).into_owned()
+                                        }
                                         Err(error) => {
                                             stderr.push_str(&format!("paste: {error}\n"));
                                             exit_code = 1;
@@ -3444,8 +3492,8 @@ impl Bash {
                     self.source_depth += 1;
                     let (out, err, code) = self.exec_script_text(&script);
                     self.source_depth -= 1;
-                    stdout.push_str(&out);
-                    stderr.push_str(&err);
+                    stdout.push_str(&String::from_utf8_lossy(&out));
+                    stderr.push_str(&String::from_utf8_lossy(&err));
                     exit_code = code;
                 }
             }
@@ -3466,7 +3514,7 @@ impl Bash {
                     let resolved = self.resolve_path(path);
                     match self.fs.read_file(&resolved) {
                         Ok(contents) => {
-                            let script = contents.to_string();
+                            let script = String::from_utf8_lossy(contents).into_owned();
                             // Arguments after the file become the positional
                             // parameters for the duration of the source.
                             let saved = if args.len() > 1 {
@@ -3485,8 +3533,8 @@ impl Bash {
                             if let Some(saved) = saved {
                                 self.restore_positionals(saved);
                             }
-                            stdout.push_str(&out);
-                            stderr.push_str(&err);
+                            stdout.push_str(&String::from_utf8_lossy(&out));
+                            stderr.push_str(&String::from_utf8_lossy(&err));
                             exit_code = returned.unwrap_or(code);
                         }
                         Err(error) => {
@@ -3511,16 +3559,16 @@ impl Bash {
                 for file in files {
                     let path = self.resolve_path(&file);
                     let written = if append {
-                        self.fs.append_file(&path, stdin)
+                        self.fs.append_file(&path, stdin_bytes)
                     } else {
-                        self.fs.write_file(&path, stdin)
+                        self.fs.write_file(&path, stdin_bytes)
                     };
                     if let Err(error) = written {
                         stderr.push_str(&format!("tee: {error}\n"));
                         exit_code = 1;
                     }
                 }
-                stdout.push_str(stdin);
+                raw_stdout = Some(stdin_bytes.to_vec());
             }
             // `pushd [DIR]` / `popd` / `dirs [-v]` — the directory stack.
             "pushd" | "popd" | "dirs" => {
@@ -3535,8 +3583,8 @@ impl Bash {
                             stderr.push_str("pushd: no other directory\n");
                             exit_code = 1;
                             return CommandOutput {
-                                stdout,
-                                stderr,
+                                stdout: stdout.into_bytes(),
+                                stderr: stderr.into_bytes(),
                                 exit_code,
                             };
                         };
@@ -3743,9 +3791,14 @@ impl Bash {
                     operands.push(arg.clone());
                 }
                 if exit_code == 0 {
-                    match self.read_inputs_for_text_tool(&operands, stdin, "xxd", &mut stderr) {
+                    match self.read_inputs_for_bytes_tool(
+                        &operands,
+                        stdin_bytes,
+                        "xxd",
+                        &mut stderr,
+                    ) {
                         Ok(input) => {
-                            stdout.push_str(&textutils::xxd(input.as_bytes(), plain, reverse))
+                            raw_stdout = Some(textutils::xxd_bytes(&input, plain, reverse))
                         }
                         Err(()) => exit_code = 1,
                     }
@@ -3786,14 +3839,14 @@ impl Bash {
                             };
                             let name = name.trim_start_matches(' ');
                             let actual = match self.fs.read_file(&self.resolve_path(name)) {
-                                Ok(bytes) => bytes.to_string(),
+                                Ok(bytes) => bytes.to_vec(),
                                 Err(_) => {
                                     stdout.push_str(&format!("{name}: FAILED open or read\n"));
                                     had_failure = true;
                                     continue;
                                 }
                             };
-                            if algorithm.hex_digest(actual.as_bytes()) == expected.trim() {
+                            if algorithm.hex_digest(&actual) == expected.trim() {
                                 stdout.push_str(&format!("{name}: OK\n"));
                             } else {
                                 stdout.push_str(&format!("{name}: FAILED\n"));
@@ -3806,12 +3859,12 @@ impl Bash {
                     }
                 } else {
                     // No operand means standard input, which GNU labels `-`.
-                    let mut inputs: Vec<(String, String)> = Vec::new();
+                    let mut inputs: Vec<(String, Vec<u8>)> = Vec::new();
                     if operands.is_empty() {
-                        inputs.push(("-".to_string(), stdin.to_string()));
+                        inputs.push(("-".to_string(), stdin_bytes.to_vec()));
                     } else {
                         for operand in &operands {
-                            match self.read_operand(operand) {
+                            match self.read_operand_bytes(operand) {
                                 Ok(contents) => inputs.push((operand.clone(), contents)),
                                 Err(error) => {
                                     stderr.push_str(&format!("{program}: {error}\n"));
@@ -3821,7 +3874,7 @@ impl Bash {
                         }
                     }
                     for (name, contents) in inputs {
-                        let digest = algorithm.hex_digest(contents.as_bytes());
+                        let digest = algorithm.hex_digest(&contents);
                         stdout.push_str(&format!("{digest}  {name}\n"));
                     }
                 }
@@ -3838,13 +3891,15 @@ impl Bash {
                         other => operands.push(other.to_string()),
                     }
                 }
-                match self.read_inputs_for_text_tool(&operands, stdin, "base64", &mut stderr) {
+                match self.read_inputs_for_bytes_tool(&operands, stdin_bytes, "base64", &mut stderr)
+                {
                     Ok(input) => {
-                        let encoded = textutils::base64(&input, decode);
-                        stdout.push_str(&encoded);
-                        // Encoding always terminates with a newline.
-                        if !decode && !encoded.is_empty() {
-                            stdout.push('\n');
+                        if decode {
+                            raw_stdout = Some(textutils::base64_decode(&input));
+                        } else {
+                            let mut encoded = textutils::base64_encode(&input);
+                            encoded.push(b'\n');
+                            raw_stdout = Some(encoded);
                         }
                     }
                     Err(()) => exit_code = 1,
@@ -4204,9 +4259,9 @@ impl Bash {
                     exit_code = 0;
                 } else {
                     // Bypass the function lookup in `run_invocation`.
-                    let result = self.run_command(rest, stdin);
-                    stdout.push_str(&result.stdout);
-                    stderr.push_str(&result.stderr);
+                    let result = self.run_command(rest, stdin.as_bytes());
+                    stdout.push_str(&String::from_utf8_lossy(&result.stdout));
+                    stderr.push_str(&String::from_utf8_lossy(&result.stderr));
                     exit_code = result.exit_code;
                 }
             }
@@ -4256,10 +4311,11 @@ impl Bash {
             }
         }
 
-        self.output_bytes_used += stdout.len() + stderr.len();
+        self.output_bytes_used +=
+            stdout.len() + stderr.len() + raw_stdout.as_ref().map_or(0, |bytes| bytes.len());
         CommandOutput {
-            stdout,
-            stderr,
+            stdout: raw_stdout.unwrap_or_else(|| stdout.into_bytes()),
+            stderr: stderr.into_bytes(),
             exit_code,
         }
     }
@@ -4278,7 +4334,7 @@ impl Bash {
         }
         self.fs
             .read_file(&resolved)
-            .map(str::to_string)
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
             .map_err(|error| error.to_string())
     }
 
@@ -4294,9 +4350,57 @@ impl Bash {
             other => self
                 .fs
                 .read_file(other)
-                .map(str::to_string)
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
                 .map_err(|error| error.to_string()),
         }
+    }
+
+    /// Byte-exact operand read used by byte-oriented builtins (`cat`, `wc`,
+    /// `head`/`tail -c`, `xxd`, `md5sum`, `base64`, …).
+    fn read_operand_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        let resolved = self.resolve_path(path);
+        if resolved == "/dev/null" {
+            return Ok(Vec::new());
+        }
+        if resolved == "/dev/zero" {
+            let limit = self.line_budget.unwrap_or(64);
+            let budget = self.remaining_output_budget().min(1 << 20);
+            let count = limit.saturating_mul(8192).min(budget).min(1 << 20);
+            return Ok(vec![0u8; count]);
+        }
+        self.fs
+            .read_file(&resolved)
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Concatenate operands (`-` = standard input) as raw bytes.
+    fn read_inputs_for_bytes_tool(
+        &self,
+        args: &[String],
+        stdin: &[u8],
+        cmd: &str,
+        stderr: &mut String,
+    ) -> Result<Vec<u8>, ()> {
+        if args.is_empty() {
+            return Ok(stdin.to_vec());
+        }
+        let mut combined = Vec::new();
+        let mut had_error = false;
+        for arg in args {
+            if arg == "-" {
+                combined.extend_from_slice(stdin);
+                continue;
+            }
+            match self.read_operand_bytes(arg) {
+                Ok(contents) => combined.extend_from_slice(&contents),
+                Err(error) => {
+                    stderr.push_str(&format!("{cmd}: {error}\n"));
+                    had_error = true;
+                }
+            }
+        }
+        if had_error { Err(()) } else { Ok(combined) }
     }
 
     fn read_inputs_for_text_tool(
@@ -5037,14 +5141,17 @@ impl Bash {
         self.mktemp_counter = self.mktemp_counter.max(child.mktemp_counter);
         self.procsub_counter = self.procsub_counter.max(child.procsub_counter);
         if !result.stderr.is_empty() {
-            self.expansion_stderr.push_str(&result.stderr);
+            self.expansion_stderr
+                .push_str(&String::from_utf8_lossy(&result.stderr));
         }
         // A substitution that failed to parse cannot be recovered from: the
         // enclosing command must fail closed (upstream #348).
         if result.exit_code == 2 {
             self.expansion_failed = true;
         }
-        result.stdout.trim_end_matches('\n').to_string()
+        String::from_utf8_lossy(&result.stdout)
+            .trim_end_matches('\n')
+            .to_string()
     }
 
     fn expand_text(&mut self, text: &str) -> String {
@@ -5146,8 +5253,8 @@ impl Bash {
     }
 }
 
-fn format_printf(format: &str, args: &[String]) -> String {
-    let mut output = String::new();
+fn format_printf(format: &str, args: &[String]) -> Vec<u8> {
+    let mut output = Vec::new();
     let mut arg_index = 0;
     let repeats = if args.is_empty() { 1 } else { args.len() };
 
@@ -5162,37 +5269,39 @@ fn format_printf(format: &str, args: &[String]) -> String {
     output
 }
 
+/// Append one text character to the byte buffer as UTF-8.
+fn push_char_bytes(output: &mut Vec<u8>, ch: char) {
+    let mut buf = [0u8; 4];
+    output.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+}
+
 /// Append one raw byte to `output`.
 ///
 /// bash's `\xHH` / `\NNN` escapes produce a **byte**, not a code point, so
-/// `printf '\xff'` is one byte long. Pushing the value as a `char` would encode
-/// it as UTF-8 (two bytes), which is why this maps the byte through Latin-1.
-fn push_raw_byte(output: &mut String, value: u32) {
-    let byte = (value & 0xff) as u8;
-    match byte {
-        0x00..=0x7f => output.push(byte as char),
-        other => output.push(char::from_u32(other as u32).unwrap_or('\u{fffd}')),
-    }
+/// `printf '\xff'` is one byte long. Writing straight into the byte buffer
+/// keeps that byte exact instead of re-encoding it as UTF-8.
+fn push_raw_byte(output: &mut Vec<u8>, value: u32) {
+    output.push((value & 0xff) as u8);
 }
 
-fn append_printf_once(output: &mut String, format: &str, args: &[String]) -> usize {
+fn append_printf_once(output: &mut Vec<u8>, format: &str, args: &[String]) -> usize {
     let mut consumed = 0;
     let mut chars = format.chars().peekable();
 
     while let Some(ch) = chars.next() {
         if ch == '\\' {
             match chars.next() {
-                Some('n') => output.push('\n'),
-                Some('t') => output.push('\t'),
-                Some('r') => output.push('\r'),
-                Some('a') => output.push('\u{7}'),
-                Some('b') => output.push('\u{8}'),
-                Some('f') => output.push('\u{c}'),
-                Some('v') => output.push('\u{b}'),
-                Some('e') => output.push('\u{1b}'),
-                Some('\\') => output.push('\\'),
-                Some('"') => output.push('"'),
-                Some('\'') => output.push('\''),
+                Some('n') => output.push(b'\n'),
+                Some('t') => output.push(b'\t'),
+                Some('r') => output.push(b'\r'),
+                Some('a') => output.push(0x07),
+                Some('b') => output.push(0x08),
+                Some('f') => output.push(0x0c),
+                Some('v') => output.push(0x0b),
+                Some('e') => output.push(0x1b),
+                Some('\\') => output.push(b'\\'),
+                Some('"') => output.push(b'"'),
+                Some('\'') => output.push(b'\''),
                 // `\xHH` reads up to two hex digits.
                 Some('x') => {
                     let mut value = 0u32;
@@ -5209,8 +5318,8 @@ fn append_printf_once(output: &mut String, format: &str, args: &[String]) -> usi
                         digits += 1;
                     }
                     if digits == 0 {
-                        output.push('\\');
-                        output.push('x');
+                        output.push(b'\\');
+                        output.push(b'x');
                     } else {
                         push_raw_byte(output, value);
                     }
@@ -5232,17 +5341,17 @@ fn append_printf_once(output: &mut String, format: &str, args: &[String]) -> usi
                     }
                     push_raw_byte(output, value);
                 }
-                Some(other) => output.push(other),
-                None => output.push('\\'),
+                Some(other) => push_char_bytes(output, other),
+                None => output.push(b'\\'),
             }
             continue;
         }
         if ch != '%' {
-            output.push(ch);
+            push_char_bytes(output, ch);
             continue;
         }
         match chars.next() {
-            Some('%') => output.push('%'),
+            Some('%') => output.push(b'%'),
             Some(first) => {
                 // Collect the spec as: flags, width, `.`, precision, conversion.
                 // `first` is the character right after `%`, already consumed.
@@ -5345,36 +5454,36 @@ fn append_printf_once(output: &mut String, format: &str, args: &[String]) -> usi
                     }
                     other => {
                         // An unknown conversion is echoed, not silently dropped.
-                        output.push('%');
-                        output.push_str(&flags);
-                        output.push_str(&width_text);
+                        output.push(b'%');
+                        output.extend_from_slice(flags.as_bytes());
+                        output.extend_from_slice(width_text.as_bytes());
                         if precision.is_some() {
-                            output.push('.');
+                            output.push(b'.');
                         }
-                        output.push(other);
+                        push_char_bytes(output, other);
                         continue;
                     }
                 };
                 // Pad to the requested width.
                 let rendered_width = rendered.chars().count();
                 if rendered_width >= width {
-                    output.push_str(&rendered);
+                    output.extend_from_slice(rendered.as_bytes());
                 } else {
                     let padding = width - rendered_width;
                     if left {
-                        output.push_str(&rendered);
+                        output.extend_from_slice(rendered.as_bytes());
                         for _ in 0..padding {
-                            output.push(' ');
+                            output.push(b' ');
                         }
                     } else {
                         for _ in 0..padding {
-                            output.push(if zero_pad { '0' } else { ' ' });
+                            output.push(if zero_pad { b'0' } else { b' ' });
                         }
-                        output.push_str(&rendered);
+                        output.extend_from_slice(rendered.as_bytes());
                     }
                 }
             }
-            None => output.push('%'),
+            None => output.push(b'%'),
         }
     }
 
@@ -5713,7 +5822,7 @@ impl Bash {
             .fs
             .read_file(&resolved)
             .map_err(|_| format!("grep: {path}: No such file or directory\n"))?;
-        Ok(split_pattern_file(contents))
+        Ok(split_pattern_file(&String::from_utf8_lossy(contents)))
     }
 
     /// Search every input source and write the selected output.
@@ -5781,7 +5890,7 @@ impl Bash {
                                 .unwrap_or_else(|| {
                                     path.strip_prefix('/').unwrap_or(&path).to_string()
                                 });
-                            sources.push((display, contents.to_string()));
+                            sources.push((display, String::from_utf8_lossy(contents).into_owned()));
                         }
                     }
                     continue;
@@ -6603,7 +6712,7 @@ impl Bash {
     ///
     /// This runtime has no concurrency, so the job finishes immediately and its
     /// output is emitted in place; only the exit status is retained for `wait`.
-    fn exec_background(&mut self, statement: &Statement) -> (String, String, i32) {
+    fn exec_background(&mut self, statement: &Statement) -> (Vec<u8>, Vec<u8>, i32) {
         let mut child = self.child_shell();
         let (stdout, stderr, status) = child.exec_statement_inner(statement);
         // A job's filesystem changes are visible to the parent; its environment
@@ -6621,7 +6730,7 @@ impl Bash {
         (stdout, stderr, 0)
     }
 
-    fn exec_case(&mut self, case_stmt: &CaseStatement) -> (String, String, i32) {
+    fn exec_case(&mut self, case_stmt: &CaseStatement) -> (Vec<u8>, Vec<u8>, i32) {
         let subject = self.expand_word(&case_stmt.word);
         for clause in &case_stmt.clauses {
             let matched = clause.patterns.iter().any(|pattern| {
@@ -6632,16 +6741,16 @@ impl Bash {
                 return self.exec_statement_list(&clause.body);
             }
         }
-        (String::new(), String::new(), 0)
+        (Vec::new(), Vec::new(), 0)
     }
 
-    fn define_function(&mut self, def: &FunctionDef) -> (String, String, i32) {
+    fn define_function(&mut self, def: &FunctionDef) -> (Vec<u8>, Vec<u8>, i32) {
         self.functions.insert(def.name.clone(), def.body.clone());
-        (String::new(), String::new(), 0)
+        (Vec::new(), Vec::new(), 0)
     }
 
     /// `( … )`: a child shell whose environment changes are discarded.
-    fn run_subshell(&mut self, body: &[Statement]) -> (String, String, i32) {
+    fn run_subshell(&mut self, body: &[Statement]) -> (Vec<u8>, Vec<u8>, i32) {
         let mut child = self.child_shell();
         let (stdout, stderr, exit_code) = child.exec_statement_list(body);
         self.fs = child.fs;
@@ -6653,11 +6762,12 @@ impl Bash {
         // process. Fail closed like every other execution limit.
         if self.function_depth >= self.execution_limits.max_call_depth {
             return CommandOutput {
-                stdout: String::new(),
+                stdout: Vec::new(),
                 stderr: format!(
                     "bash: maximum function call depth exceeded ({})\n",
                     self.execution_limits.max_call_depth
-                ),
+                )
+                .into_bytes(),
                 exit_code: 1,
             };
         }
@@ -6682,9 +6792,9 @@ impl Bash {
 
     // ── `[[ … ]]` ────────────────────────────────────────────────────────────
 
-    fn exec_cond(&mut self, expr: &CondExpr) -> (String, String, i32) {
+    fn exec_cond(&mut self, expr: &CondExpr) -> (Vec<u8>, Vec<u8>, i32) {
         let matched = self.eval_cond_expr(expr);
-        (String::new(), String::new(), if matched { 0 } else { 1 })
+        (Vec::new(), Vec::new(), if matched { 0 } else { 1 })
     }
 
     fn eval_cond_expr(&mut self, expr: &CondExpr) -> bool {
@@ -6821,7 +6931,7 @@ impl Bash {
 
     // ── Arrays ───────────────────────────────────────────────────────────────
 
-    fn exec_array_assign(&mut self, assign: &ArrayAssign) -> (String, String, i32) {
+    fn exec_array_assign(&mut self, assign: &ArrayAssign) -> (Vec<u8>, Vec<u8>, i32) {
         // Each element keeps its raw subscript text: an associative array uses
         // that text as a key, an indexed array evaluates it as an index.
         let mut elements: Vec<(Option<String>, String)> = Vec::new();
@@ -6862,7 +6972,7 @@ impl Bash {
                     .or_default()
                     .insert(key, value);
             }
-            return (String::new(), String::new(), 0);
+            return (Vec::new(), Vec::new(), 0);
         }
         if !assign.append {
             self.arrays.remove(&assign.name);
@@ -6881,7 +6991,7 @@ impl Bash {
             }
         }
         self.arrays.insert(assign.name.clone(), values);
-        (String::new(), String::new(), 0)
+        (Vec::new(), Vec::new(), 0)
     }
 
     /// Evaluate an array subscript (`a[i]`), defaulting to 0 on error.
@@ -7515,12 +7625,13 @@ impl Bash {
         let result = child.exec_in_current_state(script);
         self.fs = child.fs;
         if !result.stderr.is_empty() {
-            self.expansion_stderr.push_str(&result.stderr);
+            self.expansion_stderr
+                .push_str(&String::from_utf8_lossy(&result.stderr));
         }
         if result.exit_code == 2 {
             self.expansion_failed = true;
         }
-        result.stdout
+        String::from_utf8_lossy(&result.stdout).into_owned()
     }
 
     /// Feed each `>(cmd)` temporary file to its command once the enclosing
@@ -7528,15 +7639,15 @@ impl Bash {
     fn flush_procsub_readers(&mut self, result: &mut CommandOutput) {
         let readers = std::mem::take(&mut self.procsub_readers);
         for (script, path) in readers {
-            let contents = self.fs.read_file(&path).unwrap_or("").to_string();
+            let contents = self.fs.read_file(&path).unwrap_or(&[]).to_vec();
             let mut child = self.child_shell();
             // The reader's standard input is the fifo's contents; a child
             // shell starts without a seed, so set it explicitly.
             child.seed_stdin = Some(contents);
             let output = child.exec_in_current_state(&script);
             self.fs = child.fs;
-            result.stdout.push_str(&output.stdout);
-            result.stderr.push_str(&output.stderr);
+            result.stdout.extend_from_slice(&output.stdout);
+            result.stderr.extend_from_slice(&output.stderr);
         }
     }
 
@@ -7957,7 +8068,7 @@ impl Bash {
         for (kind, value) in &mut data {
             if let Some(path) = value.strip_prefix('@') {
                 match self.fs.read_file(&self.resolve_path(path)) {
-                    Ok(contents) => *value = contents.to_string(),
+                    Ok(contents) => *value = String::from_utf8_lossy(contents).into_owned(),
                     Err(error) => {
                         stderr.push_str(&format!("curl: {error}\n"));
                         return 26;
@@ -8623,42 +8734,51 @@ fn parse_head_tail_args(program: &str, args: &[String]) -> Result<HeadTailOption
     })
 }
 
-/// Apply `head`/`tail` semantics to one input buffer.
-fn head_or_tail(text: &str, options: &HeadTailOptions) -> String {
+/// Byte-exact `head`/`tail` over a raw buffer.
+fn head_or_tail_bytes(bytes: &[u8], options: &HeadTailOptions) -> Vec<u8> {
     match &options.mode {
         CountMode::Lines(count) => {
-            let lines: Vec<&str> = text.lines().collect();
-            let slice: Vec<&str> = if options.is_tail {
-                let start = lines.len().saturating_sub(*count);
-                lines[start..].to_vec()
+            let segments: Vec<&[u8]> = split_lines_bytes(bytes);
+            let slice: Vec<&[u8]> = if options.is_tail {
+                let start = segments.len().saturating_sub(*count);
+                segments[start..].to_vec()
             } else {
-                lines.iter().take(*count).copied().collect()
+                segments.iter().take(*count).copied().collect()
             };
-            render_lines(&slice)
+            render_lines_bytes(&slice)
         }
         CountMode::FromLine(start) => {
-            let lines: Vec<&str> = text.lines().collect();
-            let index = start.saturating_sub(1).min(lines.len());
-            render_lines(&lines[index..])
+            let segments: Vec<&[u8]> = split_lines_bytes(bytes);
+            let index = start.saturating_sub(1).min(segments.len());
+            render_lines_bytes(&segments[index..])
         }
         CountMode::Bytes(count) => {
-            let bytes = text.as_bytes();
             let slice = if options.is_tail {
                 let start = bytes.len().saturating_sub(*count);
                 &bytes[start..]
             } else {
                 &bytes[..(*count).min(bytes.len())]
             };
-            String::from_utf8_lossy(slice).into_owned()
+            slice.to_vec()
         }
     }
 }
 
-fn render_lines(lines: &[&str]) -> String {
-    let mut out = String::new();
+/// Split a byte buffer into lines without their `\n` separators; a trailing
+/// newline does not create an extra empty line.
+fn split_lines_bytes(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+    if bytes.last() == Some(&b'\n') {
+        lines.pop();
+    }
+    lines
+}
+
+fn render_lines_bytes(lines: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
     for line in lines {
-        out.push_str(line);
-        out.push('\n');
+        out.extend_from_slice(line);
+        out.push(b'\n');
     }
     out
 }
@@ -9399,8 +9519,11 @@ mod tests {
     fn executes_basic_commands_and_preserves_cwd() {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("pwd; mkdir -p work; cd work; pwd; echo hello rust");
-        assert_eq!(result.stdout, "/home/user\n/home/user/work\nhello rust\n");
-        assert_eq!(result.stderr, "");
+        assert_eq!(
+            result.stdout_text(),
+            "/home/user\n/home/user/work\nhello rust\n"
+        );
+        assert_eq!(result.stderr_text(), "");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.cwd, "/home/user/work");
     }
@@ -9415,10 +9538,10 @@ mod tests {
         })
         .unwrap();
         let result = bash.exec("cat input.txt; cp input.txt copy.txt; ls");
-        assert_eq!(result.stdout, "hello\ncopy.txt\ninput.txt\n");
-        assert_eq!(result.stderr, "");
+        assert_eq!(result.stdout_text(), "hello\ncopy.txt\ninput.txt\n");
+        assert_eq!(result.stderr_text(), "");
         assert_eq!(
-            bash.fs().read_file("/home/user/copy.txt").unwrap(),
+            bash.fs().read_file_str("/home/user/copy.txt").unwrap(),
             "hello\n"
         );
     }
@@ -9427,8 +9550,8 @@ mod tests {
     fn reports_unknown_commands() {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("wat");
-        assert_eq!(result.stdout, "");
-        assert_eq!(result.stderr, "bash: wat: command not found\n");
+        assert_eq!(result.stdout_text(), "");
+        assert_eq!(result.stderr_text(), "bash: wat: command not found\n");
         assert_eq!(result.exit_code, 127);
     }
 
@@ -9442,15 +9565,15 @@ mod tests {
         })
         .unwrap();
         let result = bash.exec("echo $NAME");
-        assert_eq!(result.stdout, "rust\n");
+        assert_eq!(result.stdout_text(), "rust\n");
     }
 
     #[test]
     fn pipes_stdout_into_next_command() {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("echo alpha; echo beta | grep beta | wc");
-        assert_eq!(result.stdout, "alpha\n      1       1       5\n");
-        assert_eq!(result.stderr, "");
+        assert_eq!(result.stdout_text(), "alpha\n      1       1       5\n");
+        assert_eq!(result.stderr_text(), "");
         assert_eq!(result.exit_code, 0);
     }
 
@@ -9464,11 +9587,11 @@ mod tests {
         })
         .unwrap();
         let result = bash.exec("grep two < input.txt > out.txt; echo done >> out.txt; cat out.txt");
-        assert_eq!(result.stdout, "two\ndone\n");
-        assert_eq!(result.stderr, "");
+        assert_eq!(result.stdout_text(), "two\ndone\n");
+        assert_eq!(result.stderr_text(), "");
         assert_eq!(result.exit_code, 0);
         assert_eq!(
-            bash.fs().read_file("/home/user/out.txt").unwrap(),
+            bash.fs().read_file_str("/home/user/out.txt").unwrap(),
             "two\ndone\n"
         );
     }
@@ -9479,8 +9602,8 @@ mod tests {
         let result = bash.exec(
             "false && echo nope; false || echo fallback; true && echo done; true || echo skip",
         );
-        assert_eq!(result.stdout, "fallback\ndone\n");
-        assert_eq!(result.stderr, "");
+        assert_eq!(result.stdout_text(), "fallback\ndone\n");
+        assert_eq!(result.stderr_text(), "");
         assert_eq!(result.exit_code, 0);
     }
 
@@ -9495,17 +9618,17 @@ mod tests {
         })
         .unwrap();
         let result = bash.exec("echo hello-$NAME-${SUFFIX}");
-        assert_eq!(result.stdout, "hello-rust-core\n");
-        assert_eq!(result.stderr, "");
+        assert_eq!(result.stdout_text(), "hello-rust-core\n");
+        assert_eq!(result.stderr_text(), "");
     }
 
     #[test]
     fn rejects_writes_to_directories_and_missing_parents() {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("echo hi > /tmp; touch /tmp; echo hi > missing/file; ls /tmp");
-        assert_eq!(result.stdout, "");
+        assert_eq!(result.stdout_text(), "");
         assert_eq!(
-            result.stderr,
+            result.stderr_text(),
             "bash: /tmp: Is a directory\ntouch: /tmp: Is a directory\nbash: /home/user/missing: No such file or directory\n"
         );
         assert_eq!(result.exit_code, 0);
@@ -9515,9 +9638,9 @@ mod tests {
     fn mkdir_without_parents_fails_for_missing_parent() {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("mkdir nested/child; ls");
-        assert_eq!(result.stdout, "");
+        assert_eq!(result.stdout_text(), "");
         assert_eq!(
-            result.stderr,
+            result.stderr_text(),
             "mkdir: /home/user/nested: No such file or directory\n"
         );
         assert_eq!(result.exit_code, 0);
@@ -9527,8 +9650,8 @@ mod tests {
     fn pipeline_commands_do_not_mutate_parent_shell_state() {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("cd /tmp | cat; pwd; exit 7 | true; echo after");
-        assert_eq!(result.stdout, "/home/user\nafter\n");
-        assert_eq!(result.stderr, "");
+        assert_eq!(result.stdout_text(), "/home/user\nafter\n");
+        assert_eq!(result.stderr_text(), "");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.cwd, "/home/user");
     }
@@ -9537,8 +9660,8 @@ mod tests {
     fn wc_counts_newline_bytes_for_lines() {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("echo -n x | wc");
-        assert_eq!(result.stdout, "      0       1       1\n");
-        assert_eq!(result.stderr, "");
+        assert_eq!(result.stdout_text(), "      0       1       1\n");
+        assert_eq!(result.stderr_text(), "");
     }
 
     #[test]
@@ -9552,9 +9675,9 @@ mod tests {
         .unwrap();
         let result = bash.exec("cat f > f; wc f");
         // Truncating `f` empties it, and an all-zero file prints bare counters.
-        assert_eq!(result.stdout, "0 0 0 f\n");
-        assert_eq!(result.stderr, "");
-        assert_eq!(bash.fs().read_file("/home/user/f").unwrap(), "");
+        assert_eq!(result.stdout_text(), "0 0 0 f\n");
+        assert_eq!(result.stderr_text(), "");
+        assert_eq!(bash.fs().read_file_str("/home/user/f").unwrap(), "");
     }
 
     #[test]
@@ -9567,16 +9690,16 @@ mod tests {
         })
         .unwrap();
         let result = bash.exec("ls file.txt");
-        assert_eq!(result.stdout, "file.txt\n");
-        assert_eq!(result.stderr, "");
+        assert_eq!(result.stdout_text(), "file.txt\n");
+        assert_eq!(result.stderr_text(), "");
     }
 
     #[test]
     fn printf_formats_arguments() {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("printf '%s\\n' a b");
-        assert_eq!(result.stdout, "a\nb\n");
-        assert_eq!(result.stderr, "");
+        assert_eq!(result.stdout_text(), "a\nb\n");
+        assert_eq!(result.stderr_text(), "");
     }
 
     #[test]
@@ -9594,8 +9717,8 @@ mod tests {
         let result = bash.exec(
             "head -n 2 input.txt; tail -n 2 input.txt; sort input.txt; sort input.txt | uniq",
         );
-        assert_eq!(result.stdout, "b\na\na\nc\na\na\nb\nc\na\nb\nc\n");
-        assert_eq!(result.stderr, "");
+        assert_eq!(result.stdout_text(), "b\na\na\nc\na\na\nb\nc\na\nb\nc\n");
+        assert_eq!(result.stderr_text(), "");
         assert_eq!(result.exit_code, 0);
     }
 
@@ -9612,8 +9735,8 @@ mod tests {
         })
         .unwrap();
         let result = bash.exec("cut -d , -f 2 csv.txt | tr og OG");
-        assert_eq!(result.stdout, "lanG\nrust\nGO\n");
-        assert_eq!(result.stderr, "");
+        assert_eq!(result.stdout_text(), "lanG\nrust\nGO\n");
+        assert_eq!(result.stderr_text(), "");
         assert_eq!(result.exit_code, 0);
     }
 
@@ -9621,8 +9744,8 @@ mod tests {
     fn supports_basename_and_dirname() {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("basename /tmp/hello.txt; dirname /tmp/hello.txt");
-        assert_eq!(result.stdout, "hello.txt\n/tmp\n");
-        assert_eq!(result.stderr, "");
+        assert_eq!(result.stdout_text(), "hello.txt\n/tmp\n");
+        assert_eq!(result.stderr_text(), "");
         assert_eq!(result.exit_code, 0);
     }
 
@@ -9630,9 +9753,9 @@ mod tests {
     fn text_tool_usage_errors_are_reported() {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("cut -d , missing");
-        assert_eq!(result.stdout, "");
+        assert_eq!(result.stdout_text(), "");
         assert_eq!(
-            result.stderr,
+            result.stderr_text(),
             "cut: you must specify a list of bytes, characters, or fields\n"
         );
         assert_eq!(result.exit_code, 1);
@@ -9648,8 +9771,8 @@ mod tests {
         })
         .unwrap();
         let result = bash.exec("rm -i file.txt; cat file.txt");
-        assert_eq!(result.stdout, "data");
-        assert_eq!(result.stderr, "rm: unsupported option: -i\n");
+        assert_eq!(result.stdout_text(), "data");
+        assert_eq!(result.stderr_text(), "rm: unsupported option: -i\n");
         assert_eq!(result.exit_code, 0);
     }
 
@@ -9663,16 +9786,16 @@ mod tests {
         })
         .unwrap();
         let result = bash.exec(r#"echo '$NAME' "$NAME" pre'$NAME'-$NAME"#);
-        assert_eq!(result.stdout, "$NAME rust pre$NAME-rust\n");
-        assert_eq!(result.stderr, "");
+        assert_eq!(result.stdout_text(), "$NAME rust pre$NAME-rust\n");
+        assert_eq!(result.stderr_text(), "");
     }
 
     #[test]
     fn assignment_words_update_environment() {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("NAME=rust; echo $NAME");
-        assert_eq!(result.stdout, "rust\n");
-        assert_eq!(result.stderr, "");
+        assert_eq!(result.stdout_text(), "rust\n");
+        assert_eq!(result.stderr_text(), "");
     }
 
     #[test]
@@ -9686,10 +9809,10 @@ mod tests {
         .unwrap();
         let first = bash
             .exec("NAME=rust; cd /tmp; cp /home/user/seed.txt /home/user/out.txt; echo $NAME; pwd");
-        assert_eq!(first.stdout, "rust\n/tmp\n");
+        assert_eq!(first.stdout_text(), "rust\n/tmp\n");
         let second = bash.exec("echo $NAME; pwd; cat out.txt");
-        assert_eq!(second.stdout, "\n/home/user\nok\n");
-        assert_eq!(second.stderr, "");
+        assert_eq!(second.stdout_text(), "\n/home/user\nok\n");
+        assert_eq!(second.stderr_text(), "");
     }
 
     #[test]
@@ -9702,7 +9825,7 @@ mod tests {
         let first = bash.exec("NAME=rust; cd /tmp");
         assert_eq!(first.exit_code, 0);
         let second = bash.exec("echo $NAME; pwd");
-        assert_eq!(second.stdout, "rust\n/tmp\n");
+        assert_eq!(second.stdout_text(), "rust\n/tmp\n");
     }
 
     #[test]
@@ -9717,7 +9840,10 @@ mod tests {
         .unwrap();
         let result = bash.exec("echo hello");
         assert_eq!(result.exit_code, 2);
-        assert_eq!(result.stderr, "bash: script exceeds limit (8 bytes)\n");
+        assert_eq!(
+            result.stderr_text(),
+            "bash: script exceeds limit (8 bytes)\n"
+        );
     }
 
     #[test]
@@ -9732,7 +9858,10 @@ mod tests {
         .unwrap();
         let result = bash.exec("echo a; echo b; echo c");
         assert_eq!(result.exit_code, 2);
-        assert_eq!(result.stderr, "bash: command count exceeds limit (2)\n");
+        assert_eq!(
+            result.stderr_text(),
+            "bash: command count exceeds limit (2)\n"
+        );
     }
 
     // ─── Control-flow tests ───────────────────────────────────────────────
@@ -9742,7 +9871,7 @@ mod tests {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("if true; then echo yes; fi");
         assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout, "yes\n");
+        assert_eq!(result.stdout_text(), "yes\n");
     }
 
     #[test]
@@ -9750,7 +9879,7 @@ mod tests {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("if false; then echo yes; else echo no; fi");
         assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout, "no\n");
+        assert_eq!(result.stdout_text(), "no\n");
     }
 
     #[test]
@@ -9758,7 +9887,7 @@ mod tests {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("if false; then echo a; elif true; then echo b; else echo c; fi");
         assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout, "b\n");
+        assert_eq!(result.stdout_text(), "b\n");
     }
 
     #[test]
@@ -9774,7 +9903,7 @@ mod tests {
         // Simple while loop that terminates when the limit is hit
         let result = bash.exec("while true; do echo x; done");
         assert_eq!(result.exit_code, 2); // Error code for loop limit
-        assert!(result.stderr.contains("loop iteration"));
+        assert!(result.stderr_text().contains("loop iteration"));
     }
 
     #[test]
@@ -9782,7 +9911,7 @@ mod tests {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("for i in a b c; do echo $i; done");
         assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout, "a\nb\nc\n");
+        assert_eq!(result.stdout_text(), "a\nb\nc\n");
     }
 
     // ─── Command substitution tests ────────────────────────────────────────
@@ -9792,7 +9921,7 @@ mod tests {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("echo $(echo hello)");
         assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout, "hello\n");
+        assert_eq!(result.stdout_text(), "hello\n");
     }
 
     #[test]
@@ -9802,9 +9931,9 @@ mod tests {
         assert_eq!(result.exit_code, 0);
         // Trailing newlines are stripped but internal ones are preserved
         assert!(
-            result.stdout.contains("a")
-                && result.stdout.contains("b")
-                && result.stdout.contains("c")
+            result.stdout_text().contains("a")
+                && result.stdout_text().contains("b")
+                && result.stdout_text().contains("c")
         );
     }
 
@@ -9813,7 +9942,7 @@ mod tests {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("echo $(echo $(echo nested))");
         assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout, "nested\n");
+        assert_eq!(result.stdout_text(), "nested\n");
     }
 
     #[test]
@@ -9821,7 +9950,7 @@ mod tests {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("i=1; i=$((i + 2 * 3)); echo $i");
         assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout, "7\n");
+        assert_eq!(result.stdout_text(), "7\n");
     }
 
     #[test]
@@ -9829,7 +9958,7 @@ mod tests {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("i=0; while [ \"$i\" -lt 3 ]; do echo $i; i=$((i + 1)); done");
         assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout, "0\n1\n2\n");
+        assert_eq!(result.stdout_text(), "0\n1\n2\n");
     }
 
     // ─── Special variables tests ───────────────────────────────────────────
@@ -9839,7 +9968,7 @@ mod tests {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("true; echo $?");
         assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout, "0\n");
+        assert_eq!(result.stdout_text(), "0\n");
     }
 
     #[test]
@@ -9847,7 +9976,7 @@ mod tests {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("false; echo $?");
         assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout, "1\n");
+        assert_eq!(result.stdout_text(), "1\n");
     }
 
     #[test]
@@ -9855,7 +9984,7 @@ mod tests {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("echo $0");
         assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout, "bash\n");
+        assert_eq!(result.stdout_text(), "bash\n");
     }
 
     // ─── Test builtin tests ──────────────────────────────────────────────
@@ -9865,7 +9994,7 @@ mod tests {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("test -z \"\"; echo $?");
         assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout, "0\n");
+        assert_eq!(result.stdout_text(), "0\n");
     }
 
     #[test]
@@ -9873,7 +10002,7 @@ mod tests {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("test -z \"hello\"; echo $?");
         assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout, "1\n");
+        assert_eq!(result.stdout_text(), "1\n");
     }
 
     #[test]
@@ -9881,7 +10010,7 @@ mod tests {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("test -n \"hello\"; echo $?");
         assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout, "0\n");
+        assert_eq!(result.stdout_text(), "0\n");
     }
 
     #[test]
@@ -9889,7 +10018,7 @@ mod tests {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("test \"a\" = \"a\"; echo $?");
         assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout, "0\n");
+        assert_eq!(result.stdout_text(), "0\n");
     }
 
     #[test]
@@ -9897,7 +10026,7 @@ mod tests {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("test 5 -eq 5; echo $?");
         assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout, "0\n");
+        assert_eq!(result.stdout_text(), "0\n");
     }
 
     #[test]
@@ -9905,7 +10034,7 @@ mod tests {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("test 3 -lt 5; echo $?");
         assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout, "0\n");
+        assert_eq!(result.stdout_text(), "0\n");
     }
 
     #[test]
@@ -9913,7 +10042,7 @@ mod tests {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("[ \"a\" = \"a\" ]; echo $?");
         assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout, "0\n");
+        assert_eq!(result.stdout_text(), "0\n");
     }
 
     // ─── Execution limits tests ────────────────────────────────────────────
@@ -9931,7 +10060,7 @@ mod tests {
         // Generate output that exceeds the limit (50 bytes limit)
         let result = bash.exec("echo this is a very long string that exceeds fifty bytes limit");
         assert_eq!(result.exit_code, 2);
-        assert!(result.stderr.contains("output exceeds limit"));
+        assert!(result.stderr_text().contains("output exceeds limit"));
     }
 
     #[test]
@@ -9946,7 +10075,7 @@ mod tests {
         .unwrap();
         let result = bash.exec("i=0; while [ 1 ]; do i=$((i + 1)); done");
         assert_eq!(result.exit_code, 2);
-        assert!(result.stderr.contains("loop iteration"));
+        assert!(result.stderr_text().contains("loop iteration"));
     }
 
     // ─── Complex scenarios ────────────────────────────────────────────────
@@ -9957,7 +10086,7 @@ mod tests {
         let result =
             bash.exec("result=$(echo \"test\"); if [ \"$result\" = \"test\" ]; then echo pass; fi");
         assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout, "pass\n");
+        assert_eq!(result.stdout_text(), "pass\n");
     }
 
     #[test]
@@ -9965,9 +10094,9 @@ mod tests {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("for i in $(echo -e \"1\\n2\\n3\"); do echo $i; done");
         assert_eq!(result.exit_code, 0);
-        assert!(result.stdout.contains("1"));
-        assert!(result.stdout.contains("2"));
-        assert!(result.stdout.contains("3"));
+        assert!(result.stdout_text().contains("1"));
+        assert!(result.stdout_text().contains("2"));
+        assert!(result.stdout_text().contains("3"));
     }
 
     // ─── mv ───────────────────────────────────────────────────────────────
@@ -9982,11 +10111,11 @@ mod tests {
         })
         .unwrap();
         let result = bash.exec("mv old.txt new.txt; cat new.txt");
-        assert_eq!(result.stdout, "content\n");
-        assert_eq!(result.stderr, "");
-        assert!(bash.fs().read_file("/home/user/old.txt").is_err());
+        assert_eq!(result.stdout_text(), "content\n");
+        assert_eq!(result.stderr_text(), "");
+        assert!(bash.fs().read_file_str("/home/user/old.txt").is_err());
         assert_eq!(
-            bash.fs().read_file("/home/user/new.txt").unwrap(),
+            bash.fs().read_file_str("/home/user/new.txt").unwrap(),
             "content\n"
         );
     }
@@ -9996,7 +10125,7 @@ mod tests {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("mv missing.txt dest.txt");
         assert_eq!(result.exit_code, 1);
-        assert!(result.stderr.contains("No such file or directory"));
+        assert!(result.stderr_text().contains("No such file or directory"));
     }
 
     // ─── wc flags ─────────────────────────────────────────────────────────
@@ -10005,21 +10134,21 @@ mod tests {
     fn wc_flag_l_counts_lines_only() {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("printf 'a\\nb\\nc\\n' | wc -l");
-        assert_eq!(result.stdout, "3\n");
+        assert_eq!(result.stdout_text(), "3\n");
     }
 
     #[test]
     fn wc_flag_w_counts_words_only() {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("echo 'hello world' | wc -w");
-        assert_eq!(result.stdout, "2\n");
+        assert_eq!(result.stdout_text(), "2\n");
     }
 
     #[test]
     fn wc_combined_flags() {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("echo 'hello world' | wc -lw");
-        assert_eq!(result.stdout, "      1       2\n");
+        assert_eq!(result.stdout_text(), "      1       2\n");
     }
 
     // ─── read builtin ─────────────────────────────────────────────────────
@@ -10043,8 +10172,8 @@ mod tests {
         .unwrap();
         bash2.exec("echo 'alice' > /home/user/name.txt");
         let r = bash2.exec("read NAME < /home/user/name.txt; echo $NAME");
-        assert_eq!(r.stdout, "alice\n");
-        assert_eq!(r.stderr, "");
+        assert_eq!(r.stdout_text(), "alice\n");
+        assert_eq!(r.stderr_text(), "");
     }
 
     // ─── set options ─────────────────────────────────────────────────────
@@ -10057,7 +10186,7 @@ mod tests {
         })
         .unwrap();
         let result = bash.exec("set -e; false; echo should_not_run");
-        assert_eq!(result.stdout, "");
+        assert_eq!(result.stdout_text(), "");
         assert_ne!(result.exit_code, 0);
     }
 
@@ -10070,7 +10199,7 @@ mod tests {
         .unwrap();
         let result = bash.exec("set -u; echo $UNSET_VAR");
         assert_eq!(result.exit_code, 1);
-        assert!(result.stderr.contains("unbound variable"));
+        assert!(result.stderr_text().contains("unbound variable"));
     }
 
     #[test]
@@ -10110,7 +10239,7 @@ mod upstream_sync_tests {
     }
 
     fn stdout_of(script: &str) -> String {
-        run(script).stdout
+        run(script).stdout_text()
     }
 
     // ─── Parameter expansion operators (upstream #4af0dc0f, #701f8e5b) ──────
@@ -10155,8 +10284,8 @@ mod upstream_sync_tests {
     #[test]
     fn error_operator_reports_the_message_and_exit_1() {
         let result = run("echo before${MISSING:?boom}after");
-        assert_eq!(result.stdout, "");
-        assert_eq!(result.stderr, "bash: boom\n");
+        assert_eq!(result.stdout_text(), "");
+        assert_eq!(result.stderr_text(), "bash: boom\n");
         assert_eq!(result.exit_code, 1);
     }
 
@@ -10173,7 +10302,7 @@ mod upstream_sync_tests {
         ] {
             let result = run(script);
             assert_eq!(result.exit_code, 0, "{script} -> {result:?}");
-            assert_eq!(result.stderr, "", "{script}");
+            assert_eq!(result.stderr_text(), "", "{script}");
         }
     }
 
@@ -10183,7 +10312,8 @@ mod upstream_sync_tests {
             let result = run(script);
             assert_eq!(result.exit_code, 1, "{script}");
             assert_eq!(
-                result.stderr, "bash: MISSING: unbound variable\n",
+                result.stderr_text(),
+                "bash: MISSING: unbound variable\n",
                 "{script}"
             );
         }
@@ -10209,12 +10339,12 @@ mod upstream_sync_tests {
             "set --; echo ${*:=fallback}",
         ] {
             let result = run(script);
-            assert_eq!(result.stdout, "", "{script}");
+            assert_eq!(result.stdout_text(), "", "{script}");
             assert_eq!(result.exit_code, 1, "{script}");
             assert!(
-                result.stderr.contains("cannot assign in this way"),
+                result.stderr_text().contains("cannot assign in this way"),
                 "{script} -> {}",
-                result.stderr
+                result.stderr_text()
             );
         }
     }
@@ -10231,35 +10361,35 @@ mod upstream_sync_tests {
     fn bundled_o_enables_pipefail() {
         // `false | true` succeeds unless pipefail is on.
         let result = run("set -euo pipefail; echo start; false | true; echo never");
-        assert!(!result.stdout.contains("never"), "{result:?}");
+        assert!(!result.stdout_text().contains("never"), "{result:?}");
         assert_ne!(result.exit_code, 0);
     }
 
     #[test]
     fn standalone_pipefail_switch_still_works() {
         let result = run("set -o pipefail; false | true; echo $?");
-        assert_eq!(result.stdout, "1\n");
+        assert_eq!(result.stdout_text(), "1\n");
     }
 
     #[test]
     fn bundled_o_consumes_the_next_word_as_the_option_name() {
         // `-oe pipefail`: the `o` takes `pipefail`, then `e` sets errexit.
         let result = run("set -oe pipefail; false | true; echo never");
-        assert!(!result.stdout.contains("never"), "{result:?}");
+        assert!(!result.stdout_text().contains("never"), "{result:?}");
         assert_ne!(result.exit_code, 0);
     }
 
     #[test]
     fn multiple_bundled_os_consume_successive_words() {
         let result = run("set -oo pipefail errexit; false | true; echo never");
-        assert!(!result.stdout.contains("never"), "{result:?}");
+        assert!(!result.stdout_text().contains("never"), "{result:?}");
         assert_ne!(result.exit_code, 0);
     }
 
     #[test]
     fn bundled_o_can_be_disabled_with_plus() {
         let result = run("set -euo pipefail; set +euo pipefail; false | true; echo done");
-        assert_eq!(result.stdout, "done\n");
+        assert_eq!(result.stdout_text(), "done\n");
         assert_eq!(result.exit_code, 0);
     }
 
@@ -10267,19 +10397,31 @@ mod upstream_sync_tests {
     fn bundled_o_rejects_an_unknown_option_name() {
         let result = run("set -euo bogusoption");
         assert_eq!(result.exit_code, 1);
-        assert!(result.stderr.contains("bogusoption"), "{}", result.stderr);
         assert!(
-            result.stderr.contains("invalid option name"),
+            result.stderr_text().contains("bogusoption"),
             "{}",
-            result.stderr
+            result.stderr_text()
+        );
+        assert!(
+            result.stderr_text().contains("invalid option name"),
+            "{}",
+            result.stderr_text()
         );
     }
 
     #[test]
     fn bare_o_prints_the_option_listing() {
         let result = run("set -o");
-        assert!(result.stdout.contains("errexit"), "{}", result.stdout);
-        assert!(result.stdout.contains("pipefail"), "{}", result.stdout);
+        assert!(
+            result.stdout_text().contains("errexit"),
+            "{}",
+            result.stdout_text()
+        );
+        assert!(
+            result.stdout_text().contains("pipefail"),
+            "{}",
+            result.stdout_text()
+        );
     }
 
     #[test]
@@ -10300,12 +10442,12 @@ mod upstream_sync_tests {
             "for i in 1; do for j in 1; do false; break 2; done; done; echo $?",
         ] {
             let result = run(script);
-            assert_eq!(result.stdout, "0\n", "{script}");
+            assert_eq!(result.stdout_text(), "0\n", "{script}");
             assert_eq!(result.exit_code, 0, "{script}");
         }
         // A nested break reports 0 to the enclosing body as well.
         let result = run("for i in 1; do for j in 1; do false; break; done; echo after=$?; done");
-        assert_eq!(result.stdout, "after=0\n");
+        assert_eq!(result.stdout_text(), "after=0\n");
     }
 
     #[test]
@@ -10341,7 +10483,7 @@ mod upstream_sync_tests {
     #[test]
     fn break_stops_the_rest_of_the_statement_list() {
         let result = run("for i in 1; do break; echo unreachable; done; echo done");
-        assert_eq!(result.stdout, "done\n");
+        assert_eq!(result.stdout_text(), "done\n");
     }
 
     // ─── fd-aware redirection (upstream #cb2b583b) ──────────────────────────
@@ -10362,11 +10504,11 @@ mod upstream_sync_tests {
     fn dup_sends_stderr_to_the_redirected_stdout() {
         let mut bash = bash();
         let result = bash.exec("nosuchcmd > /home/user/f 2>&1");
-        assert_eq!(result.stdout, "");
-        assert_eq!(result.stderr, "");
+        assert_eq!(result.stdout_text(), "");
+        assert_eq!(result.stderr_text(), "");
         assert_eq!(result.exit_code, 127);
         assert_eq!(
-            bash.fs().read_file("/home/user/f").unwrap(),
+            bash.fs().read_file_str("/home/user/f").unwrap(),
             "bash: nosuchcmd: command not found\n"
         );
     }
@@ -10377,9 +10519,9 @@ mod upstream_sync_tests {
         // `2>&1` captures the *current* stdout target (the caller's), then `> g`
         // moves fd 1 only — so g stays empty.
         let result = bash.exec("nosuchcmd 2>&1 > /home/user/g");
-        assert_eq!(result.stdout, "bash: nosuchcmd: command not found\n");
-        assert_eq!(result.stderr, "");
-        assert_eq!(bash.fs().read_file("/home/user/g").unwrap(), "");
+        assert_eq!(result.stdout_text(), "bash: nosuchcmd: command not found\n");
+        assert_eq!(result.stderr_text(), "");
+        assert_eq!(bash.fs().read_file_str("/home/user/g").unwrap(), "");
     }
 
     #[test]
@@ -10387,7 +10529,7 @@ mod upstream_sync_tests {
         let mut bash = files(&[("/home/user/log", "x\n")]);
         bash.exec("nosuchcmd >> /home/user/log 2>&1");
         assert_eq!(
-            bash.fs().read_file("/home/user/log").unwrap(),
+            bash.fs().read_file_str("/home/user/log").unwrap(),
             "x\nbash: nosuchcmd: command not found\n"
         );
     }
@@ -10396,26 +10538,26 @@ mod upstream_sync_tests {
     fn later_redirect_repoints_the_descriptor() {
         let mut bash = bash();
         bash.exec("echo hi > /home/user/a > /home/user/b");
-        assert_eq!(bash.fs().read_file("/home/user/a").unwrap(), "");
-        assert_eq!(bash.fs().read_file("/home/user/b").unwrap(), "hi\n");
+        assert_eq!(bash.fs().read_file_str("/home/user/a").unwrap(), "");
+        assert_eq!(bash.fs().read_file_str("/home/user/b").unwrap(), "hi\n");
     }
 
     #[test]
     fn dev_null_discards_without_creating_a_file() {
         let mut bash = bash();
         let result = bash.exec("nosuchcmd > /dev/null 2>&1; echo survived");
-        assert_eq!(result.stdout, "survived\n");
-        assert_eq!(result.stderr, "");
-        assert!(bash.fs().read_file("/dev/null").is_err());
+        assert_eq!(result.stdout_text(), "survived\n");
+        assert_eq!(result.stderr_text(), "");
+        assert!(bash.fs().read_file_str("/dev/null").is_err());
     }
 
     #[test]
     fn stdout_can_be_duplicated_onto_stderr() {
         let mut bash = bash();
         let result = bash.exec("echo hi 2> /home/user/e 1>&2");
-        assert_eq!(result.stdout, "");
-        assert_eq!(result.stderr, "");
-        assert_eq!(bash.fs().read_file("/home/user/e").unwrap(), "hi\n");
+        assert_eq!(result.stdout_text(), "");
+        assert_eq!(result.stderr_text(), "");
+        assert_eq!(bash.fs().read_file_str("/home/user/e").unwrap(), "hi\n");
     }
 
     #[test]
@@ -10423,30 +10565,30 @@ mod upstream_sync_tests {
         // `a2>f` is the word `a2`, not a redirect of descriptor 2.
         let mut bash = bash();
         bash.exec("echo a2>/home/user/n");
-        assert_eq!(bash.fs().read_file("/home/user/n").unwrap(), "a2\n");
+        assert_eq!(bash.fs().read_file_str("/home/user/n").unwrap(), "a2\n");
     }
 
     #[test]
     fn digit_only_word_before_the_operator_is_the_descriptor() {
         let mut bash = bash();
         bash.exec("echo 2>/home/user/m");
-        assert_eq!(bash.fs().read_file("/home/user/m").unwrap(), "");
+        assert_eq!(bash.fs().read_file_str("/home/user/m").unwrap(), "");
     }
 
     #[test]
     fn reading_from_dev_null_yields_an_empty_stream() {
         let mut bash = bash();
         let result = bash.exec("cat < /dev/null; echo after");
-        assert_eq!(result.stdout, "after\n");
-        assert_eq!(result.stderr, "");
-        assert!(bash.fs().read_file("/dev/null").is_err());
+        assert_eq!(result.stdout_text(), "after\n");
+        assert_eq!(result.stderr_text(), "");
+        assert!(bash.fs().read_file_str("/dev/null").is_err());
     }
 
     #[test]
     fn close_descriptor_discards_the_stream() {
         let result = run("echo hi 2>&-");
-        assert_eq!(result.stdout, "hi\n");
-        assert_eq!(result.stderr, "");
+        assert_eq!(result.stdout_text(), "hi\n");
+        assert_eq!(result.stderr_text(), "");
     }
 
     // ─── cat display flags (upstream #6130334f) ─────────────────────────────
@@ -10533,7 +10675,7 @@ mod upstream_sync_tests {
         let mut bash = files(&[("/a.txt", "a1\na2\n"), ("/b.txt", "b1\nb2\n")]);
         let result = bash.exec("cat -n /a.txt /b.txt");
         assert_eq!(
-            result.stdout,
+            result.stdout_text(),
             "     1\ta1\n     2\ta2\n     3\tb1\n     4\tb2\n"
         );
     }
@@ -10542,7 +10684,7 @@ mod upstream_sync_tests {
     fn cat_squeeze_spans_file_boundaries() {
         let mut bash = files(&[("/a.txt", "a\n\n"), ("/b.txt", "\n\nb\n")]);
         let result = bash.exec("cat -s /a.txt /b.txt");
-        assert_eq!(result.stdout, "a\n\nb\n");
+        assert_eq!(result.stdout_text(), "a\n\nb\n");
     }
 
     // ─── misc parity ────────────────────────────────────────────────────────
@@ -10550,7 +10692,7 @@ mod upstream_sync_tests {
     #[test]
     fn colon_is_a_successful_no_op() {
         let result = run(": anything here; echo $?");
-        assert_eq!(result.stdout, "0\n");
+        assert_eq!(result.stdout_text(), "0\n");
         assert_eq!(result.exit_code, 0);
     }
 
@@ -10571,7 +10713,10 @@ mod upstream_sync_tests {
     fn command_substitution_stderr_reaches_the_caller() {
         // A failing substitution must not vanish silently.
         let result = run("V=$(nosuchcmd); echo \"[${V}]\"");
-        assert!(result.stderr.contains("command not found"), "{result:?}");
+        assert!(
+            result.stderr_text().contains("command not found"),
+            "{result:?}"
+        );
     }
 }
 
@@ -10603,7 +10748,7 @@ mod grep_parity_tests {
     fn repeated_e_patterns_are_unioned() {
         let mut bash = with_files(&[("/t.txt", "aaa Q1\nbbb\nccc Q4\n")]);
         let result = bash.exec("grep -e Q1 -e Q4 /t.txt");
-        assert_eq!(result.stdout, "aaa Q1\nccc Q4\n");
+        assert_eq!(result.stdout_text(), "aaa Q1\nccc Q4\n");
         assert_eq!(result.exit_code, 0);
     }
 
@@ -10611,7 +10756,10 @@ mod grep_parity_tests {
     fn non_option_operands_are_files_when_e_is_present() {
         let mut bash = with_files(&[("/one.txt", "needle one\n"), ("/two.txt", "needle two\n")]);
         let result = bash.exec("grep /one.txt -e needle /two.txt");
-        assert_eq!(result.stdout, "/one.txt:needle one\n/two.txt:needle two\n");
+        assert_eq!(
+            result.stdout_text(),
+            "/one.txt:needle one\n/two.txt:needle two\n"
+        );
     }
 
     #[test]
@@ -10623,7 +10771,11 @@ mod grep_parity_tests {
             "grep -f/pat.txt /hay.txt",
         ] {
             let result = bash.exec(script);
-            assert_eq!(result.stdout, "apple pie\nbanana split\n", "{script}");
+            assert_eq!(
+                result.stdout_text(),
+                "apple pie\nbanana split\n",
+                "{script}"
+            );
         }
     }
 
@@ -10631,7 +10783,7 @@ mod grep_parity_tests {
     fn pattern_file_unions_with_e_patterns() {
         let mut bash = haystack();
         let result = bash.exec("grep -f /pat.txt -e cherry /hay.txt");
-        assert_eq!(result.stdout, "apple pie\ncherry\nbanana split\n");
+        assert_eq!(result.stdout_text(), "apple pie\ncherry\nbanana split\n");
     }
 
     #[test]
@@ -10644,22 +10796,22 @@ mod grep_parity_tests {
             "grep -f /empty.txt /nonexistent.txt",
         ] {
             let result = bash.exec(script);
-            assert_eq!(result.stdout, "", "{script}");
-            assert_eq!(result.stderr, "", "{script}");
+            assert_eq!(result.stdout_text(), "", "{script}");
+            assert_eq!(result.stderr_text(), "", "{script}");
             assert_eq!(result.exit_code, 1, "{script}");
         }
         // -v with an empty pattern list selects everything.
         let result = bash.exec("grep -v -f /empty.txt /hay.txt");
-        assert_eq!(result.stdout, "apple pie\ncherry\n");
+        assert_eq!(result.stdout_text(), "apple pie\ncherry\n");
     }
 
     #[test]
     fn missing_pattern_file_reports_and_exits_2() {
         let mut bash = haystack();
         let result = bash.exec("grep -f /missing.txt /hay.txt");
-        assert_eq!(result.stdout, "");
+        assert_eq!(result.stdout_text(), "");
         assert_eq!(
-            result.stderr,
+            result.stderr_text(),
             "grep: /missing.txt: No such file or directory\n"
         );
         assert_eq!(result.exit_code, 2);
@@ -10670,11 +10822,17 @@ mod grep_parity_tests {
         let mut bash = haystack();
         let short = bash.exec("grep -f");
         assert_eq!(short.exit_code, 2);
-        assert_eq!(short.stderr, "grep: option requires an argument -- 'f'\n");
+        assert_eq!(
+            short.stderr_text(),
+            "grep: option requires an argument -- 'f'\n"
+        );
 
         let long = bash.exec("grep --file");
         assert_eq!(long.exit_code, 2);
-        assert_eq!(long.stderr, "grep: option '--file' requires an argument\n");
+        assert_eq!(
+            long.stderr_text(),
+            "grep: option '--file' requires an argument\n"
+        );
     }
 
     #[test]
@@ -10693,7 +10851,7 @@ mod grep_parity_tests {
     fn dash_operand_reads_standard_input() {
         let mut bash = haystack();
         let result = bash.exec("printf 'apple\\n' | grep apple -");
-        assert_eq!(result.stdout, "apple\n");
+        assert_eq!(result.stdout_text(), "apple\n");
         assert_eq!(result.exit_code, 0);
     }
 
@@ -10701,21 +10859,24 @@ mod grep_parity_tests {
     fn lone_dash_gets_no_filename_prefix() {
         let mut bash = haystack();
         let result = bash.exec("printf 'apple\\n' | grep -n apple -");
-        assert_eq!(result.stdout, "1:apple\n");
+        assert_eq!(result.stdout_text(), "1:apple\n");
     }
 
     #[test]
     fn repeated_dash_operand_is_drained_after_the_first() {
         let mut bash = haystack();
         let result = bash.exec("printf 'apple\\n' | grep -c apple - -");
-        assert_eq!(result.stdout, "(standard input):1\n(standard input):0\n");
+        assert_eq!(
+            result.stdout_text(),
+            "(standard input):1\n(standard input):0\n"
+        );
     }
 
     #[test]
     fn dash_still_works_as_the_pattern() {
         let mut bash = with_files(&[("/dash.txt", "a-b\nxy\n")]);
         let result = bash.exec("grep - /dash.txt");
-        assert_eq!(result.stdout, "a-b\n");
+        assert_eq!(result.stdout_text(), "a-b\n");
     }
 
     #[test]
@@ -10727,7 +10888,7 @@ mod grep_parity_tests {
             ("grep -- --help /pt.txt", "--help\n"),
         ] {
             let result = bash.exec(script);
-            assert_eq!(result.stdout, expected, "{script}");
+            assert_eq!(result.stdout_text(), expected, "{script}");
         }
     }
 
@@ -10741,15 +10902,15 @@ mod grep_parity_tests {
         ]);
         // All match: nothing listed, status 0.
         let result = bash.exec("grep -L hello /m1.txt /m2.txt");
-        assert_eq!(result.stdout, "");
+        assert_eq!(result.stdout_text(), "");
         assert_eq!(result.exit_code, 0);
         // None match: every name listed, status 1.
         let result = bash.exec("grep -L hello /n1.txt /n2.txt");
-        assert_eq!(result.stdout, "/n1.txt\n/n2.txt\n");
+        assert_eq!(result.stdout_text(), "/n1.txt\n/n2.txt\n");
         assert_eq!(result.exit_code, 1);
         // Mixed: only the non-matching name, status 0.
         let result = bash.exec("grep -L hello /m1.txt /n1.txt");
-        assert_eq!(result.stdout, "/n1.txt\n");
+        assert_eq!(result.stdout_text(), "/n1.txt\n");
         assert_eq!(result.exit_code, 0);
     }
 
@@ -10757,9 +10918,9 @@ mod grep_parity_tests {
     fn unreadable_operand_outranks_a_match_but_still_searches() {
         let mut bash = with_files(&[("/m1.txt", "hello\n")]);
         let result = bash.exec("grep hello /m1.txt /missing.txt");
-        assert_eq!(result.stdout, "hello\n");
+        assert_eq!(result.stdout_text(), "hello\n");
         assert_eq!(
-            result.stderr,
+            result.stderr_text(),
             "grep: /missing.txt: No such file or directory\n"
         );
         assert_eq!(result.exit_code, 2);
@@ -10769,7 +10930,7 @@ mod grep_parity_tests {
     fn quiet_reports_status_without_output() {
         let mut bash = with_files(&[("/m1.txt", "hello\n")]);
         let result = bash.exec("grep -q hello /m1.txt");
-        assert_eq!(result.stdout, "");
+        assert_eq!(result.stdout_text(), "");
         assert_eq!(result.exit_code, 0);
     }
 
@@ -10781,32 +10942,35 @@ mod grep_parity_tests {
 
         let mut bash = with_files(&[("/t.txt", "foo\nbar\nfoobar\n")]);
         let result = bash.exec("grep -x -e foo -e bar /t.txt");
-        assert_eq!(result.stdout, "foo\nbar\n");
+        assert_eq!(result.stdout_text(), "foo\nbar\n");
     }
 
     #[test]
     fn ignore_case_and_invert_are_applied() {
         let mut bash = with_files(&[("/t.txt", "Apple\nbanana\n")]);
-        assert_eq!(bash.exec("grep -i apple /t.txt").stdout, "Apple\n");
+        assert_eq!(bash.exec("grep -i apple /t.txt").stdout_text(), "Apple\n");
         // -v is case-sensitive on its own, so `Apple` is kept.
-        assert_eq!(bash.exec("grep -v apple /t.txt").stdout, "Apple\nbanana\n");
-        assert_eq!(bash.exec("grep -v Apple /t.txt").stdout, "banana\n");
+        assert_eq!(
+            bash.exec("grep -v apple /t.txt").stdout_text(),
+            "Apple\nbanana\n"
+        );
+        assert_eq!(bash.exec("grep -v Apple /t.txt").stdout_text(), "banana\n");
         // -i makes `Apple` match, so -v excludes it and keeps `banana`.
-        assert_eq!(bash.exec("grep -iv apple /t.txt").stdout, "banana\n");
+        assert_eq!(bash.exec("grep -iv apple /t.txt").stdout_text(), "banana\n");
     }
 
     #[test]
     fn no_filename_suppresses_only_the_prefix() {
         let mut bash = with_files(&[("/a.txt", "x\n"), ("/b.txt", "x\n")]);
         let result = bash.exec("grep -h x /a.txt /b.txt");
-        assert_eq!(result.stdout, "x\nx\n");
+        assert_eq!(result.stdout_text(), "x\nx\n");
     }
 
     #[test]
     fn count_only_reports_per_file_totals() {
         let mut bash = with_files(&[("/a.txt", "x\nx\ny\n"), ("/b.txt", "y\n")]);
         let result = bash.exec("grep -c x /a.txt /b.txt");
-        assert_eq!(result.stdout, "/a.txt:2\n/b.txt:0\n");
+        assert_eq!(result.stdout_text(), "/a.txt:2\n/b.txt:0\n");
         assert_eq!(result.exit_code, 0);
     }
 }
@@ -10829,11 +10993,12 @@ mod feature_slice_tests {
     fn out(script: &str) -> String {
         let result = run(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "unexpected stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     fn files(entries: &[(&str, &str)]) -> Bash {
@@ -10853,31 +11018,36 @@ mod feature_slice_tests {
     #[test]
     fn heredoc_body_expands_parameters() {
         let result = run("name=world\ncat <<EOF\nhello $name\nEOF\n");
-        assert_eq!(result.stdout, "hello world\n", "stderr: {}", result.stderr);
+        assert_eq!(
+            result.stdout_text(),
+            "hello world\n",
+            "stderr: {}",
+            result.stderr_text()
+        );
     }
 
     #[test]
     fn quoted_heredoc_delimiter_suppresses_expansion() {
         let result = run("name=world\ncat <<'EOF'\nhello $name\nEOF\n");
-        assert_eq!(result.stdout, "hello $name\n");
+        assert_eq!(result.stdout_text(), "hello $name\n");
     }
 
     #[test]
     fn heredoc_dash_strips_leading_tabs() {
         let result = run("cat <<-EOF\n\tindented\n\tEOF\n");
-        assert_eq!(result.stdout, "indented\n");
+        assert_eq!(result.stdout_text(), "indented\n");
     }
 
     #[test]
     fn heredoc_runs_command_substitution() {
         let result = run("cat <<EOF\n$(printf sub)\nEOF\n");
-        assert_eq!(result.stdout, "sub\n");
+        assert_eq!(result.stdout_text(), "sub\n");
     }
 
     #[test]
     fn heredoc_keeps_quotes_literal() {
         let result = run("cat <<EOF\n\"quoted\" 'single'\nEOF\n");
-        assert_eq!(result.stdout, "\"quoted\" 'single'\n");
+        assert_eq!(result.stdout_text(), "\"quoted\" 'single'\n");
     }
 
     #[test]
@@ -10926,7 +11096,7 @@ mod feature_slice_tests {
     #[test]
     fn case_runs_several_commands_and_reports_status() {
         let result = run("case x in x) echo one; echo two;; esac\n");
-        assert_eq!(result.stdout, "one\ntwo\n");
+        assert_eq!(result.stdout_text(), "one\ntwo\n");
         assert_eq!(result.exit_code, 0);
         let result = run("case x in x) false;; esac\n");
         assert_eq!(result.exit_code, 1);
@@ -10973,9 +11143,9 @@ mod feature_slice_tests {
     #[test]
     fn function_return_sets_the_status() {
         let result = run("f() { return 3; }; f; echo $?\n");
-        assert_eq!(result.stdout, "3\n");
+        assert_eq!(result.stdout_text(), "3\n");
         let result = run("f() { true; }; f; echo $?\n");
-        assert_eq!(result.stdout, "0\n");
+        assert_eq!(result.stdout_text(), "0\n");
     }
 
     #[test]
@@ -10997,9 +11167,9 @@ mod feature_slice_tests {
         let result = run("return 1\n");
         assert_eq!(result.exit_code, 1);
         assert!(
-            result.stderr.contains("can only `return'"),
+            result.stderr_text().contains("can only `return'"),
             "{}",
-            result.stderr
+            result.stderr_text()
         );
     }
 
@@ -11007,7 +11177,12 @@ mod feature_slice_tests {
     fn functions_can_recurse() {
         let result =
             run("count() { if [ $1 -gt 0 ]; then echo $1; count $(( $1 - 1 )); fi; }; count 3\n");
-        assert_eq!(result.stdout, "3\n2\n1\n", "stderr: {}", result.stderr);
+        assert_eq!(
+            result.stdout_text(),
+            "3\n2\n1\n",
+            "stderr: {}",
+            result.stderr_text()
+        );
     }
 
     // ── `[[ … ]]` ──────────────────────────────────────────────────────────
@@ -11037,10 +11212,10 @@ mod feature_slice_tests {
     fn conditional_file_tests() {
         let mut bash = files(&[("/home/user/data.txt", "hello")]);
         let result = bash.exec("[[ -f data.txt ]] && echo file; [[ -d /tmp ]] && echo dir\n");
-        assert_eq!(result.stdout, "file\ndir\n");
+        assert_eq!(result.stdout_text(), "file\ndir\n");
         let result =
             bash.exec("[[ -s data.txt ]] && echo nonempty; [[ -e missing ]] || echo absent\n");
-        assert_eq!(result.stdout, "nonempty\nabsent\n");
+        assert_eq!(result.stdout_text(), "nonempty\nabsent\n");
     }
 
     #[test]
@@ -11116,7 +11291,7 @@ mod feature_slice_tests {
         let mut bash = bash();
         bash.exec("a=(1 2 3)");
         let result = bash.exec("echo ${#a[@]}");
-        assert_eq!(result.stdout, "0\n");
+        assert_eq!(result.stdout_text(), "0\n");
     }
 
     // ── PIPESTATUS and background jobs ─────────────────────────────────────
@@ -11141,19 +11316,28 @@ mod feature_slice_tests {
     #[test]
     fn background_statement_reports_success_and_unwinds_later() {
         let result = run("echo bg & echo fg\n");
-        assert_eq!(result.stdout, "bg\nfg\n");
+        assert_eq!(result.stdout_text(), "bg\nfg\n");
         assert_eq!(result.exit_code, 0);
     }
 
     #[test]
     fn wait_returns_the_job_status_and_jobs_lists_it() {
         let result = run("false & wait; echo $?\n");
-        assert_eq!(result.stdout, "1\n", "stderr: {}", result.stderr);
+        assert_eq!(
+            result.stdout_text(),
+            "1\n",
+            "stderr: {}",
+            result.stderr_text()
+        );
         let result = run("sh -c 'exit 4' & true\n");
         // `sh` is not available; the job still records the failure status.
         assert_eq!(result.exit_code, 0);
         let result = run("true & jobs\n");
-        assert!(result.stdout.contains("[1] Done"), "{}", result.stdout);
+        assert!(
+            result.stdout_text().contains("[1] Done"),
+            "{}",
+            result.stdout_text()
+        );
     }
 
     #[test]
@@ -11184,7 +11368,7 @@ mod feature_slice_tests {
     #[test]
     fn process_substitution_removes_its_temporary_file() {
         let result = run("cat <(echo tmp) > /dev/null; echo ${#PIPESTATUS[@]}\n");
-        assert_eq!(result.stdout, "1\n");
+        assert_eq!(result.stdout_text(), "1\n");
     }
 
     #[test]
@@ -11201,16 +11385,16 @@ mod feature_slice_tests {
             ("/home/user/b.txt", ""),
             ("/home/user/c.md", ""),
         ]);
-        assert_eq!(bash.exec("echo *.txt").stdout, "a.txt b.txt\n");
-        assert_eq!(bash.exec("echo *.none").stdout, "*.none\n");
-        assert_eq!(bash.exec("echo ?.md").stdout, "c.md\n");
+        assert_eq!(bash.exec("echo *.txt").stdout_text(), "a.txt b.txt\n");
+        assert_eq!(bash.exec("echo *.none").stdout_text(), "*.none\n");
+        assert_eq!(bash.exec("echo ?.md").stdout_text(), "c.md\n");
     }
 
     #[test]
     fn glob_is_skipped_for_quoted_and_escaped_metacharacters() {
         let mut bash = files(&[("/home/user/a.txt", "")]);
-        assert_eq!(bash.exec("echo \"*.txt\"").stdout, "*.txt\n");
-        assert_eq!(bash.exec("echo \\*.txt").stdout, "*.txt\n");
+        assert_eq!(bash.exec("echo \"*.txt\"").stdout_text(), "*.txt\n");
+        assert_eq!(bash.exec("echo \\*.txt").stdout_text(), "*.txt\n");
     }
 
     #[test]
@@ -11220,10 +11404,10 @@ mod feature_slice_tests {
             ("/home/user/src/lib.rs", ""),
         ]);
         assert_eq!(
-            bash.exec("echo src/*.rs").stdout,
+            bash.exec("echo src/*.rs").stdout_text(),
             "src/lib.rs src/main.rs\n"
         );
-        assert_eq!(bash.exec("echo */").stdout, "src/\n");
+        assert_eq!(bash.exec("echo */").stdout_text(), "src/\n");
     }
 
     #[test]
@@ -11233,15 +11417,16 @@ mod feature_slice_tests {
             ("/home/user/a", ""),
             ("/home/user/.hidden", ""),
         ]);
-        assert_eq!(bash.exec("echo *").stdout, "a b\n");
-        assert_eq!(bash.exec("echo .*").stdout, ".hidden\n");
+        assert_eq!(bash.exec("echo *").stdout_text(), "a b\n");
+        assert_eq!(bash.exec("echo .*").stdout_text(), ".hidden\n");
     }
 
     #[test]
     fn for_loop_iterates_glob_matches() {
         let mut bash = files(&[("/home/user/a.txt", ""), ("/home/user/b.txt", "")]);
         assert_eq!(
-            bash.exec("for f in *.txt; do echo \"[$f]\"; done").stdout,
+            bash.exec("for f in *.txt; do echo \"[$f]\"; done")
+                .stdout_text(),
             "[a.txt]\n[b.txt]\n"
         );
     }
@@ -11273,18 +11458,19 @@ mod feature_slice_tests {
             "a=$(mktemp); b=$(mktemp); [ \"$a\" != \"$b\" ] && echo distinct; [ -f \"$a\" ] && echo exists\n",
         );
         assert_eq!(
-            result.stdout, "distinct\nexists\n",
+            result.stdout_text(),
+            "distinct\nexists\n",
             "stderr: {}",
-            result.stderr
+            result.stderr_text()
         );
     }
 
     #[test]
     fn mktemp_directory_and_template() {
         let result = run("d=$(mktemp -d); [ -d \"$d\" ] && echo dir\n");
-        assert_eq!(result.stdout, "dir\n");
+        assert_eq!(result.stdout_text(), "dir\n");
         let result = run("f=$(mktemp /tmp/name.XXXXXX); echo \"$f\"\n");
-        assert_eq!(result.stdout, "/tmp/name.000001\n");
+        assert_eq!(result.stdout_text(), "/tmp/name.000001\n");
     }
 
     #[test]
@@ -11307,20 +11493,27 @@ mod feature_slice_tests {
     #[test]
     fn stat_reports_size_and_type() {
         let mut bash = files(&[("/home/user/data", "hello")]);
-        assert_eq!(bash.exec("stat -c '%s %F' data").stdout, "5 regular file");
-        assert_eq!(bash.exec("stat -c '%F' /tmp").stdout, "directory");
+        assert_eq!(
+            bash.exec("stat -c '%s %F' data").stdout_text(),
+            "5 regular file"
+        );
+        assert_eq!(bash.exec("stat -c '%F' /tmp").stdout_text(), "directory");
     }
 
     #[test]
     fn chmod_rejects_an_invalid_mode() {
         let result = run("touch /tmp/f; chmod 999 /tmp/f\n");
         assert_eq!(result.exit_code, 1);
-        assert!(result.stderr.contains("invalid mode"), "{}", result.stderr);
+        assert!(
+            result.stderr_text().contains("invalid mode"),
+            "{}",
+            result.stderr_text()
+        );
     }
 
     #[test]
     fn sleep_validates_its_operand() {
-        assert_eq!(run("sleep 1; echo ok\n").stdout, "ok\n");
+        assert_eq!(run("sleep 1; echo ok\n").stdout_text(), "ok\n");
         let result = run("sleep abc\n");
         assert_eq!(result.exit_code, 1);
     }
@@ -11330,8 +11523,8 @@ mod feature_slice_tests {
     #[test]
     fn ls_sorts_by_name_by_default_and_reverses() {
         let mut bash = files(&[("/home/user/b", ""), ("/home/user/a", "")]);
-        assert_eq!(bash.exec("ls").stdout, "a\nb\n");
-        assert_eq!(bash.exec("ls -r").stdout, "b\na\n");
+        assert_eq!(bash.exec("ls").stdout_text(), "a\nb\n");
+        assert_eq!(bash.exec("ls -r").stdout_text(), "b\na\n");
     }
 
     #[test]
@@ -11339,9 +11532,9 @@ mod feature_slice_tests {
         let mut bash = bash();
         bash.exec("echo 1 > small; echo 12345 > large");
         // `large` was written last, so it is newest and largest.
-        assert_eq!(bash.exec("ls -t").stdout, "large\nsmall\n");
-        assert_eq!(bash.exec("ls -S").stdout, "large\nsmall\n");
-        assert_eq!(bash.exec("ls -Sr").stdout, "small\nlarge\n");
+        assert_eq!(bash.exec("ls -t").stdout_text(), "large\nsmall\n");
+        assert_eq!(bash.exec("ls -S").stdout_text(), "large\nsmall\n");
+        assert_eq!(bash.exec("ls -Sr").stdout_text(), "small\nlarge\n");
     }
 
     #[test]
@@ -11351,29 +11544,44 @@ mod feature_slice_tests {
             ("/home/user/visible", ""),
             ("/home/user/dir/x", ""),
         ]);
-        assert_eq!(bash.exec("ls").stdout, "dir\nvisible\n");
-        assert_eq!(bash.exec("ls -a").stdout, ".\n..\n.hidden\ndir\nvisible\n");
-        assert_eq!(bash.exec("ls -A").stdout, ".hidden\ndir\nvisible\n");
-        assert_eq!(bash.exec("ls -F").stdout, "dir/\nvisible\n");
+        assert_eq!(bash.exec("ls").stdout_text(), "dir\nvisible\n");
+        assert_eq!(
+            bash.exec("ls -a").stdout_text(),
+            ".\n..\n.hidden\ndir\nvisible\n"
+        );
+        assert_eq!(bash.exec("ls -A").stdout_text(), ".hidden\ndir\nvisible\n");
+        assert_eq!(bash.exec("ls -F").stdout_text(), "dir/\nvisible\n");
     }
 
     #[test]
     fn ls_accepts_multiple_operands_and_long_format() {
         let mut bash = files(&[("/home/user/a", "1"), ("/home/user/b", "22")]);
         let result = bash.exec("ls a b");
-        assert_eq!(result.stdout, "a\nb\n");
+        assert_eq!(result.stdout_text(), "a\nb\n");
         let result = bash.exec("ls -l a");
-        assert!(result.stdout.starts_with("-rw-r--r--"), "{}", result.stdout);
-        assert!(result.stdout.contains("a\n"), "{}", result.stdout);
+        assert!(
+            result.stdout_text().starts_with("-rw-r--r--"),
+            "{}",
+            result.stdout_text()
+        );
+        assert!(
+            result.stdout_text().contains("a\n"),
+            "{}",
+            result.stdout_text()
+        );
         let result = bash.exec("ls missing");
         assert_eq!(result.exit_code, 2);
-        assert!(result.stderr.contains("No such file"), "{}", result.stderr);
+        assert!(
+            result.stderr_text().contains("No such file"),
+            "{}",
+            result.stderr_text()
+        );
     }
 
     #[test]
     fn ls_directory_itself_with_dash_d() {
         let mut bash = files(&[("/home/user/dir/x", "")]);
-        assert_eq!(bash.exec("ls -d dir").stdout, "dir\n");
+        assert_eq!(bash.exec("ls -d dir").stdout_text(), "dir\n");
     }
 
     // ── Regex-backed grep ──────────────────────────────────────────────────
@@ -11415,7 +11623,7 @@ mod feature_slice_tests {
     fn grep_invalid_regex_exits_two() {
         let result = run("echo x | grep -E '('\n");
         assert_eq!(result.exit_code, 2);
-        assert!(!result.stderr.is_empty(), "expected a syntax error");
+        assert!(!result.stderr_text().is_empty(), "expected a syntax error");
     }
 
     // ── sed ────────────────────────────────────────────────────────────────
@@ -11439,7 +11647,10 @@ mod feature_slice_tests {
     #[test]
     fn sed_reads_files_from_the_virtual_filesystem() {
         let mut bash = files(&[("/home/user/data.txt", "one two\n")]);
-        assert_eq!(bash.exec("sed 's/one/1/' data.txt").stdout, "1 two\n");
+        assert_eq!(
+            bash.exec("sed 's/one/1/' data.txt").stdout_text(),
+            "1 two\n"
+        );
     }
 
     #[test]
@@ -11448,9 +11659,9 @@ mod feature_slice_tests {
         let result = run("printf 'x\\n' | sed 'w out.txt'\n");
         assert_eq!(result.exit_code, 1);
         assert!(
-            result.stderr.contains("unsupported command"),
+            result.stderr_text().contains("unsupported command"),
             "{}",
-            result.stderr
+            result.stderr_text()
         );
     }
 
@@ -11464,7 +11675,7 @@ mod feature_slice_tests {
             .insert("http://example.test/hello".to_string(), "hi\n".to_string());
         let mut bash = Bash::new(options).expect("initialize");
         let result = bash.exec("curl http://example.test/hello");
-        assert_eq!(result.stdout, "hi\n");
+        assert_eq!(result.stdout_text(), "hi\n");
         assert_eq!(result.exit_code, 0);
     }
 
@@ -11476,14 +11687,18 @@ mod feature_slice_tests {
             .insert("http://example.test/data".to_string(), "body".to_string());
         let mut bash = Bash::new(options).expect("initialize");
         let result = bash.exec("curl -s -o /tmp/out http://example.test/data; cat /tmp/out");
-        assert_eq!(result.stdout, "body");
+        assert_eq!(result.stdout_text(), "body");
         let result = bash.exec("curl -s -i http://example.test/data");
         assert!(
-            result.stdout.starts_with("HTTP/1.1 200 OK"),
+            result.stdout_text().starts_with("HTTP/1.1 200 OK"),
             "{}",
-            result.stdout
+            result.stdout_text()
         );
-        assert!(result.stdout.ends_with("body"), "{}", result.stdout);
+        assert!(
+            result.stdout_text().ends_with("body"),
+            "{}",
+            result.stdout_text()
+        );
     }
 
     #[test]
@@ -11491,9 +11706,9 @@ mod feature_slice_tests {
         let result = run("curl http://example.test/\n");
         assert_eq!(result.exit_code, 7);
         assert!(
-            result.stderr.contains("network access is disabled"),
+            result.stderr_text().contains("network access is disabled"),
             "{}",
-            result.stderr
+            result.stderr_text()
         );
     }
 
@@ -11530,11 +11745,11 @@ mod feature_slice_tests {
     #[test]
     fn negation_inverts_the_status() {
         let result = run("! true; echo $?\n");
-        assert_eq!(result.stdout, "1\n");
+        assert_eq!(result.stdout_text(), "1\n");
         let result = run("! false; echo $?\n");
-        assert_eq!(result.stdout, "0\n");
+        assert_eq!(result.stdout_text(), "0\n");
         let result = run("! [ -f /nope ] && echo absent\n");
-        assert_eq!(result.stdout, "absent\n");
+        assert_eq!(result.stdout_text(), "absent\n");
     }
 
     #[test]
@@ -11547,9 +11762,11 @@ mod feature_slice_tests {
             let result = run(&format!("{command}\n"));
             assert_eq!(result.exit_code, 127, "{command}");
             assert!(
-                result.stderr.contains("does not embed an interpreter"),
+                result
+                    .stderr_text()
+                    .contains("does not embed an interpreter"),
                 "{command} -> {}",
-                result.stderr
+                result.stderr_text()
             );
         }
     }
@@ -11559,7 +11776,7 @@ mod feature_slice_tests {
         let result = run("definitely-not-a-command\n");
         assert_eq!(result.exit_code, 127);
         assert_eq!(
-            result.stderr,
+            result.stderr_text(),
             "bash: definitely-not-a-command: command not found\n"
         );
     }
@@ -11569,14 +11786,14 @@ mod feature_slice_tests {
     #[test]
     fn errexit_stops_after_a_failed_conditional_statement() {
         let result = run("set -e\n[[ -n '' ]]\necho unreachable\n");
-        assert_eq!(result.stdout, "");
+        assert_eq!(result.stdout_text(), "");
         assert_eq!(result.exit_code, 1);
     }
 
     #[test]
     fn pipefail_reports_the_failing_stage() {
         let result = run("set -o pipefail\nfalse | true\necho $?\n");
-        assert_eq!(result.stdout, "1\n");
+        assert_eq!(result.stdout_text(), "1\n");
     }
 
     #[test]
@@ -11600,8 +11817,8 @@ mod feature_slice_tests {
     #[test]
     fn dot_components_glob_correctly() {
         let mut bash = files(&[("/home/user/a.rs", ""), ("/home/user/b.rs", "")]);
-        assert_eq!(bash.exec("echo ./*.rs").stdout, "./a.rs ./b.rs\n");
-        assert_eq!(bash.exec("echo ./a.rs").stdout, "./a.rs\n");
+        assert_eq!(bash.exec("echo ./*.rs").stdout_text(), "./a.rs ./b.rs\n");
+        assert_eq!(bash.exec("echo ./a.rs").stdout_text(), "./a.rs\n");
     }
 
     #[test]
@@ -11632,11 +11849,12 @@ mod array_and_declare_tests {
     fn out(script: &str) -> String {
         let result = run(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "unexpected stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     // ── Associative arrays ──────────────────────────────────────────────────
@@ -11702,7 +11920,7 @@ mod array_and_declare_tests {
     fn associative_arrays_are_isolated_between_exec_calls() {
         let mut bash = Bash::new(Options::default()).expect("initialize");
         bash.exec("declare -A m=([a]=1)");
-        assert_eq!(bash.exec("echo ${#m[@]}").stdout, "0\n");
+        assert_eq!(bash.exec("echo ${#m[@]}").stdout_text(), "0\n");
     }
 
     // ── Indexed arrays keep working ─────────────────────────────────────────
@@ -11829,9 +12047,11 @@ mod array_and_declare_tests {
         let result = run("local x=1\n");
         assert_eq!(result.exit_code, 1);
         assert!(
-            result.stderr.contains("can only be used in a function"),
+            result
+                .stderr_text()
+                .contains("can only be used in a function"),
             "{}",
-            result.stderr
+            result.stderr_text()
         );
     }
 
@@ -11840,9 +12060,9 @@ mod array_and_declare_tests {
         let result = run("declare 1bad=2\n");
         assert_eq!(result.exit_code, 1);
         assert!(
-            result.stderr.contains("not a valid identifier"),
+            result.stderr_text().contains("not a valid identifier"),
             "{}",
-            result.stderr
+            result.stderr_text()
         );
     }
 
@@ -11871,7 +12091,11 @@ mod array_and_declare_tests {
     fn array_literal_on_a_non_declaration_is_a_syntax_error() {
         let result = run("echo a=(1 2)\n");
         assert_eq!(result.exit_code, 2);
-        assert!(result.stderr.contains("syntax error"), "{}", result.stderr);
+        assert!(
+            result.stderr_text().contains("syntax error"),
+            "{}",
+            result.stderr_text()
+        );
     }
 
     // ── shift ──────────────────────────────────────────────────────────────
@@ -11886,7 +12110,7 @@ mod array_and_declare_tests {
     #[test]
     fn shift_past_the_end_reports_failure() {
         let result = run("set -- a; shift 5; echo $?\n");
-        assert_eq!(result.stdout, "1\n");
+        assert_eq!(result.stdout_text(), "1\n");
         // The positional parameters are unchanged.
         assert_eq!(out("set -- a; shift 5; echo $1\n"), "a\n");
     }
@@ -11896,9 +12120,9 @@ mod array_and_declare_tests {
         let result = run("set -- a; shift x\n");
         assert_eq!(result.exit_code, 1);
         assert!(
-            result.stderr.contains("numeric argument required"),
+            result.stderr_text().contains("numeric argument required"),
             "{}",
-            result.stderr
+            result.stderr_text()
         );
     }
 
@@ -11928,11 +12152,12 @@ mod feature_edge_tests {
     fn out(script: &str) -> String {
         let result = run(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "unexpected stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     #[test]
@@ -11976,9 +12201,9 @@ mod feature_edge_tests {
         let result = run("set -u\nunset v\necho ${v:1}\n");
         assert_eq!(result.exit_code, 1);
         assert!(
-            result.stderr.contains("unbound variable"),
+            result.stderr_text().contains("unbound variable"),
             "{}",
-            result.stderr
+            result.stderr_text()
         );
     }
 
@@ -12044,7 +12269,7 @@ mod host_safety_tests {
         let result = bash_with(limits).exec("f(){ f; }; f");
         assert_eq!(result.exit_code, 1);
         assert_eq!(
-            result.stderr,
+            result.stderr_text(),
             "bash: maximum function call depth exceeded (20)\n"
         );
     }
@@ -12060,7 +12285,7 @@ mod host_safety_tests {
         assert_eq!(result.exit_code, 1);
         assert!(
             result
-                .stderr
+                .stderr_text()
                 .contains("maximum function call depth exceeded")
         );
     }
@@ -12076,7 +12301,7 @@ mod host_safety_tests {
         let result = bash_with(limits).exec(&script);
         assert_eq!(result.exit_code, 1);
         assert_eq!(
-            result.stderr,
+            result.stderr_text(),
             "bash: maximum expansion depth exceeded (10)\n"
         );
     }
@@ -12092,7 +12317,7 @@ mod host_safety_tests {
         let result = bash_with(limits).exec(&script);
         assert_eq!(result.exit_code, 2);
         assert_eq!(
-            result.stderr,
+            result.stderr_text(),
             "bash: maximum parser nesting depth exceeded (8)\n"
         );
     }
@@ -12112,7 +12337,7 @@ mod host_safety_tests {
                 );
                 assert_eq!(bash.exec(&nested).exit_code, 2);
                 assert_eq!(bash.exec("f(){ f; }; f").exit_code, 1);
-                assert_eq!(bash.exec("echo ok").stdout, "ok\n");
+                assert_eq!(bash.exec("echo ok").stdout_text(), "ok\n");
             })
             .unwrap();
         handle.join().expect("small-stack worker must not abort");
@@ -12122,8 +12347,8 @@ mod host_safety_tests {
     #[test]
     fn read_reports_eof() {
         let result = bash_with(ExecutionLimits::default()).exec("read x; echo \"rc=$?\"");
-        assert_eq!(result.stdout, "rc=1\n");
-        assert_eq!(result.stderr, "");
+        assert_eq!(result.stdout_text(), "rc=1\n");
+        assert_eq!(result.stderr_text(), "");
     }
 
     /// An empty line is data, not EOF.
@@ -12133,7 +12358,7 @@ mod host_safety_tests {
             .exec("printf '\\n' | { read x; echo \"rc=$? v=[$x]\"; }");
         // Compound-command pipes are not supported yet, so assert only that the
         // blank line case does not report EOF when stdin holds a newline.
-        assert!(!result.stdout.contains("rc=1 v=[]"));
+        assert!(!result.stdout_text().contains("rc=1 v=[]"));
     }
 
     /// Limits must not disturb ordinary scripts.
@@ -12141,8 +12366,8 @@ mod host_safety_tests {
     fn ordinary_scripts_still_run() {
         let result = bash_with(ExecutionLimits::default())
             .exec("f(){ echo fn; }; f; (echo sub); { echo grp; }; x=1; echo $x");
-        assert_eq!(result.stdout, "fn\nsub\ngrp\n1\n");
-        assert_eq!(result.stderr, "");
+        assert_eq!(result.stdout_text(), "fn\nsub\ngrp\n1\n");
+        assert_eq!(result.stderr_text(), "");
         assert_eq!(result.exit_code, 0);
     }
 }
@@ -12158,11 +12383,12 @@ mod compound_redirect_tests {
     fn out(script: &str) -> String {
         let result = bash().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "unexpected stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     /// `{ …; } > f` used to print to stdout and leave an empty file.
@@ -12220,7 +12446,7 @@ mod compound_redirect_tests {
     #[test]
     fn compound_stderr_redirect_is_separate() {
         let result = bash().exec("{ echo out; echo err >&2; } > /o 2> /e; cat /o; cat /e");
-        assert_eq!(result.stdout, "out\nerr\n");
+        assert_eq!(result.stdout_text(), "out\nerr\n");
     }
 
     /// The input redirect is shared by every command inside the compound.
@@ -12279,9 +12505,9 @@ mod compound_redirect_tests {
         let result = bash().exec("{ cat; } < /missing");
         assert_eq!(result.exit_code, 1);
         assert!(
-            result.stderr.contains("No such file or directory"),
+            result.stderr_text().contains("No such file or directory"),
             "{}",
-            result.stderr
+            result.stderr_text()
         );
     }
 
@@ -12352,11 +12578,12 @@ mod word_splitting_tests {
     fn out(script: &str) -> String {
         let result = bash().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "unexpected stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     fn fields(script: &str) -> String {
@@ -12472,10 +12699,13 @@ mod word_splitting_tests {
             ..Options::default()
         })
         .expect("initialize");
-        assert_eq!(bash.exec("echo *.txt").stdout, "a.txt b.txt\n");
-        assert_eq!(bash.exec("echo \"*.txt\"").stdout, "*.txt\n");
-        assert_eq!(bash.exec("echo \\*.txt").stdout, "*.txt\n");
-        assert_eq!(bash.exec("x='*.txt'; echo $x").stdout, "a.txt b.txt\n");
+        assert_eq!(bash.exec("echo *.txt").stdout_text(), "a.txt b.txt\n");
+        assert_eq!(bash.exec("echo \"*.txt\"").stdout_text(), "*.txt\n");
+        assert_eq!(bash.exec("echo \\*.txt").stdout_text(), "*.txt\n");
+        assert_eq!(
+            bash.exec("x='*.txt'; echo $x").stdout_text(),
+            "a.txt b.txt\n"
+        );
     }
 
     #[test]
@@ -12489,7 +12719,7 @@ mod word_splitting_tests {
         })
         .expect("initialize");
         assert_eq!(
-            bash.exec("x=\"*.txt *.md\"; echo $x").stdout,
+            bash.exec("x=\"*.txt *.md\"; echo $x").stdout_text(),
             "a.txt b.md\n"
         );
     }
@@ -12511,11 +12741,12 @@ mod pattern_operator_tests {
     fn out(script: &str) -> String {
         let result = bash().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "unexpected stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     fn value(script: &str) -> String {
@@ -12647,11 +12878,12 @@ mod assignment_prefix_tests {
     fn out(script: &str) -> String {
         let result = bash().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "unexpected stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     /// `VAR=value cmd` used to be treated as a command named `VAR=value`,
@@ -12677,7 +12909,7 @@ mod assignment_prefix_tests {
     fn assignment_prefix_value_is_not_field_split() {
         // The value keeps its space: assignments never undergo word splitting.
         let result = bash().exec("q='a b'; x=$q env");
-        assert!(result.stdout.lines().any(|line| line == "x=a b"));
+        assert!(result.stdout_text().lines().any(|line| line == "x=a b"));
     }
 
     #[test]
@@ -12724,11 +12956,12 @@ mod parser_expansion_tests {
     fn out(script: &str) -> String {
         let result = bash().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "unexpected stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     fn value(script: &str) -> String {
@@ -12841,7 +13074,7 @@ mod parser_expansion_tests {
             ..Options::default()
         })
         .expect("initialize");
-        assert_eq!(bash.exec("echo *.{txt,md}").stdout, "a.txt b.md\n");
+        assert_eq!(bash.exec("echo *.{txt,md}").stdout_text(), "a.txt b.md\n");
     }
 
     /// A word with expansions inside braces keeps the ordinary path.
@@ -12862,11 +13095,12 @@ mod arithmetic_tests {
     fn out(script: &str) -> String {
         let result = bash().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "unexpected stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     fn value(script: &str) -> String {
@@ -12939,7 +13173,11 @@ mod arithmetic_tests {
     fn division_by_zero_is_an_error() {
         let result = bash().exec("echo $((1/0))");
         assert_ne!(result.exit_code, 0);
-        assert!(result.stderr.contains("division by 0"), "{}", result.stderr);
+        assert!(
+            result.stderr_text().contains("division by 0"),
+            "{}",
+            result.stderr_text()
+        );
     }
 
     // ── `(( … ))` ───────────────────────────────────────────────────────
@@ -12992,7 +13230,11 @@ mod arithmetic_tests {
     fn let_reports_syntax_errors() {
         let result = bash().exec("let x=1+");
         assert_eq!(result.exit_code, 2);
-        assert!(result.stderr.contains("let"), "{}", result.stderr);
+        assert!(
+            result.stderr_text().contains("let"),
+            "{}",
+            result.stderr_text()
+        );
     }
 }
 
@@ -13007,11 +13249,12 @@ mod shell_builtin_tests {
     fn out(script: &str) -> String {
         let result = bash().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "unexpected stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     // ── eval ────────────────────────────────────────────────────────────
@@ -13047,7 +13290,8 @@ mod shell_builtin_tests {
         // A self-evaluating script would recurse forever without the bound.
         let result = bash.exec("eval 'eval \"eval \\\"eval \\\\\\\"echo deep\\\\\\\"\\\"\"'");
         assert!(
-            result.stderr.contains("nesting exceeds limit") || result.stdout.contains("deep"),
+            result.stderr_text().contains("nesting exceeds limit")
+                || result.stdout_text().contains("deep"),
             "unexpected result: {result:?}"
         );
     }
@@ -13081,9 +13325,9 @@ mod shell_builtin_tests {
         let result = bash().exec("source /nope");
         assert_eq!(result.exit_code, 1);
         assert!(
-            result.stderr.contains("No such file or directory"),
+            result.stderr_text().contains("No such file or directory"),
             "{}",
-            result.stderr
+            result.stderr_text()
         );
     }
 
@@ -13091,7 +13335,7 @@ mod shell_builtin_tests {
     fn source_without_a_file_is_a_usage_error() {
         let result = bash().exec("source");
         assert_eq!(result.exit_code, 2);
-        assert!(result.stderr.contains("filename argument"));
+        assert!(result.stderr_text().contains("filename argument"));
     }
 
     // ── type / command ──────────────────────────────────────────────────
@@ -13102,7 +13346,7 @@ mod shell_builtin_tests {
         assert_eq!(out("f(){ :; }; type f"), "f is a function\n");
         let result = bash().exec("type nosuchcmd");
         assert_eq!(result.exit_code, 1);
-        assert!(result.stderr.contains("not found"));
+        assert!(result.stderr_text().contains("not found"));
     }
 
     #[test]
@@ -13132,11 +13376,12 @@ mod text_tool_option_tests {
     fn out(script: &str) -> String {
         let result = bash().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "unexpected stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     /// These all used to treat the option as a file name and report
@@ -13215,9 +13460,9 @@ mod text_tool_option_tests {
         let result = bash().exec("printf 'x\\n' | sort -z");
         assert_eq!(result.exit_code, 2);
         assert!(
-            result.stderr.contains("invalid option"),
+            result.stderr_text().contains("invalid option"),
             "{}",
-            result.stderr
+            result.stderr_text()
         );
     }
 }
@@ -13233,11 +13478,12 @@ mod grep_tr_tests {
     fn out(script: &str) -> String {
         let result = bash().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "unexpected stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     fn with_files(entries: &[(&str, &str)]) -> Bash {
@@ -13329,9 +13575,9 @@ mod grep_tr_tests {
             ("/home/user/dir/sub/c.md", "hello from c\n"),
         ]);
         let result = bash.exec("grep -r hello dir");
-        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert_eq!(result.exit_code, 0, "{}", result.stderr_text());
         assert_eq!(
-            result.stdout,
+            result.stdout_text(),
             "dir/a.txt:hello from a\ndir/sub/b.txt:hello from b\ndir/sub/c.md:hello from c\n"
         );
     }
@@ -13344,7 +13590,7 @@ mod grep_tr_tests {
         ]);
         let result = bash.exec("grep -r --include='*.ts' hello dir");
         // `-r` names the file even when only one matches.
-        assert_eq!(result.stdout, "dir/a.ts:hello ts\n");
+        assert_eq!(result.stdout_text(), "dir/a.ts:hello ts\n");
     }
 
     // ── tr ──────────────────────────────────────────────────────────────
@@ -13388,11 +13634,12 @@ mod misc_builtin_tests {
     fn out(script: &str) -> String {
         let result = bash().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "unexpected stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     fn with_files(entries: &[(&str, &str)]) -> Bash {
@@ -13483,9 +13730,13 @@ mod misc_builtin_tests {
     #[test]
     fn alias_reports_missing_names_on_stderr() {
         let result = bash().exec("alias notexists || echo failed");
-        assert_eq!(result.stdout, "failed\n");
+        assert_eq!(result.stdout_text(), "failed\n");
         assert_eq!(result.exit_code, 0);
-        assert!(result.stderr.contains("not found"), "{}", result.stderr);
+        assert!(
+            result.stderr_text().contains("not found"),
+            "{}",
+            result.stderr_text()
+        );
     }
 
     #[test]
@@ -13495,8 +13746,8 @@ mod misc_builtin_tests {
             "done\n"
         );
         let result = bash().exec("unalias nonexistent || echo not_found");
-        assert_eq!(result.stdout, "not_found\n");
-        assert!(result.stderr.contains("not found"));
+        assert_eq!(result.stdout_text(), "not_found\n");
+        assert!(result.stderr_text().contains("not found"));
     }
 
     // ── ls -R ───────────────────────────────────────────────────────────
@@ -13509,9 +13760,9 @@ mod misc_builtin_tests {
             ("/home/user/dir/sub/file2.txt", "z\n"),
         ]);
         let result = bash.exec("ls -R");
-        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert_eq!(result.exit_code, 0, "{}", result.stderr_text());
         assert_eq!(
-            result.stdout,
+            result.stdout_text(),
             ".:\ndir\nfile.txt\n\n./dir:\nfile1.txt\nsub\n\n./dir/sub:\nfile2.txt\n"
         );
     }
@@ -13528,11 +13779,12 @@ mod textutils_builtin_tests {
     fn out(script: &str) -> String {
         let result = bash().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "unexpected stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     fn with_files(entries: &[(&str, &str)]) -> Bash {
@@ -13594,11 +13846,18 @@ mod textutils_builtin_tests {
             ("/home/user/a.txt", "a\nb\nc\n"),
             ("/home/user/b.txt", "1\n2\n"),
         ]);
-        assert_eq!(bash.exec("paste a.txt b.txt").stdout, "a\t1\nb\t2\nc\t\n");
-        assert_eq!(bash.exec("paste -d, a.txt b.txt").stdout, "a,1\nb,2\nc,\n");
-        assert_eq!(bash.exec("paste -sd, a.txt").stdout, "a,b,c\n");
         assert_eq!(
-            bash.exec("printf '1\\n2\\n3\\n4\\n' | paste - -").stdout,
+            bash.exec("paste a.txt b.txt").stdout_text(),
+            "a\t1\nb\t2\nc\t\n"
+        );
+        assert_eq!(
+            bash.exec("paste -d, a.txt b.txt").stdout_text(),
+            "a,1\nb,2\nc,\n"
+        );
+        assert_eq!(bash.exec("paste -sd, a.txt").stdout_text(), "a,b,c\n");
+        assert_eq!(
+            bash.exec("printf '1\\n2\\n3\\n4\\n' | paste - -")
+                .stdout_text(),
             "1\t2\n3\t4\n"
         );
     }
@@ -13623,18 +13882,18 @@ mod textutils_builtin_tests {
     fn split_writes_chunk_files() {
         let mut bash = with_files(&[("/home/user/test.txt", "a\nb\nc\n")]);
         let result = bash.exec("split -l 1 test.txt");
-        assert_eq!(result.exit_code, 0, "{}", result.stderr);
-        assert_eq!(bash.exec("cat xaa").stdout, "a\n");
-        assert_eq!(bash.exec("cat xab").stdout, "b\n");
-        assert_eq!(bash.exec("cat xac").stdout, "c\n");
+        assert_eq!(result.exit_code, 0, "{}", result.stderr_text());
+        assert_eq!(bash.exec("cat xaa").stdout_text(), "a\n");
+        assert_eq!(bash.exec("cat xab").stdout_text(), "b\n");
+        assert_eq!(bash.exec("cat xac").stdout_text(), "c\n");
     }
 
     #[test]
     fn split_by_bytes() {
         let mut bash = with_files(&[("/home/user/test.txt", "hello")]);
         bash.exec("split -b 4 test.txt");
-        assert_eq!(bash.exec("cat xaa").stdout, "hell");
-        assert_eq!(bash.exec("cat xab").stdout, "o");
+        assert_eq!(bash.exec("cat xaa").stdout_text(), "hell");
+        assert_eq!(bash.exec("cat xab").stdout_text(), "o");
     }
 }
 
@@ -13649,11 +13908,12 @@ mod conformance_fix_tests {
     fn out(script: &str) -> String {
         let result = bash().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "unexpected stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     fn with_files(entries: &[(&str, &str)]) -> Bash {
@@ -13689,10 +13949,10 @@ mod conformance_fix_tests {
     #[test]
     fn wc_pads_columns_and_names_files() {
         let mut bash = with_files(&[("/home/user/a.txt", "x\ny\n")]);
-        assert_eq!(bash.exec("wc a.txt").stdout, " 2  2  4 a.txt\n");
-        assert_eq!(bash.exec("wc -l a.txt").stdout, "2 a.txt\n");
+        assert_eq!(bash.exec("wc a.txt").stdout_text(), " 2  2  4 a.txt\n");
+        assert_eq!(bash.exec("wc -l a.txt").stdout_text(), "2 a.txt\n");
         assert_eq!(
-            bash.exec("wc -l a.txt a.txt").stdout,
+            bash.exec("wc -l a.txt a.txt").stdout_text(),
             " 2 a.txt\n 2 a.txt\n 4 total\n"
         );
     }
@@ -13700,8 +13960,8 @@ mod conformance_fix_tests {
     #[test]
     fn rm_force_ignores_missing_files() {
         let result = bash().exec("rm -f missing; echo done");
-        assert_eq!(result.stdout, "done\n");
-        assert_eq!(result.stderr, "");
+        assert_eq!(result.stdout_text(), "done\n");
+        assert_eq!(result.stderr_text(), "");
     }
 
     #[test]
@@ -13713,7 +13973,7 @@ mod conformance_fix_tests {
     fn cat_dash_reads_stdin_in_place() {
         let mut bash = with_files(&[("/home/user/t.txt", "file\n")]);
         let result = bash.exec("echo from-stdin | cat - t.txt");
-        assert_eq!(result.stdout, "from-stdin\nfile\n");
+        assert_eq!(result.stdout_text(), "from-stdin\nfile\n");
     }
 
     #[test]
@@ -13745,7 +14005,7 @@ mod conformance_fix_tests {
         let mut bash = with_files(&[("/home/user/t.txt", "b\na\n")]);
         let result = bash.exec("sort -c t.txt");
         assert_eq!(result.exit_code, 1);
-        assert_eq!(result.stderr, "sort: t.txt:2: disorder: a\n");
+        assert_eq!(result.stderr_text(), "sort: t.txt:2: disorder: a\n");
     }
 
     #[test]
@@ -13775,11 +14035,12 @@ mod wc_alignment_tests {
     fn run(bash: &mut Bash, script: &str) -> String {
         let result = bash.exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     /// One column with a single input is never padded.
@@ -13843,11 +14104,12 @@ mod find_tar_tests {
     fn out(bash: &mut Bash, script: &str) -> String {
         let result = bash.exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     #[test]
@@ -13907,8 +14169,8 @@ mod find_tar_tests {
     fn tar_round_trips_a_file() {
         let mut bash = bash_with(&[("/home/user/original.txt", "Original content\n")]);
         let result = bash.exec("tar -cf archive.tar original.txt && rm original.txt && tar -xf archive.tar && cat original.txt");
-        assert_eq!(result.stderr, "");
-        assert_eq!(result.stdout, "Original content\n");
+        assert_eq!(result.stderr_text(), "");
+        assert_eq!(result.stdout_text(), "Original content\n");
     }
 
     #[test]
@@ -13930,7 +14192,7 @@ mod find_tar_tests {
     fn tar_extracts_into_a_directory() {
         let mut bash = bash_with(&[("/home/user/source.txt", "Source content\n")]);
         let result = bash.exec("tar -cf archive.tar source.txt && mkdir dest && tar -xf archive.tar -C dest && cat dest/source.txt");
-        assert_eq!(result.stdout, "Source content\n");
+        assert_eq!(result.stdout_text(), "Source content\n");
     }
 
     #[test]
@@ -13939,16 +14201,16 @@ mod find_tar_tests {
         let result = bash.exec(
             "tar -czf archive.tar.gz compress.txt && rm compress.txt && tar -xzf archive.tar.gz && cat compress.txt",
         );
-        assert_eq!(result.stderr, "");
-        assert_eq!(result.stdout, "Compressed content\n");
+        assert_eq!(result.stderr_text(), "");
+        assert_eq!(result.stdout_text(), "Compressed content\n");
     }
 
     #[test]
     fn tar_strip_components() {
         let mut bash = bash_with(&[("/home/user/deep/path/file.txt", "Deep content\n")]);
         let result = bash.exec("tar -cf archive.tar deep/path/file.txt && mkdir out && tar -xf archive.tar -C out --strip-components=2 && cat out/file.txt");
-        assert_eq!(result.stderr, "");
-        assert_eq!(result.stdout, "Deep content\n");
+        assert_eq!(result.stderr_text(), "");
+        assert_eq!(result.stdout_text(), "Deep content\n");
     }
 }
 
@@ -13958,7 +14220,7 @@ mod arithmetic_disambiguation_tests {
 
     fn out(script: &str) -> (String, String) {
         let result = Bash::new(Options::default()).unwrap().exec(script);
-        (result.stdout, result.stderr)
+        (result.stdout_text(), result.stderr_text())
     }
 
     /// `$((…))` is always arithmetic; a command-shaped body is an error.
@@ -14003,11 +14265,12 @@ mod compound_pipeline_tests {
     fn out(script: &str) -> String {
         let result = Bash::new(Options::default()).unwrap().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     /// A `{ …; }` stage feeds the next stage rather than the terminal.
@@ -14059,7 +14322,7 @@ mod printf_format_tests {
 
     fn format(fmt: &str, args: &[&str]) -> String {
         let owned: Vec<String> = args.iter().map(|value| (*value).to_string()).collect();
-        format_printf(fmt, &owned)
+        String::from_utf8_lossy(&format_printf(fmt, &owned)).into_owned()
     }
 
     #[test]
@@ -14114,11 +14377,12 @@ mod shell_builtin_coverage_tests {
     fn out(script: &str) -> String {
         let result = bash().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     // ── trap ────────────────────────────────────────────────────────────
@@ -14180,15 +14444,15 @@ mod shell_builtin_coverage_tests {
     fn tee_writes_and_passes_through() {
         let mut bash = bash();
         let result = bash.exec("echo x | tee /tmp/t1 | cat");
-        assert_eq!(result.stdout, "x\n");
-        assert_eq!(bash.exec("cat /tmp/t1").stdout, "x\n");
+        assert_eq!(result.stdout_text(), "x\n");
+        assert_eq!(bash.exec("cat /tmp/t1").stdout_text(), "x\n");
     }
 
     #[test]
     fn tee_appends() {
         let mut bash = bash();
         bash.exec("echo one > /tmp/t3; echo two | tee -a /tmp/t3");
-        assert_eq!(bash.exec("cat /tmp/t3").stdout, "one\ntwo\n");
+        assert_eq!(bash.exec("cat /tmp/t3").stdout_text(), "one\ntwo\n");
     }
 
     #[test]
@@ -14218,11 +14482,12 @@ mod shell_option_tests {
     fn out(script: &str) -> String {
         let result = Bash::new(Options::default()).unwrap().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     /// `set -f` / `set -o noglob` leave glob patterns unexpanded.
@@ -14251,8 +14516,8 @@ mod shell_option_tests {
         let result = Bash::new(Options::default())
             .unwrap()
             .exec("set -x; echo hi");
-        assert_eq!(result.stdout, "hi\n");
-        assert_eq!(result.stderr, "+ echo hi\n");
+        assert_eq!(result.stdout_text(), "hi\n");
+        assert_eq!(result.stderr_text(), "+ echo hi\n");
     }
 
     /// A bare assignment is traced too.
@@ -14261,8 +14526,8 @@ mod shell_option_tests {
         let result = Bash::new(Options::default())
             .unwrap()
             .exec("set -x; x=1; echo $x");
-        assert_eq!(result.stdout, "1\n");
-        assert_eq!(result.stderr, "+ x=1\n+ echo 1\n");
+        assert_eq!(result.stdout_text(), "1\n");
+        assert_eq!(result.stderr_text(), "+ x=1\n+ echo 1\n");
     }
 
     /// `readonly` and `declare -r` record the attribute.
@@ -14275,7 +14540,11 @@ mod shell_option_tests {
             .unwrap()
             .exec("x=1; readonly x; x=2");
         assert_eq!(result.exit_code, 1);
-        assert!(result.stderr.contains("readonly"), "{}", result.stderr);
+        assert!(
+            result.stderr_text().contains("readonly"),
+            "{}",
+            result.stderr_text()
+        );
     }
 }
 
@@ -14286,11 +14555,12 @@ mod sed_extended_tests {
     fn out(script: &str) -> String {
         let result = Bash::new(Options::default()).unwrap().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     /// `y` transliterates character by character.
@@ -14322,11 +14592,12 @@ mod middle_compound_stage_tests {
     fn out(script: &str) -> String {
         let result = Bash::new(Options::default()).unwrap().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     /// A compound stage in the middle of a pipeline must consume the previous
@@ -14367,11 +14638,12 @@ mod exec_redirection_tests {
     fn out(script: &str) -> String {
         let result = bash().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     /// `exec cmd` runs the command and ends the script.
@@ -14428,11 +14700,12 @@ mod checksum_tests {
     fn out(script: &str) -> String {
         let result = bash().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     /// The digests match the published reference vectors.
@@ -14490,7 +14763,7 @@ mod checksum_tests {
         bash.exec("printf 'abc' > f; sha256sum f > s");
         bash.exec("printf 'tampered' > f");
         let result = bash.exec("sha256sum -c s");
-        assert_eq!(result.stdout, "f: FAILED\n");
+        assert_eq!(result.stdout_text(), "f: FAILED\n");
         assert_eq!(result.exit_code, 1);
     }
 }
@@ -14502,11 +14775,12 @@ mod device_file_tests {
     fn out(script: &str) -> String {
         let result = Bash::new(Options::default()).unwrap().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     /// `/dev/null` reads as an empty stream.
@@ -14539,8 +14813,8 @@ mod device_file_tests {
         let result = Bash::new(Options::default())
             .unwrap()
             .exec("grep x /dev/null; echo rc=$?");
-        assert_eq!(result.stdout, "rc=1\n");
-        assert_eq!(result.stderr, "");
+        assert_eq!(result.stdout_text(), "rc=1\n");
+        assert_eq!(result.stderr_text(), "");
     }
 
     /// Writing to `/dev/null` discards and does not create a file.
@@ -14557,11 +14831,12 @@ mod xxd_builtin_tests {
     fn out(script: &str) -> String {
         let result = Bash::new(Options::default()).unwrap().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     #[test]
@@ -14606,11 +14881,12 @@ mod du_tests {
     fn out(bash: &mut Bash, script: &str) -> String {
         let result = bash.exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     /// A directory reports the sum of everything beneath it.
@@ -14651,7 +14927,11 @@ mod du_tests {
         let mut bash = Bash::new(Options::default()).unwrap();
         let result = bash.exec("du /nonexistent");
         assert_eq!(result.exit_code, 1);
-        assert!(result.stderr.contains("No such file"), "{}", result.stderr);
+        assert!(
+            result.stderr_text().contains("No such file"),
+            "{}",
+            result.stderr_text()
+        );
     }
 }
 
@@ -14666,11 +14946,12 @@ mod dir_stack_tests {
     fn out(bash: &mut Bash, script: &str) -> String {
         let result = bash.exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     #[test]
@@ -14715,7 +14996,11 @@ mod dir_stack_tests {
     fn popd_on_an_empty_stack_fails() {
         let result = bash().exec("popd");
         assert_eq!(result.exit_code, 1);
-        assert!(result.stderr.contains("stack empty"), "{}", result.stderr);
+        assert!(
+            result.stderr_text().contains("stack empty"),
+            "{}",
+            result.stderr_text()
+        );
     }
 }
 
@@ -14781,14 +15066,15 @@ mod builtin_registry_tests {
         for name in implemented {
             let result = bash.exec(&format!("type {name}"));
             assert_eq!(
-                result.exit_code, 0,
+                result.exit_code,
+                0,
                 "`type {name}` should succeed, said: {}",
-                result.stderr
+                result.stderr_text()
             );
             assert!(
-                result.stdout.contains("builtin"),
+                result.stdout_text().contains("builtin"),
                 "`type {name}` said {:?}",
-                result.stdout
+                result.stdout_text()
             );
         }
     }
@@ -14810,11 +15096,12 @@ mod tac_tests {
     fn out(script: &str) -> String {
         let result = Bash::new(Options::default()).unwrap().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     #[test]
@@ -14851,7 +15138,7 @@ mod tac_tests {
     fn tac_reads_files() {
         let mut bash = Bash::new(Options::default()).unwrap();
         bash.exec("printf 'x\\ny\\n' > f");
-        assert_eq!(bash.exec("tac f").stdout, "y\nx\n");
+        assert_eq!(bash.exec("tac f").stdout_text(), "y\nx\n");
     }
 }
 
@@ -14862,11 +15149,12 @@ mod length_substitution_tests {
     fn out(script: &str) -> String {
         let result = Bash::new(Options::default()).unwrap().exec(script);
         assert_eq!(
-            result.stderr, "",
+            result.stderr_text(),
+            "",
             "stderr for {script:?}: {}",
-            result.stderr
+            result.stderr_text()
         );
-        result.stdout
+        result.stdout_text()
     }
 
     /// The ordinary length forms keep working.
@@ -14889,9 +15177,9 @@ mod length_substitution_tests {
         ] {
             let result = Bash::new(Options::default()).unwrap().exec(script);
             assert!(
-                result.stderr.contains("bad substitution"),
+                result.stderr_text().contains("bad substitution"),
                 "{script:?} said {:?}",
-                result.stderr
+                result.stderr_text()
             );
         }
     }

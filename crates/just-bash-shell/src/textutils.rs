@@ -619,58 +619,54 @@ pub fn find(entries: &[FindEntry<'_>], options: &FindOptions) -> String {
     out
 }
 
-/// `base64 [-d]`: encode to or decode from standard base64.
-pub fn base64(text: &str, decode: bool) -> String {
-    if decode {
-        let mut out = Vec::new();
-        let mut buffer = 0u32;
-        let mut bits = 0u32;
-        for byte in text.bytes() {
-            let value = match byte {
-                b'A'..=b'Z' => byte - b'A',
-                b'a'..=b'z' => byte - b'a' + 26,
-                b'0'..=b'9' => byte - b'0' + 52,
-                b'+' => 62,
-                b'/' => 63,
-                // Ignore padding and any whitespace/newlines.
-                _ => continue,
-            } as u32;
-            buffer = (buffer << 6) | value;
-            bits += 6;
-            if bits >= 8 {
-                bits -= 8;
-                if let Some(decoded) = char::from_u32((buffer >> bits) & 0xff) {
-                    out.push(decoded);
-                }
-            }
-        }
-        return out.into_iter().collect();
+/// Base64-encode raw bytes (no trailing newline).
+pub fn base64_encode(bytes: &[u8]) -> Vec<u8> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0] as u32;
+        let second = chunk.get(1).copied().unwrap_or(0) as u32;
+        let third = chunk.get(2).copied().unwrap_or(0) as u32;
+        let combined = (first << 16) | (second << 8) | third;
+        out.push(ALPHABET[(combined >> 18) as usize & 0x3f]);
+        out.push(ALPHABET[(combined >> 12) as usize & 0x3f]);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(combined >> 6) as usize & 0x3f]
+        } else {
+            b'='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[combined as usize & 0x3f]
+        } else {
+            b'='
+        });
     }
-    {
-        const ALPHABET: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let bytes = text.as_bytes();
-        let mut out = String::new();
-        for chunk in bytes.chunks(3) {
-            let first = chunk[0] as u32;
-            let second = chunk.get(1).copied().unwrap_or(0) as u32;
-            let third = chunk.get(2).copied().unwrap_or(0) as u32;
-            let combined = (first << 16) | (second << 8) | third;
-            out.push(ALPHABET[(combined >> 18) as usize & 0x3f] as char);
-            out.push(ALPHABET[(combined >> 12) as usize & 0x3f] as char);
-            out.push(if chunk.len() > 1 {
-                ALPHABET[(combined >> 6) as usize & 0x3f] as char
-            } else {
-                '='
-            });
-            out.push(if chunk.len() > 2 {
-                ALPHABET[combined as usize & 0x3f] as char
-            } else {
-                '='
-            });
+    out
+}
+
+/// Decode base64 text into raw bytes; non-alphabet characters (whitespace,
+/// padding) are ignored, so the result is byte-exact.
+pub fn base64_decode(text: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buffer = 0u32;
+    let mut bits = 0u32;
+    for byte in text {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => continue,
+        } as u32;
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buffer >> bits) & 0xff) as u8);
         }
-        out
     }
+    out
 }
 
 /// `uname [-s] [-n] [-r] [-m] [-a]`: report the virtual platform identity.
@@ -770,6 +766,20 @@ fn hex_digit(value: u8) -> char {
 /// Rebuild bytes from `xxd` output, honouring `-p` (bare hex) and the default
 /// `OFFSET: hhhh hhhh  ascii` layout.
 fn xxd_reverse(bytes: &[u8], plain: bool) -> String {
+    decode_latin1(&xxd_reverse_bytes(bytes, plain))
+}
+
+/// Byte-exact `xxd`: reverse mode returns the reconstructed raw bytes.
+pub fn xxd_bytes(bytes: &[u8], plain: bool, reverse: bool) -> Vec<u8> {
+    if reverse {
+        xxd_reverse_bytes(bytes, plain)
+    } else {
+        xxd(bytes, plain, false).into_bytes()
+    }
+}
+
+/// Rebuild the raw bytes from `xxd` output without any lossy text conversion.
+fn xxd_reverse_bytes(bytes: &[u8], plain: bool) -> Vec<u8> {
     let text = String::from_utf8_lossy(bytes);
     let mut out = Vec::new();
     for line in text.lines() {
@@ -794,10 +804,9 @@ fn xxd_reverse(bytes: &[u8], plain: bool) -> String {
             }
         }
     }
-    // Map each byte to the character with the same code point. This is
-    // reversible, unlike `from_utf8_lossy`, which would turn `0xff` into the
-    // replacement character and silently corrupt the data.
-    decode_latin1(&out)
+    // The reconstructed bytes are returned as-is; the string wrapper above maps
+    // them one-code-point-per-byte for callers that want text.
+    out
 }
 
 /// Bytes to text, one code point per byte (the inverse of [`encode_latin1`]).

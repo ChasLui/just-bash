@@ -364,7 +364,11 @@ fn run_case(case: &Case) -> (String, String, i32) {
     })
     .expect("initialize shell");
     let result = bash.exec(&case.command);
-    (result.stdout, result.stderr, result.exit_code)
+    (
+        String::from_utf8_lossy(&result.stdout).into_owned(),
+        String::from_utf8_lossy(&result.stderr).into_owned(),
+        result.exit_code,
+    )
 }
 
 #[test]
