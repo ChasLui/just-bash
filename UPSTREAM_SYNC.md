@@ -127,6 +127,22 @@ Notes:
   values agree, and the `{re, flags}` / `[re, flags]` regex argument forms are
   accepted by every regex built-in.
 
+## Conformance baseline
+
+`crates/just-bash/tests/conformance.rs` replays the upstream bash-comparison
+fixtures (457 cases, vendored under `crates/just-bash/tests/conformance/`) and
+reports how many match byte-for-byte, including exit status. Run it with:
+
+```bash
+cargo test -p just-bash --test conformance -- --nocapture
+```
+
+Current result: **456 / 457 match bash (99.8%)**. The single remaining case is
+listed one per line in `crates/just-bash/tests/conformance/known_failures.txt`;
+a case that starts passing while still listed makes the test fail, so the list
+can only shrink. Per-suite detail and the plan for the rest live in
+[`UPSTREAM_GAPS.md`](./UPSTREAM_GAPS.md).
+
 ## Not yet ported
 
 This list is not exhaustive, and the absence of an item is not a claim of parity.

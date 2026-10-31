@@ -5,13 +5,61 @@ use just_bash_fs::Error;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParseLimits {
     pub max_command_substitution_depth: usize,
+    /// Maximum nesting depth of any recursive construct (`( )`, `{ }`, `if`,
+    /// `while`, `for`, function bodies, `[[ … ]]` groups and
+    /// parameter-expansion defaults).
+    ///
+    /// Recursive-descent parsing means each level of source nesting costs one
+    /// parser stack frame; without this budget a ~1 KB script such as 800
+    /// nested `( … )` aborts the whole process with a stack overflow, which an
+    /// embedder cannot catch. The default matches upstream's
+    /// `MAX_PARSER_DEPTH`.
+    pub max_nesting_depth: usize,
 }
 
 impl Default for ParseLimits {
     fn default() -> Self {
         Self {
             max_command_substitution_depth: 50,
+            // Deliberately far below upstream's 200. A Rust parser frame costs
+            // roughly 14 KB of stack here, and measurement on a 1 MiB worker
+            // stack (the smallest this runtime targets) shows 56 levels is the
+            // debug-build maximum before a stack overflow. 32 keeps a ~1.75x
+            // margin; embedders that control their stack size can raise it.
+            max_nesting_depth: 32,
         }
+    }
+}
+
+/// Shared nesting budget for one parse.
+///
+/// Every recursive construct draws from this single counter, so alternating
+/// shapes — an `if` inside `{ }` inside `( … )` inside `$( … )` — cannot each
+/// consume a private budget and multiply the effective stack depth.
+struct DepthGuard {
+    depth: usize,
+    max: usize,
+}
+
+impl DepthGuard {
+    fn new(max: usize) -> Self {
+        Self { depth: 0, max }
+    }
+
+    /// Enter one nesting level, or fail closed when the budget is exhausted.
+    fn enter(&mut self) -> Result<(), Error> {
+        if self.depth >= self.max {
+            return Err(Error::Parse(format!(
+                "maximum parser nesting depth exceeded ({})",
+                self.max
+            )));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn leave(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 }
 
@@ -152,6 +200,9 @@ pub struct CommandInvocation {
     pub redirects: Vec<Redirect>,
     /// An array literal written as an argument, e.g. `declare -A m=( … )`.
     pub array: Option<ArrayAssign>,
+    /// A compound command used as a pipeline stage (`{ …; } | cat`,
+    /// `( … ) | cat`). When present, `words` is empty.
+    pub compound: Option<Box<StatementKind>>,
 }
 
 // ─── Pipeline connector ───────────────────────────────────────────────────────
@@ -250,6 +301,18 @@ pub enum StatementKind {
     Subshell(Vec<Statement>),
     Cond(CondExpr),
     ArrayAssign(ArrayAssign),
+    /// `(( expression ))` — evaluated for its side effects; the exit status is
+    /// 1 when the value is zero.
+    Arithmetic(String),
+    /// A compound command carrying its own redirections: `{ …; } > f`,
+    /// `while …; done < in`, `if …; fi 2>&1`.
+    ///
+    /// Redirections written after a compound belong to that compound as a
+    /// whole, not to the last simple command inside it.
+    Redirected {
+        inner: Box<StatementKind>,
+        redirects: Vec<Redirect>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,7 +351,8 @@ pub fn parse_script(source: &str) -> Result<Script, Error> {
 pub fn parse_script_with_limits(source: &str, limits: ParseLimits) -> Result<Script, Error> {
     let tokens = lex(source, limits)?;
     let mut pos = 0;
-    let statements = parse_statements(&tokens, &mut pos, &[])?;
+    let mut depth = DepthGuard::new(limits.max_nesting_depth);
+    let statements = parse_statements(&tokens, &mut pos, &[], &mut depth)?;
     if pos < tokens.len() {
         return Err(Error::Parse(format!(
             "syntax error near unexpected token `{}'",
@@ -332,6 +396,8 @@ enum Token {
     ArrayAssign(String, bool),
     /// `[[ … ]]`, already split into condition words.
     Condition(Vec<Word>),
+    /// `(( … ))` — an arithmetic command; the body is unevaluated text.
+    ArithmeticCommand(String),
     Separator,
 }
 
@@ -353,6 +419,7 @@ fn describe_token(token: &Token) -> String {
         Token::RParen => ")".to_string(),
         Token::LBrace => "{".to_string(),
         Token::RBrace => "}".to_string(),
+        Token::ArithmeticCommand(_) => "((".to_string(),
         Token::RedirectRead(_) => "<".to_string(),
         Token::RedirectWrite(_) => ">".to_string(),
         Token::RedirectAppend(_) => ">>".to_string(),
@@ -416,6 +483,19 @@ impl<'a> Lexer<'a> {
                     self.quote = Some(Quote::Double);
                 }
                 (Some(Quote::Single), '\'') | (Some(Quote::Double), '"') => self.quote = None,
+                // ANSI-C quoting `$'…'`. Only recognised outside double quotes,
+                // where it is an ordinary three-character sequence.
+                (None, '$') if self.chars.peek() == Some(&'\'') => {
+                    self.started = true;
+                    self.word_quoted = true;
+                    self.lex_ansi_c_quoted()?;
+                }
+                // Backtick command substitution, the pre-`$(…)` spelling.
+                // Inside single quotes a backtick is literal, so it is not
+                // matched here.
+                (quote_state, '`') if quote_state != Some(Quote::Single) => {
+                    self.lex_backtick()?;
+                }
                 (None, c) if c.is_whitespace() && c != '\n' => self.flush_word(),
                 (None, '\n') => {
                     self.flush_word();
@@ -448,7 +528,7 @@ impl<'a> Lexer<'a> {
                 }
                 (None, '<') => self.lex_less()?,
                 (None, '>') => self.lex_greater()?,
-                (None, '(') => self.lex_lparen(),
+                (None, '(') => self.lex_lparen()?,
                 (None, ')') => {
                     self.flush_word();
                     self.tokens.push(Token::RParen);
@@ -495,7 +575,10 @@ impl<'a> Lexer<'a> {
                                 WordPartKind::CommandSub,
                             )
                         };
-                        self.push_part(inner, kind, false);
+                        // A substitution inside double quotes is protected:
+                        // `"$(cmd)"` is one field and its metacharacters do
+                        // not drive pathname expansion.
+                        self.push_part(inner, kind, quote_state.is_some());
                     } else {
                         self.push_char('$', WordPartKind::Variable);
                     }
@@ -533,6 +616,117 @@ impl<'a> Lexer<'a> {
         }
         self.flush_word();
         Ok(self.tokens)
+    }
+
+    /// Consume an ANSI-C quoted string; the `$` is already taken.
+    ///
+    /// Backslash escapes are interpreted here, so the resulting part is a
+    /// literal: it is never expanded again and never field-split.
+    fn lex_ansi_c_quoted(&mut self) -> Result<(), Error> {
+        self.chars.next(); // opening `'`
+        let mut text = String::new();
+        while let Some(ch) = self.chars.next() {
+            match ch {
+                '\'' => {
+                    self.push_part(text, WordPartKind::Literal, true);
+                    return Ok(());
+                }
+                '\\' => {
+                    let Some(escape) = self.chars.next() else {
+                        break;
+                    };
+                    match escape {
+                        'n' => text.push('\n'),
+                        't' => text.push('\t'),
+                        'r' => text.push('\r'),
+                        'a' => text.push('\u{7}'),
+                        'b' => text.push('\u{8}'),
+                        'f' => text.push('\u{c}'),
+                        'v' => text.push('\u{b}'),
+                        'e' | 'E' => text.push('\u{1b}'),
+                        '\\' => text.push('\\'),
+                        '\'' => text.push('\''),
+                        '"' => text.push('"'),
+                        '?' => text.push('?'),
+                        'x' => {
+                            let mut value = 0u32;
+                            let mut digits = 0;
+                            while digits < 2 {
+                                let Some(next) = self.chars.peek().copied() else {
+                                    break;
+                                };
+                                let Some(digit) = next.to_digit(16) else {
+                                    break;
+                                };
+                                self.chars.next();
+                                value = value * 16 + digit;
+                                digits += 1;
+                            }
+                            if digits == 0 {
+                                text.push('\\');
+                                text.push('x');
+                            } else if let Some(ch) = char::from_u32(value) {
+                                text.push(ch);
+                            }
+                        }
+                        '0'..='7' => {
+                            let mut value = escape.to_digit(8).unwrap_or(0);
+                            let mut digits = 1;
+                            while digits < 3 {
+                                let Some(next) = self.chars.peek().copied() else {
+                                    break;
+                                };
+                                let Some(digit) = next.to_digit(8) else {
+                                    break;
+                                };
+                                self.chars.next();
+                                value = value * 8 + digit;
+                                digits += 1;
+                            }
+                            if let Some(ch) = char::from_u32(value) {
+                                text.push(ch);
+                            }
+                        }
+                        other => {
+                            text.push('\\');
+                            text.push(other);
+                        }
+                    }
+                }
+                other => text.push(other),
+            }
+        }
+        Err(Error::Parse(
+            "unexpected EOF while looking for matching `''".to_string(),
+        ))
+    }
+
+    /// Consume a backtick command substitution; the opening backtick is taken.
+    fn lex_backtick(&mut self) -> Result<(), Error> {
+        self.started = true;
+        let mut text = String::new();
+        while let Some(ch) = self.chars.next() {
+            match ch {
+                '`' => {
+                    // A backtick inside double quotes is protected from field
+                    // splitting, exactly like `"$(…)"`.
+                    self.push_part(text, WordPartKind::CommandSub, self.quote.is_some());
+                    return Ok(());
+                }
+                '\\' => match self.chars.peek().copied() {
+                    // Only these three escapes are removed inside backticks.
+                    Some(next @ ('`' | '\\' | '$')) => {
+                        self.chars.next();
+                        text.push(next);
+                    }
+                    _ => text.push('\\'),
+                },
+                other => text.push(other),
+            }
+        }
+        Err(Error::Parse(
+            "unexpected EOF while looking for matching ``'".to_string(),
+        ))
     }
 
     fn skip_comment(&mut self) -> Result<(), Error> {
@@ -624,13 +818,22 @@ impl<'a> Lexer<'a> {
     }
 
     /// `(` — an array assignment (`name=(`) when it directly follows `name=`.
-    fn lex_lparen(&mut self) {
+    fn lex_lparen(&mut self) -> Result<(), Error> {
         if let Some((name, append)) = self.take_array_prefix() {
             self.tokens.push(Token::ArrayAssign(name, append));
-            return;
+            return Ok(());
+        }
+        // `(( … ))` in command position is an arithmetic command, not two
+        // nested subshells.
+        if !self.started && self.chars.peek() == Some(&'(') {
+            self.chars.next();
+            let body = consume_arithmetic_substitution(&mut self.chars)?;
+            self.tokens.push(Token::ArithmeticCommand(body));
+            return Ok(());
         }
         self.flush_word();
         self.tokens.push(Token::LParen);
+        Ok(())
     }
 
     fn take_array_prefix(&mut self) -> Option<(String, bool)> {
@@ -805,7 +1008,9 @@ impl<'a> Lexer<'a> {
     }
 
     fn push_char(&mut self, ch: char, kind: WordPartKind) {
-        self.push_part(ch.to_string(), kind, self.quote == Some(Quote::Double));
+        // Inside either kind of quote the text is literal: glob metacharacters
+        // must not expand, so both single and double quotes mark it protected.
+        self.push_part(ch.to_string(), kind, self.quote.is_some());
     }
 
     fn push_part(&mut self, text: String, kind: WordPartKind, quoted: bool) {
@@ -1246,6 +1451,7 @@ fn parse_statements(
     tokens: &[Token],
     pos: &mut usize,
     terminators: &[&str],
+    depth: &mut DepthGuard,
 ) -> Result<Vec<Statement>, Error> {
     let mut statements: Vec<Statement> = Vec::new();
     let mut connector = PipelineConnector::Always;
@@ -1259,7 +1465,7 @@ fn parse_statements(
             break;
         }
 
-        let Some((kind, negated)) = parse_single_statement(tokens, pos, terminators)? else {
+        let Some((kind, negated)) = parse_single_statement(tokens, pos, terminators, depth)? else {
             // If we couldn't parse a statement but have a pending connector, error
             if !matches!(connector, PipelineConnector::Always) {
                 return Err(Error::Parse(format!(
@@ -1333,18 +1539,24 @@ fn parse_single_statement(
     tokens: &[Token],
     pos: &mut usize,
     terminators: &[&str],
+    depth: &mut DepthGuard,
 ) -> Result<Option<(StatementKind, bool)>, Error> {
     skip_separators(tokens, pos);
     if *pos >= tokens.len() {
         return Ok(None);
     }
 
-    // `!` negates the statement that follows (a pipeline or a compound).
+    // `!` negates the statement that follows (a pipeline or a compound). The
+    // recursion is user-controlled (`!!!!… true`), so it draws from the shared
+    // nesting budget like every other recursive construct.
     if let Token::Word(word) = &tokens[*pos]
         && word.is_reserved("!")
     {
+        depth.enter()?;
         *pos += 1;
-        return match parse_single_statement(tokens, pos, terminators)? {
+        let nested = parse_single_statement(tokens, pos, terminators, depth);
+        depth.leave();
+        return match nested? {
             Some((kind, negated)) => Ok(Some((kind, !negated))),
             None => Err(Error::Parse(
                 "syntax error near unexpected token `!'".to_string(),
@@ -1359,33 +1571,76 @@ fn parse_single_statement(
             t if terminators.contains(&t) => return Ok(None),
             "if" => {
                 *pos += 1;
-                return Ok(Some((StatementKind::If(parse_if(tokens, pos)?), false)));
+                depth.enter()?;
+                let parsed = parse_if(tokens, pos, depth);
+                depth.leave();
+                let kind = with_trailing_redirects(StatementKind::If(parsed?), tokens, pos)?;
+                if let Some(pipeline) =
+                    continue_pipeline_with(&kind, tokens, pos, terminators, depth)?
+                {
+                    return Ok(Some((pipeline, false)));
+                }
+                return Ok(Some((kind, false)));
             }
             "while" => {
                 *pos += 1;
-                return Ok(Some((
-                    StatementKind::While(parse_while(tokens, pos, false)?),
-                    false,
-                )));
+                depth.enter()?;
+                let parsed = parse_while(tokens, pos, false, depth);
+                depth.leave();
+                let kind = with_trailing_redirects(StatementKind::While(parsed?), tokens, pos)?;
+                if let Some(pipeline) =
+                    continue_pipeline_with(&kind, tokens, pos, terminators, depth)?
+                {
+                    return Ok(Some((pipeline, false)));
+                }
+                return Ok(Some((kind, false)));
             }
             "until" => {
                 *pos += 1;
-                return Ok(Some((
-                    StatementKind::While(parse_while(tokens, pos, true)?),
-                    false,
-                )));
+                depth.enter()?;
+                let parsed = parse_while(tokens, pos, true, depth);
+                depth.leave();
+                let kind = with_trailing_redirects(StatementKind::While(parsed?), tokens, pos)?;
+                if let Some(pipeline) =
+                    continue_pipeline_with(&kind, tokens, pos, terminators, depth)?
+                {
+                    return Ok(Some((pipeline, false)));
+                }
+                return Ok(Some((kind, false)));
             }
             "for" => {
                 *pos += 1;
-                return Ok(Some((StatementKind::For(parse_for(tokens, pos)?), false)));
+                depth.enter()?;
+                let parsed = parse_for(tokens, pos, depth);
+                depth.leave();
+                let kind = with_trailing_redirects(StatementKind::For(parsed?), tokens, pos)?;
+                if let Some(pipeline) =
+                    continue_pipeline_with(&kind, tokens, pos, terminators, depth)?
+                {
+                    return Ok(Some((pipeline, false)));
+                }
+                return Ok(Some((kind, false)));
             }
             "case" => {
                 *pos += 1;
-                return Ok(Some((StatementKind::Case(parse_case(tokens, pos)?), false)));
+                depth.enter()?;
+                let parsed = parse_case(tokens, pos, depth);
+                depth.leave();
+                let kind = with_trailing_redirects(StatementKind::Case(parsed?), tokens, pos)?;
+                if let Some(pipeline) =
+                    continue_pipeline_with(&kind, tokens, pos, terminators, depth)?
+                {
+                    return Ok(Some((pipeline, false)));
+                }
+                return Ok(Some((kind, false)));
             }
             "function" => {
                 *pos += 1;
-                return Ok(Some((parse_function_keyword(tokens, pos)?, false)));
+                depth.enter()?;
+                let parsed = parse_function_keyword(tokens, pos, depth);
+                depth.leave();
+                let kind = with_trailing_redirects(parsed?, tokens, pos)?;
+                return Ok(Some((kind, false)));
             }
             other => {
                 // `name() { … }` — a function definition.
@@ -1395,10 +1650,12 @@ fn parse_single_statement(
                 {
                     let name = other.to_string();
                     *pos += 3;
-                    return Ok(Some((
-                        StatementKind::Function(parse_function_body(tokens, pos, name)?),
-                        false,
-                    )));
+                    depth.enter()?;
+                    let parsed = parse_function_body(tokens, pos, name, depth);
+                    depth.leave();
+                    let kind =
+                        with_trailing_redirects(StatementKind::Function(parsed?), tokens, pos)?;
+                    return Ok(Some((kind, false)));
                 }
                 if let Some(message) = unsupported_construct(other) {
                     return Err(Error::Parse(message));
@@ -1410,20 +1667,46 @@ fn parse_single_statement(
     match &tokens[*pos] {
         Token::LParen => {
             *pos += 1;
-            let body = parse_statements(tokens, pos, &[])?;
-            expect_token(tokens, pos, ")", |token| matches!(token, Token::RParen))?;
-            return Ok(Some((StatementKind::Subshell(body), false)));
+            depth.enter()?;
+            let parsed = (|| {
+                let body = parse_statements(tokens, pos, &[], depth)?;
+                expect_token(tokens, pos, ")", |token| matches!(token, Token::RParen))?;
+                Ok::<_, Error>(body)
+            })();
+            depth.leave();
+            let kind = with_trailing_redirects(StatementKind::Subshell(parsed?), tokens, pos)?;
+            if let Some(pipeline) = continue_pipeline_with(&kind, tokens, pos, terminators, depth)?
+            {
+                return Ok(Some((pipeline, false)));
+            }
+            return Ok(Some((kind, false)));
         }
         Token::LBrace => {
             *pos += 1;
-            let body = parse_statements(tokens, pos, &[])?;
-            expect_token(tokens, pos, "}", |token| matches!(token, Token::RBrace))?;
-            return Ok(Some((StatementKind::Group(body), false)));
+            depth.enter()?;
+            let parsed = (|| {
+                let body = parse_statements(tokens, pos, &[], depth)?;
+                expect_token(tokens, pos, "}", |token| matches!(token, Token::RBrace))?;
+                Ok::<_, Error>(body)
+            })();
+            depth.leave();
+            let kind = with_trailing_redirects(StatementKind::Group(parsed?), tokens, pos)?;
+            if let Some(pipeline) = continue_pipeline_with(&kind, tokens, pos, terminators, depth)?
+            {
+                return Ok(Some((pipeline, false)));
+            }
+            return Ok(Some((kind, false)));
+        }
+        Token::ArithmeticCommand(body) => {
+            let body = body.clone();
+            *pos += 1;
+            return Ok(Some((StatementKind::Arithmetic(body), false)));
         }
         Token::Condition(words) => {
             let expr = parse_condition(words)?;
             *pos += 1;
-            return Ok(Some((StatementKind::Cond(expr), false)));
+            let kind = with_trailing_redirects(StatementKind::Cond(expr), tokens, pos)?;
+            return Ok(Some((kind, false)));
         }
         Token::ArrayAssign(name, append) => {
             let name = name.clone();
@@ -1460,7 +1743,138 @@ fn parse_single_statement(
         _ => {}
     }
 
-    Ok(parse_pipeline_statement(tokens, pos, terminators)?.map(|kind| (kind, false)))
+    Ok(parse_pipeline_statement(tokens, pos, terminators, depth)?.map(|kind| (kind, false)))
+}
+
+/// Whether the token at `at` starts a compound command rather than a word.
+fn is_compound_start(tokens: &[Token], at: usize) -> bool {
+    match tokens.get(at) {
+        Some(Token::LBrace) | Some(Token::LParen) => true,
+        Some(Token::Word(word)) if word.is_bare() => matches!(
+            word.text().as_str(),
+            "if" | "while" | "until" | "for" | "case"
+        ),
+        _ => false,
+    }
+}
+
+/// Continue a pipeline whose first stage is the just-parsed `kind`.
+///
+/// bash allows any compound command in a pipeline (`{ …; } | cat`,
+/// `( … ) | wc`, `while …; done | wc`). The compound has already been consumed,
+/// so this wraps it as the first `CommandInvocation` and parses the remaining
+/// stages, returning `None` when there is no `|` to continue with.
+fn continue_pipeline_with(
+    kind: &StatementKind,
+    tokens: &[Token],
+    pos: &mut usize,
+    terminators: &[&str],
+    depth: &mut DepthGuard,
+) -> Result<Option<StatementKind>, Error> {
+    if !matches!(tokens.get(*pos), Some(Token::Pipe)) {
+        return Ok(None);
+    }
+    let mut commands = vec![CommandInvocation {
+        words: Vec::new(),
+        redirects: Vec::new(),
+        array: None,
+        compound: Some(Box::new(kind.clone())),
+    }];
+    // Every remaining `| stage` belongs to this pipeline; a stage may itself be
+    // a compound, which recurses through this same path.
+    while matches!(tokens.get(*pos), Some(Token::Pipe)) {
+        *pos += 1;
+        let rest = parse_pipeline_statement(tokens, pos, terminators, depth)?;
+        match rest {
+            Some(StatementKind::Pipeline(mut stages)) => commands.append(&mut stages),
+            Some(other) => commands.push(CommandInvocation {
+                words: Vec::new(),
+                redirects: Vec::new(),
+                array: None,
+                compound: Some(Box::new(other)),
+            }),
+            None => {
+                return Err(Error::Parse(
+                    "syntax error near unexpected token `|'".to_string(),
+                ));
+            }
+        }
+        if !matches!(tokens.get(*pos), Some(Token::Pipe)) {
+            break;
+        }
+    }
+    Ok(Some(StatementKind::Pipeline(commands)))
+}
+
+/// Parse one redirection at `*pos`.
+///
+/// Returns `Ok(None)` when the current token is not a redirection, so the same
+/// helper serves simple commands (inside a pipeline) and compound commands
+/// (`{ …; } > f`, `while …; done < in`).
+fn parse_redirect_token(tokens: &[Token], pos: &mut usize) -> Result<Option<Redirect>, Error> {
+    let (mode, fd) = match tokens.get(*pos) {
+        Some(Token::RedirectRead(fd)) => (RedirectMode::Read, *fd),
+        Some(Token::RedirectWrite(fd)) => (RedirectMode::Write, *fd),
+        Some(Token::RedirectAppend(fd)) => (RedirectMode::Append, *fd),
+        Some(Token::RedirectDup(fd, target)) => match target {
+            Some(target) => (RedirectMode::Dup(*target), *fd),
+            None => (RedirectMode::Close, *fd),
+        },
+        Some(Token::RedirectHereString(fd)) => (RedirectMode::HereString, *fd),
+        Some(Token::RedirectHeredoc(fd, body, expand)) => {
+            let redirect = Redirect {
+                mode: RedirectMode::Heredoc {
+                    body: body.clone(),
+                    expand: *expand,
+                },
+                target: Word::empty(),
+                fd: *fd,
+            };
+            *pos += 1;
+            return Ok(Some(redirect));
+        }
+        _ => return Ok(None),
+    };
+    *pos += 1;
+    // Dup/Close carry their target in the token itself.
+    if matches!(mode, RedirectMode::Dup(_) | RedirectMode::Close) {
+        return Ok(Some(Redirect {
+            mode,
+            target: Word::empty(),
+            fd,
+        }));
+    }
+    let Some(Token::Word(target)) = tokens.get(*pos) else {
+        return Err(Error::Parse(
+            "syntax error near unexpected token `newline'".to_string(),
+        ));
+    };
+    let redirect = Redirect {
+        mode,
+        target: target.clone(),
+        fd,
+    };
+    *pos += 1;
+    Ok(Some(redirect))
+}
+
+/// Attach any redirections written after a compound command to that compound.
+fn with_trailing_redirects(
+    kind: StatementKind,
+    tokens: &[Token],
+    pos: &mut usize,
+) -> Result<StatementKind, Error> {
+    let mut redirects = Vec::new();
+    while let Some(redirect) = parse_redirect_token(tokens, pos)? {
+        redirects.push(redirect);
+    }
+    if redirects.is_empty() {
+        return Ok(kind);
+    }
+    Ok(StatementKind::Redirected {
+        inner: Box::new(kind),
+        redirects,
+    })
 }
 
 /// Parse a pipeline: one or more commands joined by `|`.
@@ -1468,6 +1882,7 @@ fn parse_pipeline_statement(
     tokens: &[Token],
     pos: &mut usize,
     terminators: &[&str],
+    depth: &mut DepthGuard,
 ) -> Result<Option<StatementKind>, Error> {
     let mut commands: Vec<CommandInvocation> = Vec::new();
     let mut words: Vec<Word> = Vec::new();
@@ -1476,7 +1891,33 @@ fn parse_pipeline_statement(
     let mut pending_pipe = false;
 
     while *pos < tokens.len() {
+        // A compound command in stage-initial position is a pipeline stage:
+        // `printf … | { cat; } | wc`. It is parsed by the shared statement
+        // routine so nesting limits and trailing redirects still apply.
+        if words.is_empty()
+            && redirects.is_empty()
+            && array.is_none()
+            && is_compound_start(tokens, *pos)
+        {
+            depth.enter()?;
+            let parsed = parse_single_statement(tokens, pos, terminators, depth);
+            depth.leave();
+            match parsed? {
+                Some((kind, _)) => {
+                    commands.push(CommandInvocation {
+                        words: Vec::new(),
+                        redirects: Vec::new(),
+                        array: None,
+                        compound: Some(Box::new(kind)),
+                    });
+                    pending_pipe = false;
+                    continue;
+                }
+                None => break,
+            }
+        }
         match &tokens[*pos] {
+            Token::ArithmeticCommand(_) => break,
             Token::Word(word) => {
                 if is_keyword_at(tokens, *pos, terminators) {
                     break;
@@ -1498,68 +1939,13 @@ fn parse_pipeline_statement(
             Token::RedirectRead(_)
             | Token::RedirectWrite(_)
             | Token::RedirectAppend(_)
-            | Token::RedirectDup(_, _) => {
-                let (mode, fd) = match tokens[*pos] {
-                    Token::RedirectRead(fd) => (RedirectMode::Read, fd),
-                    Token::RedirectWrite(fd) => (RedirectMode::Write, fd),
-                    Token::RedirectAppend(fd) => (RedirectMode::Append, fd),
-                    Token::RedirectDup(fd, target) => match target {
-                        Some(target) => (RedirectMode::Dup(target), fd),
-                        None => (RedirectMode::Close, fd),
-                    },
-                    _ => unreachable!(),
-                };
-                *pos += 1;
-                // Dup/Close carry their target in the token itself.
-                if matches!(mode, RedirectMode::Dup(_) | RedirectMode::Close) {
-                    redirects.push(Redirect {
-                        mode,
-                        target: Word::empty(),
-                        fd,
-                    });
-                    pending_pipe = false;
-                    continue;
+            | Token::RedirectDup(_, _)
+            | Token::RedirectHereString(_)
+            | Token::RedirectHeredoc(_, _, _) => {
+                if let Some(redirect) = parse_redirect_token(tokens, pos)? {
+                    redirects.push(redirect);
                 }
-                let Some(Token::Word(target)) = tokens.get(*pos) else {
-                    return Err(Error::Parse(
-                        "syntax error near unexpected token `newline'".to_string(),
-                    ));
-                };
-                redirects.push(Redirect {
-                    mode,
-                    target: target.clone(),
-                    fd,
-                });
                 pending_pipe = false;
-                *pos += 1;
-            }
-            Token::RedirectHereString(fd) => {
-                let fd = *fd;
-                *pos += 1;
-                let Some(Token::Word(target)) = tokens.get(*pos) else {
-                    return Err(Error::Parse(
-                        "syntax error near unexpected token `newline'".to_string(),
-                    ));
-                };
-                redirects.push(Redirect {
-                    mode: RedirectMode::HereString,
-                    target: target.clone(),
-                    fd,
-                });
-                pending_pipe = false;
-                *pos += 1;
-            }
-            Token::RedirectHeredoc(fd, body, expand) => {
-                redirects.push(Redirect {
-                    mode: RedirectMode::Heredoc {
-                        body: body.clone(),
-                        expand: *expand,
-                    },
-                    target: Word::empty(),
-                    fd: *fd,
-                });
-                pending_pipe = false;
-                *pos += 1;
             }
             // `{`, `}` and `[[ … ]]` are reserved words only in command
             // position; as arguments they are ordinary words.
@@ -1677,10 +2063,14 @@ fn parse_pipeline_statement(
     }
 }
 
-fn parse_if(tokens: &[Token], pos: &mut usize) -> Result<IfStatement, Error> {
-    let condition = parse_statements(tokens, pos, &["then"])?;
+fn parse_if(
+    tokens: &[Token],
+    pos: &mut usize,
+    depth: &mut DepthGuard,
+) -> Result<IfStatement, Error> {
+    let condition = parse_statements(tokens, pos, &["then"], depth)?;
     expect_keyword(tokens, pos, "then")?;
-    let body = parse_statements(tokens, pos, &["elif", "else", "fi"])?;
+    let body = parse_statements(tokens, pos, &["elif", "else", "fi"], depth)?;
 
     let mut elif_clauses = Vec::new();
     loop {
@@ -1689,9 +2079,9 @@ fn parse_if(tokens: &[Token], pos: &mut usize) -> Result<IfStatement, Error> {
             break;
         }
         *pos += 1; // consume "elif"
-        let elif_cond = parse_statements(tokens, pos, &["then"])?;
+        let elif_cond = parse_statements(tokens, pos, &["then"], depth)?;
         expect_keyword(tokens, pos, "then")?;
-        let elif_body = parse_statements(tokens, pos, &["elif", "else", "fi"])?;
+        let elif_body = parse_statements(tokens, pos, &["elif", "else", "fi"], depth)?;
         elif_clauses.push((elif_cond, elif_body));
     }
 
@@ -1699,7 +2089,7 @@ fn parse_if(tokens: &[Token], pos: &mut usize) -> Result<IfStatement, Error> {
         skip_separators(tokens, pos);
         if is_keyword_at(tokens, *pos, &["else"]) {
             *pos += 1; // consume "else"
-            Some(parse_statements(tokens, pos, &["fi"])?)
+            Some(parse_statements(tokens, pos, &["fi"], depth)?)
         } else {
             None
         }
@@ -1714,10 +2104,15 @@ fn parse_if(tokens: &[Token], pos: &mut usize) -> Result<IfStatement, Error> {
     })
 }
 
-fn parse_while(tokens: &[Token], pos: &mut usize, until: bool) -> Result<WhileStatement, Error> {
-    let condition = parse_statements(tokens, pos, &["do"])?;
+fn parse_while(
+    tokens: &[Token],
+    pos: &mut usize,
+    until: bool,
+    depth: &mut DepthGuard,
+) -> Result<WhileStatement, Error> {
+    let condition = parse_statements(tokens, pos, &["do"], depth)?;
     expect_keyword(tokens, pos, "do")?;
-    let body = parse_statements(tokens, pos, &["done"])?;
+    let body = parse_statements(tokens, pos, &["done"], depth)?;
     expect_keyword(tokens, pos, "done")?;
     Ok(WhileStatement {
         until,
@@ -1726,7 +2121,11 @@ fn parse_while(tokens: &[Token], pos: &mut usize, until: bool) -> Result<WhileSt
     })
 }
 
-fn parse_for(tokens: &[Token], pos: &mut usize) -> Result<ForStatement, Error> {
+fn parse_for(
+    tokens: &[Token],
+    pos: &mut usize,
+    depth: &mut DepthGuard,
+) -> Result<ForStatement, Error> {
     skip_separators(tokens, pos);
 
     let var = match tokens.get(*pos) {
@@ -1775,13 +2174,17 @@ fn parse_for(tokens: &[Token], pos: &mut usize) -> Result<ForStatement, Error> {
         }
     }
 
-    let body = parse_statements(tokens, pos, &["done"])?;
+    let body = parse_statements(tokens, pos, &["done"], depth)?;
     expect_keyword(tokens, pos, "done")?;
     Ok(ForStatement { var, items, body })
 }
 
 /// `case WORD in [ ( ] PAT|PAT ) list ;; … esac`
-fn parse_case(tokens: &[Token], pos: &mut usize) -> Result<CaseStatement, Error> {
+fn parse_case(
+    tokens: &[Token],
+    pos: &mut usize,
+    depth: &mut DepthGuard,
+) -> Result<CaseStatement, Error> {
     skip_separators(tokens, pos);
     let word = match tokens.get(*pos) {
         Some(Token::Word(word)) => {
@@ -1846,7 +2249,7 @@ fn parse_case(tokens: &[Token], pos: &mut usize) -> Result<CaseStatement, Error>
                 }
             }
         }
-        let body = parse_statements(tokens, pos, &["esac"])?;
+        let body = parse_statements(tokens, pos, &["esac"], depth)?;
         if matches!(tokens.get(*pos), Some(Token::DoubleSemi)) {
             *pos += 1;
         }
@@ -1857,7 +2260,11 @@ fn parse_case(tokens: &[Token], pos: &mut usize) -> Result<CaseStatement, Error>
 }
 
 /// `function NAME [()] compound`
-fn parse_function_keyword(tokens: &[Token], pos: &mut usize) -> Result<StatementKind, Error> {
+fn parse_function_keyword(
+    tokens: &[Token],
+    pos: &mut usize,
+    depth: &mut DepthGuard,
+) -> Result<StatementKind, Error> {
     skip_separators(tokens, pos);
     let name = match tokens.get(*pos) {
         Some(Token::Word(word)) => {
@@ -1881,7 +2288,7 @@ fn parse_function_keyword(tokens: &[Token], pos: &mut usize) -> Result<Statement
         expect_token(tokens, pos, ")", |token| matches!(token, Token::RParen))?;
     }
     Ok(StatementKind::Function(parse_function_body(
-        tokens, pos, name,
+        tokens, pos, name, depth,
     )?))
 }
 
@@ -1890,18 +2297,19 @@ fn parse_function_body(
     tokens: &[Token],
     pos: &mut usize,
     name: String,
+    depth: &mut DepthGuard,
 ) -> Result<FunctionDef, Error> {
     skip_separators(tokens, pos);
     match tokens.get(*pos) {
         Some(Token::LBrace) => {
             *pos += 1;
-            let body = parse_statements(tokens, pos, &[])?;
+            let body = parse_statements(tokens, pos, &[], depth)?;
             expect_token(tokens, pos, "}", |token| matches!(token, Token::RBrace))?;
             Ok(FunctionDef { name, body })
         }
         Some(Token::LParen) => {
             *pos += 1;
-            let body = parse_statements(tokens, pos, &[])?;
+            let body = parse_statements(tokens, pos, &[], depth)?;
             expect_token(tokens, pos, ")", |token| matches!(token, Token::RParen))?;
             Ok(FunctionDef {
                 name,
@@ -1913,7 +2321,7 @@ fn parse_function_body(
                 }],
             })
         }
-        _ => match parse_single_statement(tokens, pos, &[])? {
+        _ => match parse_single_statement(tokens, pos, &[], depth)? {
             Some((kind, negated)) => Ok(FunctionDef {
                 name,
                 body: vec![Statement {
@@ -2084,6 +2492,7 @@ fn push_command_to(
             words: std::mem::take(words),
             redirects: std::mem::take(redirects),
             array: array.take(),
+            compound: None,
         });
     }
 }
@@ -2470,6 +2879,7 @@ mod tests {
     fn rejects_excessive_command_substitution_nesting() {
         let limits = ParseLimits {
             max_command_substitution_depth: 2,
+            ..ParseLimits::default()
         };
         let error =
             parse_script_with_limits("echo $(printf $(printf $(printf hi)))", limits).unwrap_err();
@@ -2699,5 +3109,106 @@ mod escape_and_reserved_word_tests {
         let commands = pipeline(&script, 0);
         assert_eq!(commands[0].redirects[0].mode, RedirectMode::Append);
         assert_eq!(commands[0].redirects[0].fd, 2);
+    }
+}
+
+#[cfg(test)]
+mod nesting_limit_tests {
+    use super::*;
+
+    /// Build `depth` levels of `{ … }` nesting around a trivial command.
+    /// The `;` before `}` is required by the shell grammar.
+    fn nested_group(depth: usize) -> String {
+        format!("{}echo hi;{}", "{ ".repeat(depth), " }".repeat(depth))
+    }
+
+    /// Spaced form: `((` in command position is an arithmetic command, so the
+    /// subshell fixtures keep a space between the parentheses.
+    fn nested_subshell(depth: usize) -> String {
+        format!("{}echo hi{}", "( ".repeat(depth), " )".repeat(depth))
+    }
+
+    fn nested_if(depth: usize) -> String {
+        format!(
+            "{}echo hi; {}",
+            "if true; then ".repeat(depth),
+            "fi ".repeat(depth)
+        )
+    }
+
+    #[test]
+    fn ordinary_nesting_is_allowed() {
+        for source in [nested_group(20), nested_subshell(20), nested_if(20)] {
+            assert!(parse_script(&source).is_ok(), "should parse: {source:.40}");
+        }
+    }
+
+    /// Recursive descent plus unbounded user nesting used to overflow the stack
+    /// and abort the process instead of returning an error.
+    #[test]
+    fn excessive_nesting_fails_closed() {
+        let limits = ParseLimits::default();
+        let too_deep = limits.max_nesting_depth + 20;
+        for source in [
+            nested_group(too_deep),
+            nested_subshell(too_deep),
+            nested_if(too_deep),
+        ] {
+            let error = parse_script(&source).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "maximum parser nesting depth exceeded ({})",
+                    limits.max_nesting_depth
+                )
+            );
+        }
+    }
+
+    /// `!!!!…true` recurses through parse_single_statement.
+    #[test]
+    fn excessive_negation_fails_closed() {
+        let source = format!(
+            "{}true",
+            "! ".repeat(ParseLimits::default().max_nesting_depth + 20)
+        );
+        let error = parse_script(&source).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("maximum parser nesting depth exceeded"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The budget is shared, so alternating shapes cannot each claim full depth.
+    #[test]
+    fn nesting_budget_is_shared_across_constructs() {
+        let limits = ParseLimits::default();
+        let half = limits.max_nesting_depth / 2 + 10;
+        let source = format!(
+            "{}if true; then {}echo hi;{} fi;{}",
+            "{ ".repeat(half),
+            "( ".repeat(half),
+            " )".repeat(half),
+            " }".repeat(half)
+        );
+        let error = parse_script(&source).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("maximum parser nesting depth exceeded"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn custom_nesting_limit_is_honoured() {
+        let limits = ParseLimits {
+            max_nesting_depth: 3,
+            ..ParseLimits::default()
+        };
+        assert!(parse_script_with_limits(&nested_group(3), limits).is_ok());
+        assert!(parse_script_with_limits(&nested_group(4), limits).is_err());
     }
 }

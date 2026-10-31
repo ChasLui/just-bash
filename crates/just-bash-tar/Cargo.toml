@@ -1,0 +1,9 @@
+[package]
+name = "just-bash-tar"
+version.workspace = true
+edition.workspace = true
+description = "Dependency-free tar (ustar) and gzip support for the just-bash virtual shell"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

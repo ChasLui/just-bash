@@ -1,0 +1,7 @@
+# Conformance cases that are known not to match upstream bash yet.
+# One `suite/id` per line. Each entry is an outstanding gap; delete the
+# line once the case passes (the harness fails on stale entries).
+#
+# Baseline after sed y/N and uniq -c: 456/457 match bash.
+
+substitution-desync/e7accfa7d60b71b5

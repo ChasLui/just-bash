@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 just-bash-awk.workspace = true
+just-bash-checksum.workspace = true
 just-bash-fs.workspace = true
 just-bash-glob.workspace = true
 just-bash-jq.workspace = true
@@ -23,4 +24,5 @@ just-bash-net.workspace = true
 just-bash-parser.workspace = true
 just-bash-regex.workspace = true
 just-bash-sed.workspace = true
+just-bash-tar.workspace = true
 just-bash-shell.workspace = true
