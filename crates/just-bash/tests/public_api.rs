@@ -293,7 +293,7 @@ fn shell_execution_is_identical_through_both_paths() {
     assert_eq!(root_result.stderr, module_result.stderr);
     assert_eq!(root_result.exit_code, module_result.exit_code);
     // One column and one input: `wc` does not pad.
-    assert_eq!(root_result.stdout, "hello\n2\n");
+    assert_eq!(root_result.stdout_text(), "hello\n2\n");
 
     // Filesystem changes are observable through the facade type. The default
     // working directory is `/home/user`.
@@ -301,7 +301,10 @@ fn shell_execution_is_identical_through_both_paths() {
     bash.exec("mkdir -p work && echo x > work/f.txt");
     assert!(bash.fs().is_dir("/home/user/work"));
     assert!(bash.fs().is_file("/home/user/work/f.txt"));
-    assert_eq!(bash.fs().read_file("/home/user/work/f.txt").unwrap(), "x\n");
+    assert_eq!(
+        bash.fs().read_file_str("/home/user/work/f.txt").unwrap(),
+        "x\n"
+    );
 }
 
 /// The `just-bash-rs` binary target keeps its name and both input modes.

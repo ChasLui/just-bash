@@ -2,13 +2,13 @@ use std::io::{self, Read, Write};
 
 use just_bash::{Bash, Options};
 
-/// Write `text` to `handle`, treating a closed reader as success.
+/// Write `bytes` to `handle`, treating a closed reader as success.
 ///
 /// `just-bash-rs … | head` is an ordinary thing to do: the downstream process
 /// exits after a few lines and the pipe closes, which makes `print!` panic. A
 /// shell must simply stop writing instead.
-fn write_ignoring_closed<R: Write>(mut handle: R, text: &str) {
-    let _ = handle.write_all(text.as_bytes());
+fn write_ignoring_closed<R: Write>(mut handle: R, bytes: &[u8]) {
+    let _ = handle.write_all(bytes);
     let _ = handle.flush();
 }
 

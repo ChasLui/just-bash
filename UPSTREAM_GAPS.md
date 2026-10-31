@@ -2248,3 +2248,95 @@ cargo test -p just-bash --test conformance -- --nocapture
 退出码传播（`$?`、函数返回值、`! `取反、`&&`/`||`、`pipefail`）、
 变量作用域（全局修改、`local`、函数位置参数）、算术（负数整除取模、
 `x++`、`&&`/`||`）、展开顺序（`$x` 分割 vs `"$x"` 不分割）—— 全部与 bash 一致。
+
+---
+
+## 45. 已落地：输出链路字节缓冲（切片 35）
+
+§40、§42、§43 曾三次把「高字节保真」记录为遗留项，结论都是「共 86 处输出路径，
+根治需改字节缓冲」「架构级改动，建议单独立项」。本轮正式立项并完成：把输出链路
+从 `String` 文本模型整体换成字节缓冲（`Vec<u8>`）模型，非 UTF-8 / 高字节数据
+**端到端**保留。§40/§42/§43 中记录的那次评估到此关闭。
+
+### 缺陷
+
+旧实现里 `CommandOutput` / `ExecResult` / `FsEntry::File.contents` 全部使用 `String`，
+任何经过输出链路的字节都要先按 UTF-8 解释：
+
+```
+printf '\xff'            # 落盘为 c3 bf  而非单字节 ff
+printf '\xff' | wc -c    # 2           而非 1
+printf 'ff' | xxd -r -p | wc -c   # 3   而非 1（U+FFFD 三字节）
+```
+
+`0xff` 不是合法 UTF-8，`String::from_utf8_lossy` 把它替换成 U+FFFD（`efbfbd`），
+**原始值被静默丢弃**。这不是长度不符的问题，而是数据损坏。
+
+### 修复
+
+核心改动是让字节在「命令输出 → 管道 → 重定向 → 虚拟文件系统 → 公开 API」全程
+保持 `Vec<u8>`，只在需要文本视图的边界做有损解码。
+
+`crates/just-bash-shell/src/lib.rs`：
+
+- `pub struct ExecResult { pub stdout: Vec<u8>, pub stderr: Vec<u8>, pub exit_code: i32, pub cwd: String }`；
+  新增 `ExecResult::stdout_text()` / `ExecResult::stderr_text()`，返回有损 UTF-8 `String`。
+- 内部 `CommandOutput { stdout: Vec<u8>, stderr: Vec<u8>, exit_code }`。
+- 16 个内部执行函数统一改为返回 `(Vec<u8>, Vec<u8>, i32)`：`exec_statement`、
+  `exec_statement_inner`、`exec_pipeline`、`exec_statement_list`、`exec_if`、`exec_while`、
+  `exec_for`、`exec_case`、`exec_cond`、`run_subshell`、`exec_background`、`define_function`、
+  `exec_arithmetic_command`、`exec_redirected_compound`、`exec_script_text`、`exec_array_assign`。
+- 管道、重定向、`Sink` 写入、`StdinBuffer`、`seed_stdin`、heredoc / here-string 全部承载字节。
+- `run_command` 新增字节精确的 `raw_stdout: Option<Vec<u8>>` 输出通道，供面向字节的内建使用。
+- `printf` 引擎（`format_printf` / `append_printf_once` / `push_raw_byte`）重写为直接构建
+  `Vec<u8>`，`\xHH` / `\NNN` 转义因此能输出原始字节。
+
+`crates/just-bash-fs/src/lib.rs`：
+
+- `FsEntry::File.contents: Vec<u8>`；
+- `read_file` 返回 `Result<&[u8], Error>`，另加 `read_file_str`（有损文本）；
+- `write_file` / `append_file` 接受 `P: AsRef<[u8]>`；
+- `entries_under` 返回 `Option<Vec<u8>>`。
+
+面向字节的内建全部改为字节精确：`printf`、`cat`、`tee`、`head -c` / `tail -c`、`wc -c`、
+`xxd`（含 `-r` 反向）、`base64`（编解码）、`md5sum` / `sha1sum` / `sha256sum`、
+`tar` / `gzip`（归档直接以原始字节存储，不再做 Latin-1 往返），以及 `cp` / `mv` / `touch`
+的文件拷贝。新增 `textutils::base64_encode` / `base64_decode` / `xxd_bytes` 辅助函数。
+
+### 汇总
+
+| 层面 | 改动 |
+| --- | --- |
+| 公开 API | `ExecResult.stdout` / `stderr` 改为 `Vec<u8>`，配套 `stdout_text()` / `stderr_text()` |
+| 执行核心 | 16 个执行函数、管道、重定向、`Sink`、`StdinBuffer`、heredoc 全链路字节化 |
+| 文件系统 | `File.contents: Vec<u8>`，`read_file` 返回 `&[u8]`，写入接受 `AsRef<[u8]>` |
+| 字节内建 | `printf`/`cat`/`tee`/`head -c`/`tail -c`/`wc -c`/`xxd`/`base64`/校验和/`tar`/`gzip`/`cp`/`mv`/`touch` |
+| 版本 | 3.0.0 → 4.0.0（公开 API 破坏性变更） |
+
+### 刻意保留的文本过滤限制
+
+**这一点不能含糊：文本过滤器仍不是字节精确的。** 纯文本过滤类命令
+（`awk`、`jq`、`sed`、`grep`、`sort`、`uniq`、`tr`、`cut`、`paste`、`column`、`nl`、
+`join`、`fold` 等）在其边界处依旧按有损 UTF-8 解码输入，因此**流经**这些文本过滤器的
+非 UTF-8 字节会退化为 U+FFFD。字节透明的命令与文件 I/O 是精确的；文本过滤器只在
+「输入本身是合法 UTF-8 文本」的前提下保证正确。
+
+出于同样的原因，`eval` / `source` / `exec` 内建的输出会先拼接进一个文本累加器，
+其输出的高字节也是有损的。
+
+这些是有意保留的边界，属于后续可继续推进的方向，但不在本次字节缓冲改造的范围内。
+
+### 验证
+
+```bash
+cargo fmt --all --check                              # ok
+cargo clippy --workspace --all-targets               # 0 warnings（清理后）
+cargo test --workspace                               # 912 passed, 0 failed
+cargo test -p just-bash --test conformance -- --nocapture
+#   conformance: 456/457 match bash  （1 个既有的已记录失败，与改造前一致）
+```
+
+新增回归测试文件 `crates/just-bash/tests/byte_pipeline.rs`（9 个用例）：
+`printf '\xff' | wc -c == 1`、文件往返、管道保留 NUL 与高字节、`xxd -r` 字节精确、
+`cat` / `tee` 透明、`head -c` / `tail -c` 按字节计数、`base64` 二进制往返、
+字面 UTF-8 原样保留，以及 `ExecResult` 同时暴露原始字节与有损文本视图。
