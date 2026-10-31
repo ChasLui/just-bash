@@ -1,0 +1,9 @@
+[package]
+name = "just-bash-checksum"
+version.workspace = true
+edition.workspace = true
+description = "Dependency-free MD5, SHA-1 and SHA-256 digests for the just-bash virtual shell"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

@@ -2004,7 +2004,6 @@ const UNSUPPORTED_FUNCTIONS: &[(&str, &str)] = &[
     ("debug", "debugging output is not supported"),
     ("walk", "`walk` is not supported"),
     ("path", "`path` is not supported"),
-    ("range", "`range` is not supported"),
     ("recurse", "`recurse` is not supported"),
     ("ascii", "`ascii` is not supported; use `explode`"),
     ("input_filename", "there are no input filenames to report"),
@@ -2025,6 +2024,7 @@ const UNSUPPORTED_FUNCTIONS: &[(&str, &str)] = &[
 /// Names this module implements, used to reject unknown functions at compile
 /// time rather than at run time.
 const BUILTIN_NAMES: &[&str] = &[
+    "range",
     "length",
     "utf8bytelength",
     "keys",
@@ -4716,6 +4716,35 @@ impl<'a> Evaluator<'a> {
                     .into_iter()
                     .collect())
             }
+            // `range(n)`, `range(from; to)` and `range(from; to; step)`.
+            "range" => {
+                if args.is_empty() || args.len() > 3 {
+                    return Err(EvalErr::runtime("range expects 1 to 3 arguments", 0, 0));
+                }
+                let mut bounds = Vec::new();
+                for index in 0..args.len() {
+                    bounds.push(as_number(&self.argument(args, index, input, depth)?, 0, 0)?);
+                }
+                let (start, end, step) = match bounds.len() {
+                    1 => (0.0, bounds[0], 1.0),
+                    2 => (bounds[0], bounds[1], 1.0),
+                    _ => (bounds[0], bounds[1], bounds[2]),
+                };
+                if step == 0.0 {
+                    return Err(EvalErr::runtime("range step cannot be zero", 0, 0));
+                }
+                let mut values = Vec::new();
+                let mut current = start;
+                // A hard cap keeps a hostile filter from allocating forever.
+                while (step > 0.0 && current < end) || (step < 0.0 && current > end) {
+                    values.push(Json::Number(current));
+                    if values.len() > 1_000_000 {
+                        return Err(EvalErr::runtime("range produces too many values", 0, 0));
+                    }
+                    current += step;
+                }
+                Ok(values)
+            }
             "limit" => {
                 self.expect_args(args, 2, name)?;
                 let count = as_number(&self.argument(args, 0, input, depth)?, 0, 0)?;
@@ -7209,7 +7238,6 @@ mod tests {
             "path(.a)",
             "recurse",
             "ascii(65)",
-            "range(2)",
             "input",
             "debug",
             "label $x | 1",

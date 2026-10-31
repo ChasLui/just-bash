@@ -7,6 +7,7 @@ name = "just-bash"
 version = "3.0.0"
 dependencies = [
  "just-bash-awk",
+ "just-bash-checksum",
  "just-bash-fs",
  "just-bash-glob",
  "just-bash-jq",
@@ -15,6 +16,7 @@ dependencies = [
  "just-bash-regex",
  "just-bash-sed",
  "just-bash-shell",
+ "just-bash-tar",
 ]
 
 [[package]]
@@ -23,6 +25,10 @@ version = "3.0.0"
 dependencies = [
  "just-bash-regex",
 ]
+
+[[package]]
+name = "just-bash-checksum"
+version = "3.0.0"
 
 [[package]]
 name = "just-bash-fs"
@@ -69,6 +75,7 @@ name = "just-bash-shell"
 version = "3.0.0"
 dependencies = [
  "just-bash-awk",
+ "just-bash-checksum",
  "just-bash-fs",
  "just-bash-glob",
  "just-bash-jq",
@@ -76,4 +83,9 @@ dependencies = [
  "just-bash-parser",
  "just-bash-regex",
  "just-bash-sed",
+ "just-bash-tar",
 ]
+
+[[package]]
+name = "just-bash-tar"
+version = "3.0.0"

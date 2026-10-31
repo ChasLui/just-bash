@@ -18,12 +18,14 @@ pub struct SedRun {
     pub exit_code: i32,
 }
 
-/// Which lines a command applies to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One address in `sed` syntax.
+#[derive(Debug, Clone)]
 pub enum SedAddress {
     Every,
     Line(usize),
     Last,
+    /// `/regex/` — matches any line containing the pattern.
+    Pattern(Regex),
 }
 
 /// One parsed `sed` command.
@@ -36,26 +38,45 @@ pub enum SedCommand {
         replacement: String,
         global: bool,
         print: bool,
-        address: SedAddress,
+        address: SedRange,
     },
     Print {
-        address: SedAddress,
+        address: SedRange,
     },
     Delete {
-        address: SedAddress,
+        address: SedRange,
+    },
+    /// `N` — append the next input line to the pattern space.
+    AppendNext {
+        address: SedRange,
+    },
+    /// `y<d>from<d>to<d>` — transliterate characters.
+    Transliterate {
+        from: Vec<char>,
+        to: Vec<char>,
+        address: SedRange,
     },
     Quit {
-        address: SedAddress,
+        address: SedRange,
     },
 }
 
+/// A command's address: a single address or an inclusive `start,end` range.
+#[derive(Debug, Clone)]
+pub struct SedRange {
+    pub start: SedAddress,
+    pub end: Option<SedAddress>,
+}
+
 impl SedCommand {
-    pub fn address(&self) -> SedAddress {
+    pub fn address(&self) -> &SedRange {
         match self {
             SedCommand::Substitute { address, .. }
             | SedCommand::Print { address }
             | SedCommand::Delete { address }
-            | SedCommand::Quit { address } => *address,
+            | SedCommand::Transliterate { address, .. }
+            | SedCommand::AppendNext { address }
+            | SedCommand::Quit { address } => address,
         }
     }
 }
@@ -63,6 +84,8 @@ impl SedCommand {
 /// What one line's pass through the program produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SedOutcome {
+    /// Extra input lines consumed by `N` (0 for every other command).
+    pub advanced: usize,
     pub line: String,
     pub deleted: bool,
     pub quit: bool,
@@ -175,9 +198,23 @@ pub fn run(args: &[String], stdin: &str, read_file: &dyn Fn(&str) -> Option<Stri
         }
     }
 
-    let total = input.lines().count();
-    for (number, line) in input.lines().enumerate() {
-        let outcome = apply_program(&program, line, number + 1, total);
+    let lines: Vec<&str> = input.lines().collect();
+    let total = lines.len();
+    // One `in_range` slot per command, so a `start,end` range spans lines.
+    let mut range_state = vec![false; program.len()];
+    let mut cursor = 0usize;
+    while cursor < lines.len() {
+        let number = cursor;
+        let outcome = apply_program_with(
+            &program,
+            lines[cursor],
+            number + 1,
+            total,
+            &mut range_state,
+            lines.get(cursor + 1).copied(),
+        );
+        // `N` appends the following line; skip it on the next iteration.
+        cursor += 1 + outcome.advanced;
         if outcome.deleted {
             continue;
         }
@@ -207,14 +244,34 @@ pub fn apply_program(
     line: &str,
     line_number: usize,
     total: usize,
+    range_state: &mut [bool],
 ) -> SedOutcome {
+    apply_program_with(program, line, line_number, total, range_state, None)
+}
+
+/// [`apply_program`] with the rest of the input available for `N`.
+pub fn apply_program_with(
+    program: &[SedCommand],
+    line: &str,
+    line_number: usize,
+    total: usize,
+    range_state: &mut [bool],
+    next_line: Option<&str>,
+) -> SedOutcome {
+    let mut advanced = 0usize;
     let mut current = line.to_string();
     let mut extra_prints = 0usize;
     let mut deleted = false;
     let mut quit = false;
 
-    for command in program {
-        if !address_matches(command.address(), line_number, total) {
+    for (index, command) in program.iter().enumerate() {
+        if !range_matches(
+            command.address(),
+            line,
+            line_number,
+            total,
+            &mut range_state[index],
+        ) {
             continue;
         }
         match command {
@@ -246,6 +303,33 @@ pub fn apply_program(
                 }
             }
             SedCommand::Print { .. } => extra_prints += 1,
+            SedCommand::AppendNext { .. } => {
+                // At end of input `N` prints the pattern space and quits.
+                match next_line {
+                    Some(next) if advanced == 0 => {
+                        current.push('\n');
+                        current.push_str(next);
+                        advanced += 1;
+                    }
+                    _ => {
+                        // `N` at end of input drops the pattern space and ends
+                        // this cycle, so nothing is printed.
+                        deleted = true;
+                        break;
+                    }
+                }
+            }
+            SedCommand::Transliterate { from, to, .. } => {
+                current = current
+                    .chars()
+                    .map(
+                        |ch| match from.iter().position(|candidate| *candidate == ch) {
+                            Some(index) => to.get(index).copied().unwrap_or(ch),
+                            None => ch,
+                        },
+                    )
+                    .collect();
+            }
             SedCommand::Delete { .. } => {
                 deleted = true;
                 break;
@@ -258,6 +342,7 @@ pub fn apply_program(
     }
 
     SedOutcome {
+        advanced,
         line: current,
         deleted,
         quit,
@@ -265,11 +350,46 @@ pub fn apply_program(
     }
 }
 
-fn address_matches(address: SedAddress, line_number: usize, total: usize) -> bool {
+fn address_matches(address: &SedAddress, line: &str, line_number: usize, total: usize) -> bool {
     match address {
         SedAddress::Every => true,
-        SedAddress::Line(number) => number == line_number,
+        SedAddress::Line(number) => *number == line_number,
         SedAddress::Last => line_number == total,
+        SedAddress::Pattern(regex) => regex.is_match(line),
+    }
+}
+
+/// Whether a command applies to this line, updating a range's active state.
+///
+/// A range starts on the line matching `start` and stays active until the line
+/// matching `end` (inclusive). Two line numbers that are both satisfied on the
+/// starting line — the usual `1,1d` — still end on that same line.
+fn range_matches(
+    range: &SedRange,
+    line: &str,
+    line_number: usize,
+    total: usize,
+    active: &mut bool,
+) -> bool {
+    let start_hit = address_matches(&range.start, line, line_number, total);
+    match &range.end {
+        None => start_hit,
+        Some(end) => {
+            if *active {
+                if address_matches(end, line, line_number, total) {
+                    *active = false;
+                }
+                return true;
+            }
+            if start_hit {
+                // `1,1d` ends immediately; otherwise the range stays open.
+                if !address_matches(end, line, line_number, total) {
+                    *active = true;
+                }
+                return true;
+            }
+            false
+        }
     }
 }
 
@@ -366,25 +486,73 @@ pub fn parse_script(script: &str) -> Result<Vec<SedCommand>, String> {
     Ok(commands)
 }
 
-fn parse_command(chars: &[char], start: usize) -> Result<(SedCommand, usize), String> {
+/// Parse one address: a line number, `$`, or `/regex/`.
+fn parse_address(chars: &[char], start: usize) -> Result<(SedAddress, usize), String> {
     let mut index = start;
-    let mut address = SedAddress::Every;
     if chars.get(index) == Some(&'$') {
-        address = SedAddress::Last;
+        return Ok((SedAddress::Last, index + 1));
+    }
+    if chars.get(index) == Some(&'/') {
         index += 1;
-    } else {
-        let digits_start = index;
-        while matches!(chars.get(index), Some(ch) if ch.is_ascii_digit()) {
+        let mut pattern = String::new();
+        while let Some(&ch) = chars.get(index) {
+            if ch == '/' {
+                let regex = Regex::new(&pattern)
+                    .map_err(|error| format!("invalid regex `{pattern}': {error}"))?;
+                return Ok((SedAddress::Pattern(regex), index + 1));
+            }
+            if ch == '\\' {
+                // `\/` is a literal slash inside the pattern.
+                if chars.get(index + 1) == Some(&'/') {
+                    pattern.push('/');
+                    index += 2;
+                    continue;
+                }
+                pattern.push(ch);
+                index += 1;
+                continue;
+            }
+            pattern.push(ch);
             index += 1;
         }
-        if index > digits_start {
-            let text: String = chars[digits_start..index].iter().collect();
-            match text.parse::<usize>() {
-                Ok(number) => address = SedAddress::Line(number),
-                Err(_) => return Err(format!("invalid address `{text}'")),
-            }
-        }
+        return Err("unterminated address regex".to_string());
     }
+    let digits_start = index;
+    while matches!(chars.get(index), Some(ch) if ch.is_ascii_digit()) {
+        index += 1;
+    }
+    if index == digits_start {
+        return Ok((SedAddress::Every, start));
+    }
+    let text: String = chars[digits_start..index].iter().collect();
+    match text.parse::<usize>() {
+        Ok(number) => Ok((SedAddress::Line(number), index)),
+        Err(_) => Err(format!("invalid address `{text}'")),
+    }
+}
+
+fn parse_command(chars: &[char], start: usize) -> Result<(SedCommand, usize), String> {
+    let mut index = start;
+    let (first, next) = parse_address(chars, index)?;
+    index = next;
+    // Whitespace may separate an address from its command (`$ d`).
+    while matches!(chars.get(index), Some(ch) if ch.is_whitespace()) {
+        index += 1;
+    }
+    // A `start,end` pair is a range; `1,3d` deletes lines 1 through 3.
+    let address = if !matches!(first, SedAddress::Every) && chars.get(index) == Some(&',') {
+        let (second, after) = parse_address(chars, index + 1)?;
+        index = after;
+        SedRange {
+            start: first,
+            end: Some(second),
+        }
+    } else {
+        SedRange {
+            start: first,
+            end: None,
+        }
+    };
 
     let Some(&command) = chars.get(index) else {
         return Err("missing command".to_string());
@@ -393,16 +561,58 @@ fn parse_command(chars: &[char], start: usize) -> Result<(SedCommand, usize), St
     match command {
         's' => parse_substitute(chars, index, address),
         'p' => Ok((SedCommand::Print { address }, index)),
+        'y' => parse_transliterate(chars, index, address),
+        'N' => Ok((SedCommand::AppendNext { address }, index)),
         'd' => Ok((SedCommand::Delete { address }, index)),
         'q' => Ok((SedCommand::Quit { address }, index)),
         other => Err(format!("unsupported command `{other}'")),
     }
 }
 
+/// `y<d>from<d>to<d>` — the two lists must be the same length.
+fn parse_transliterate(
+    chars: &[char],
+    start: usize,
+    address: SedRange,
+) -> Result<(SedCommand, usize), String> {
+    let Some(&delimiter) = chars.get(start) else {
+        return Err("missing `y' delimiter".to_string());
+    };
+    let mut index = start + 1;
+    let read_list = |index: &mut usize| -> String {
+        let mut text = String::new();
+        while let Some(&ch) = chars.get(*index) {
+            if ch == delimiter {
+                *index += 1;
+                break;
+            }
+            if ch == '\\'
+                && let Some(&next) = chars.get(*index + 1)
+            {
+                text.push(next);
+                *index += 2;
+                continue;
+            }
+            text.push(ch);
+            *index += 1;
+        }
+        text
+    };
+    let from: Vec<char> = read_list(&mut index).chars().collect();
+    let to: Vec<char> = read_list(&mut index).chars().collect();
+    if from.len() != to.len() {
+        return Err("strings for `y' command are different lengths".to_string());
+    }
+    if from.is_empty() {
+        return Err("empty string for `y' command".to_string());
+    }
+    Ok((SedCommand::Transliterate { from, to, address }, index))
+}
+
 fn parse_substitute(
     chars: &[char],
     start: usize,
-    address: SedAddress,
+    address: SedRange,
 ) -> Result<(SedCommand, usize), String> {
     let Some(&delimiter) = chars.get(start) else {
         return Err("missing substitution delimiter".to_string());
@@ -587,7 +797,8 @@ mod tests {
 
     #[test]
     fn unsupported_commands_fail_closed() {
-        for script in ["y/a/b/", "a text", "w out.txt", "s/a/b/x"] {
+        // `y` and `N` are implemented; these still fail closed.
+        for script in ["a text", "w out.txt", "s/a/b/x"] {
             let result = run(&[script.to_string()], "a\n", &|_| None);
             assert_eq!(result.exit_code, 1, "{script} should fail");
             assert!(!result.stderr.is_empty(), "{script} needs a message");

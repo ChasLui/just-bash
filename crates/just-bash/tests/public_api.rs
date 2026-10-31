@@ -292,6 +292,7 @@ fn shell_execution_is_identical_through_both_paths() {
     assert_eq!(root_result.stdout, module_result.stdout);
     assert_eq!(root_result.stderr, module_result.stderr);
     assert_eq!(root_result.exit_code, module_result.exit_code);
+    // One column and one input: `wc` does not pad.
     assert_eq!(root_result.stdout, "hello\n2\n");
 
     // Filesystem changes are observable through the facade type. The default

@@ -10,6 +10,7 @@ repository = "https://github.com/ChasLui/just-bash"
 
 [workspace.dependencies]
 just-bash-awk = { path = "crates/just-bash-awk", version = "3.0.0" }
+just-bash-checksum = { path = "crates/just-bash-checksum", version = "3.0.0" }
 just-bash-fs = { path = "crates/just-bash-fs", version = "3.0.0" }
 just-bash-glob = { path = "crates/just-bash-glob", version = "3.0.0" }
 just-bash-jq = { path = "crates/just-bash-jq", version = "3.0.0" }
@@ -18,3 +19,4 @@ just-bash-parser = { path = "crates/just-bash-parser", version = "3.0.0" }
 just-bash-regex = { path = "crates/just-bash-regex", version = "3.0.0" }
 just-bash-sed = { path = "crates/just-bash-sed", version = "3.0.0" }
 just-bash-shell = { path = "crates/just-bash-shell", version = "3.0.0" }
+just-bash-tar = { path = "crates/just-bash-tar", version = "3.0.0" }

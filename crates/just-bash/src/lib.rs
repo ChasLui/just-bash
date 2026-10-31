@@ -17,6 +17,7 @@
 //! | [`shell`] | `just-bash-shell` |
 
 pub use just_bash_awk as awk;
+pub use just_bash_checksum as checksum;
 pub use just_bash_fs as fs;
 pub use just_bash_glob as glob;
 pub use just_bash_jq as jq;
@@ -25,6 +26,7 @@ pub use just_bash_parser as parser;
 pub use just_bash_regex as regex;
 pub use just_bash_sed as sed;
 pub use just_bash_shell as shell;
+pub use just_bash_tar as tar;
 
 pub use just_bash_awk::{AwkRun, MAX_RECORDS as AWK_MAX_RECORDS};
 pub use just_bash_fs::{
